@@ -20,3 +20,7 @@ path = "src/bin/dsapid.rs"
 [[bin]]
 name = "dsapictl"
 path = "src/bin/dsapictl.rs"
+
+[[bin]]
+name = "dsapistream"
+path = "src/bin/dsapistream.rs"

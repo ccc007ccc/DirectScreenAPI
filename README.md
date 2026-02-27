@@ -82,6 +82,17 @@ Android 显示探测与同步：
 ./scripts/daemon_stop.sh
 ```
 
+真实触摸采集桥接（getevent -> daemon）：
+
+```sh
+./scripts/daemon_start.sh
+./scripts/daemon_sync_display.sh
+./scripts/daemon_touch_bridge_start.sh
+./scripts/daemon_touch_bridge_status.sh
+./scripts/daemon_touch_bridge_stop.sh
+./scripts/daemon_stop.sh
+```
+
 C 示例：
 
 ```sh

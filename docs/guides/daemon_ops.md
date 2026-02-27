@@ -31,9 +31,17 @@
 ./scripts/daemon_sync_display.sh
 ```
 
+启动触摸桥接：
+
+```sh
+./scripts/daemon_touch_bridge_start.sh
+./scripts/daemon_touch_bridge_status.sh
+```
+
 ## 停止
 
 ```sh
+./scripts/daemon_touch_bridge_stop.sh
 ./scripts/daemon_stop.sh
 ```
 
@@ -42,5 +50,7 @@
 - `DSAPI_SOCKET_PATH`
 - `DSAPI_PID_FILE`
 - `DSAPI_LOG_FILE`
+- `DSAPI_TOUCH_BRIDGE_PID_FILE`
+- `DSAPI_TOUCH_BRIDGE_LOG_FILE`
 
 可用于多实例隔离运行与路径定制。

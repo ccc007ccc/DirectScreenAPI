@@ -11,6 +11,8 @@
 - 新增 daemon 触控命令（`TOUCH_*`）
 - 新增 C ABI 触控接口（`dsapi_touch_*`）
 - 新增触控路由指南文档
+- 新增真实触摸桥接脚本（`getevent` -> `TOUCH_*`）
+- 新增持久流式客户端 `dsapistream`
 
 ## 0.1.0 - 基石重构版本
 

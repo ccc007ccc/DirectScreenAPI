@@ -16,6 +16,7 @@
 - `guides/daemon_ops.md`
 - `guides/android_adapter.md`
 - `guides/touch_routing.md`
+- `guides/touch_bridge.md`
 - `guides/stability_policy.md`
 
 ## 治理
