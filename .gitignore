@@ -1,0 +1,17 @@
+# Build outputs
+/target
+**/target
+**/build
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Runtime artifacts
+artifacts/
+
+# Generated lockfiles outside Rust
+*.log
