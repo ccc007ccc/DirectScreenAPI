@@ -1,4 +1,6 @@
-use crate::api::{Decision, DisplayState, RectRegion, RouteResult, Status, TouchEvent};
+use crate::api::{
+    Decision, DisplayState, RectRegion, RenderStats, RouteResult, Status, TouchEvent,
+};
 use crate::domain::RuntimeState;
 
 #[derive(Debug, Default)]
@@ -53,6 +55,20 @@ impl RuntimeEngine {
 
     pub fn active_touch_count(&self) -> usize {
         self.state.active_touch_count()
+    }
+
+    pub fn submit_render_stats(
+        &mut self,
+        draw_calls: u32,
+        frost_passes: u32,
+        text_calls: u32,
+    ) -> RenderStats {
+        self.state
+            .submit_render_stats(draw_calls, frost_passes, text_calls)
+    }
+
+    pub fn render_stats(&self) -> RenderStats {
+        self.state.render_stats()
     }
 }
 
@@ -156,5 +172,25 @@ mod tests {
             y: 1.0,
         });
         assert_eq!(res, Err(Status::OutOfRange));
+    }
+
+    #[test]
+    fn render_submit_increments_frame_seq_and_updates_stats() {
+        let mut engine = RuntimeEngine::default();
+
+        let first = engine.submit_render_stats(7, 1, 2);
+        assert_eq!(first.frame_seq, 1);
+        assert_eq!(first.draw_calls, 7);
+        assert_eq!(first.frost_passes, 1);
+        assert_eq!(first.text_calls, 2);
+
+        let second = engine.submit_render_stats(12, 3, 4);
+        assert_eq!(second.frame_seq, 2);
+        assert_eq!(second.draw_calls, 12);
+        assert_eq!(second.frost_passes, 3);
+        assert_eq!(second.text_calls, 4);
+
+        let got = engine.render_stats();
+        assert_eq!(got, second);
     }
 }

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::api::{
-    Decision, DisplayState, RectRegion, RouteResult, Status, TouchEvent, TOUCH_MAX_POINTERS,
+    Decision, DisplayState, RectRegion, RenderStats, RouteResult, Status, TouchEvent,
+    TOUCH_MAX_POINTERS,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -14,6 +15,7 @@ struct ActiveTouch {
 #[derive(Debug)]
 pub struct RuntimeState {
     pub display: DisplayState,
+    pub render: RenderStats,
     pub default_decision: Decision,
     pub regions: Vec<RectRegion>,
     active_touches: HashMap<i32, ActiveTouch>,
@@ -23,6 +25,7 @@ impl Default for RuntimeState {
     fn default() -> Self {
         Self {
             display: DisplayState::default(),
+            render: RenderStats::default(),
             default_decision: Decision::Pass,
             regions: Vec::new(),
             active_touches: HashMap::new(),
@@ -123,5 +126,22 @@ impl RuntimeState {
 
     pub fn active_touch_count(&self) -> usize {
         self.active_touches.len()
+    }
+
+    pub fn submit_render_stats(
+        &mut self,
+        draw_calls: u32,
+        frost_passes: u32,
+        text_calls: u32,
+    ) -> RenderStats {
+        self.render.frame_seq = self.render.frame_seq.saturating_add(1);
+        self.render.draw_calls = draw_calls;
+        self.render.frost_passes = frost_passes;
+        self.render.text_calls = text_calls;
+        self.render
+    }
+
+    pub fn render_stats(&self) -> RenderStats {
+        self.render
     }
 }

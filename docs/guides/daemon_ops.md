@@ -23,6 +23,8 @@
 ./scripts/daemon_cmd.sh TOUCH_MOVE 1 300 300
 ./scripts/daemon_cmd.sh TOUCH_UP 1 300 300
 ./scripts/daemon_cmd.sh TOUCH_COUNT
+./scripts/daemon_cmd.sh RENDER_SUBMIT 12 2 3
+./scripts/daemon_cmd.sh RENDER_GET
 ```
 
 同步 Android 实际显示参数：

@@ -10,6 +10,14 @@ pub enum Status {
 
 pub const TOUCH_MAX_POINTERS: usize = 16;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct RenderStats {
+    pub frame_seq: u64,
+    pub draw_calls: u32,
+    pub frost_passes: u32,
+    pub text_calls: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum Decision {

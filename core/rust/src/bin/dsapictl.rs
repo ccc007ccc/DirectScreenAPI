@@ -13,6 +13,8 @@ fn usage() {
     println!("  dsapictl DISPLAY_SET 1440 3168 120 640 0");
     println!("  dsapictl ROUTE_ADD_RECT 10 block 100 100 300 300");
     println!("  dsapictl ROUTE_POINT 120 140");
+    println!("  dsapictl RENDER_SUBMIT 12 2 3");
+    println!("  dsapictl RENDER_GET");
 }
 
 fn main() {

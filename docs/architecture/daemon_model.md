@@ -27,6 +27,8 @@
 - `TOUCH_CANCEL <pointer_id>`
 - `TOUCH_CLEAR`
 - `TOUCH_COUNT`
+- `RENDER_SUBMIT <draw_calls> <frost_passes> <text_calls>`
+- `RENDER_GET`
 - `SHUTDOWN`
 
 ## 响应格式

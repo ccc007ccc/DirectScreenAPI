@@ -231,6 +231,38 @@ pub fn execute_command(engine: &mut RuntimeEngine, line: &str) -> CommandOutcome
             Ok("OK".to_string())
         }
         "TOUCH_COUNT" => Ok(format!("OK {}", engine.active_touch_count())),
+        "RENDER_SUBMIT" => {
+            if tokens.len() != 4 {
+                Err(Status::InvalidArgument)
+            } else {
+                match (
+                    parse_u32(tokens[1]),
+                    parse_u32(tokens[2]),
+                    parse_u32(tokens[3]),
+                ) {
+                    (Ok(draw_calls), Ok(frost_passes), Ok(text_calls)) => {
+                        let stats =
+                            engine.submit_render_stats(draw_calls, frost_passes, text_calls);
+                        Ok(format!(
+                            "OK {} {} {} {}",
+                            stats.frame_seq, stats.draw_calls, stats.frost_passes, stats.text_calls
+                        ))
+                    }
+                    _ => Err(Status::InvalidArgument),
+                }
+            }
+        }
+        "RENDER_GET" => {
+            if tokens.len() != 1 {
+                Err(Status::InvalidArgument)
+            } else {
+                let stats = engine.render_stats();
+                Ok(format!(
+                    "OK {} {} {} {}",
+                    stats.frame_seq, stats.draw_calls, stats.frost_passes, stats.text_calls
+                ))
+            }
+        }
         "SHUTDOWN" => Ok("OK SHUTDOWN".to_string()),
         _ => Err(Status::InvalidArgument),
     };
@@ -283,5 +315,43 @@ mod tests {
 
         let count_after = execute_command(&mut engine, "TOUCH_COUNT");
         assert_eq!(count_after.response_line, "OK 0");
+    }
+
+    #[test]
+    fn render_submit_and_get_commands() {
+        let mut engine = RuntimeEngine::default();
+
+        let first = execute_command(&mut engine, "RENDER_SUBMIT 8 2 3");
+        assert_eq!(first.response_line, "OK 1 8 2 3");
+
+        let second = execute_command(&mut engine, "RENDER_SUBMIT 10 4 5");
+        assert_eq!(second.response_line, "OK 2 10 4 5");
+
+        let get = execute_command(&mut engine, "RENDER_GET");
+        assert_eq!(get.response_line, "OK 2 10 4 5");
+    }
+
+    #[test]
+    fn render_submit_invalid_argument_rejected() {
+        let mut engine = RuntimeEngine::default();
+
+        let bad = execute_command(&mut engine, "RENDER_SUBMIT x 1 2");
+        assert_eq!(bad.response_line, "ERR INVALID_ARGUMENT");
+
+        let get_bad = execute_command(&mut engine, "RENDER_GET extra");
+        assert_eq!(get_bad.response_line, "ERR INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn render_response_tokens_are_parsable_numbers() {
+        let mut engine = RuntimeEngine::default();
+        let out = execute_command(&mut engine, "RENDER_SUBMIT 12 6 7");
+        let tokens: Vec<&str> = out.response_line.split_whitespace().collect();
+        assert_eq!(tokens.len(), 5);
+        assert_eq!(tokens[0], "OK");
+        assert!(tokens[1].parse::<u64>().is_ok());
+        assert!(tokens[2].parse::<u32>().is_ok());
+        assert!(tokens[3].parse::<u32>().is_ok());
+        assert!(tokens[4].parse::<u32>().is_ok());
     }
 }
