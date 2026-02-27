@@ -2,8 +2,11 @@ use std::ffi::c_char;
 use std::ptr;
 use std::sync::Mutex;
 
-use crate::api::{Decision, DisplayState, RectRegion, RouteResult, Status, TouchEvent};
-use crate::engine::RuntimeEngine;
+use crate::api::{
+    Decision, DisplayState, RectRegion, RenderFrameInfo, RenderStats, RouteResult, Status,
+    TouchEvent,
+};
+use crate::engine::{RenderPresentInfo, RuntimeEngine};
 use crate::DIRECTSCREEN_CORE_VERSION;
 
 #[repr(C)]
@@ -26,6 +29,45 @@ pub struct DsapiDisplayState {
 pub struct DsapiRouteResult {
     pub decision: i32,
     pub region_id: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DsapiRenderStats {
+    pub frame_seq: u64,
+    pub draw_calls: u32,
+    pub frost_passes: u32,
+    pub text_calls: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DsapiRenderFrameInfo {
+    pub frame_seq: u64,
+    pub width: u32,
+    pub height: u32,
+    pub byte_len: u32,
+    pub checksum_fnv1a32: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DsapiRenderPresentInfo {
+    pub present_seq: u64,
+    pub frame_seq: u64,
+    pub width: u32,
+    pub height: u32,
+    pub byte_len: u32,
+    pub checksum_fnv1a32: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DsapiRenderFrameChunk {
+    pub frame_seq: u64,
+    pub total_bytes: u32,
+    pub offset: u32,
+    pub chunk_len: u32,
 }
 
 const VERSION_CSTR: &[u8] = b"0.1.0\0";
@@ -59,6 +101,42 @@ impl From<RouteResult> for DsapiRouteResult {
         Self {
             decision: v.decision as i32,
             region_id: v.region_id,
+        }
+    }
+}
+
+impl From<RenderStats> for DsapiRenderStats {
+    fn from(v: RenderStats) -> Self {
+        Self {
+            frame_seq: v.frame_seq,
+            draw_calls: v.draw_calls,
+            frost_passes: v.frost_passes,
+            text_calls: v.text_calls,
+        }
+    }
+}
+
+impl From<RenderFrameInfo> for DsapiRenderFrameInfo {
+    fn from(v: RenderFrameInfo) -> Self {
+        Self {
+            frame_seq: v.frame_seq,
+            width: v.width,
+            height: v.height,
+            byte_len: v.byte_len,
+            checksum_fnv1a32: v.checksum_fnv1a32,
+        }
+    }
+}
+
+impl From<RenderPresentInfo> for DsapiRenderPresentInfo {
+    fn from(v: RenderPresentInfo) -> Self {
+        Self {
+            present_seq: v.present_seq,
+            frame_seq: v.frame_seq,
+            width: v.width,
+            height: v.height,
+            byte_len: v.byte_len,
+            checksum_fnv1a32: v.checksum_fnv1a32,
         }
     }
 }
@@ -369,5 +447,235 @@ pub unsafe extern "C" fn dsapi_touch_count(ctx: *mut DsapiContext, out_count: *m
             ptr::write(out_count, engine.active_touch_count() as u32);
         }
         Status::Ok
+    }) as i32
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `ctx` must be a valid context pointer from `dsapi_context_create`.
+/// `out_stats` must be a valid, writable pointer to `DsapiRenderStats`.
+pub unsafe extern "C" fn dsapi_render_submit_stats(
+    ctx: *mut DsapiContext,
+    draw_calls: u32,
+    frost_passes: u32,
+    text_calls: u32,
+    out_stats: *mut DsapiRenderStats,
+) -> i32 {
+    if out_stats.is_null() {
+        return Status::NullPointer as i32;
+    }
+
+    with_engine_mut(ctx, |engine| {
+        let stats: DsapiRenderStats = engine
+            .submit_render_stats(draw_calls, frost_passes, text_calls)
+            .into();
+        unsafe {
+            ptr::write(out_stats, stats);
+        }
+        Status::Ok
+    }) as i32
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `ctx` must be a valid context pointer from `dsapi_context_create`.
+/// `out_stats` must be a valid, writable pointer to `DsapiRenderStats`.
+pub unsafe extern "C" fn dsapi_render_get_stats(
+    ctx: *mut DsapiContext,
+    out_stats: *mut DsapiRenderStats,
+) -> i32 {
+    if out_stats.is_null() {
+        return Status::NullPointer as i32;
+    }
+
+    with_engine_ref(ctx, |engine| {
+        let stats: DsapiRenderStats = engine.render_stats().into();
+        unsafe {
+            ptr::write(out_stats, stats);
+        }
+        Status::Ok
+    }) as i32
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `ctx` must be a valid context pointer from `dsapi_context_create`.
+/// `pixels_rgba8` must be a valid readable pointer of `pixels_len` bytes.
+/// `out_info` must be a valid writable pointer to `DsapiRenderFrameInfo`.
+pub unsafe extern "C" fn dsapi_render_submit_frame_rgba(
+    ctx: *mut DsapiContext,
+    width: u32,
+    height: u32,
+    pixels_rgba8: *const u8,
+    pixels_len: u32,
+    out_info: *mut DsapiRenderFrameInfo,
+) -> i32 {
+    if pixels_rgba8.is_null() || out_info.is_null() {
+        return Status::NullPointer as i32;
+    }
+
+    let len = match usize::try_from(pixels_len) {
+        Ok(v) => v,
+        Err(_) => return Status::OutOfRange as i32,
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(pixels_rgba8, len) }.to_vec();
+
+    with_engine_mut(ctx, |engine| {
+        match engine.submit_render_frame_rgba(width, height, bytes) {
+            Ok(info) => {
+                let info: DsapiRenderFrameInfo = info.into();
+                unsafe {
+                    ptr::write(out_info, info);
+                }
+                Status::Ok
+            }
+            Err(e) => e,
+        }
+    }) as i32
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `ctx` must be a valid context pointer from `dsapi_context_create`.
+/// `out_info` must be a valid writable pointer to `DsapiRenderFrameInfo`.
+pub unsafe extern "C" fn dsapi_render_get_frame_info(
+    ctx: *mut DsapiContext,
+    out_info: *mut DsapiRenderFrameInfo,
+) -> i32 {
+    if out_info.is_null() {
+        return Status::NullPointer as i32;
+    }
+
+    with_engine_ref(ctx, |engine| match engine.render_frame_info() {
+        Some(info) => {
+            let info: DsapiRenderFrameInfo = info.into();
+            unsafe {
+                ptr::write(out_info, info);
+            }
+            Status::Ok
+        }
+        None => Status::OutOfRange,
+    }) as i32
+}
+
+#[no_mangle]
+pub extern "C" fn dsapi_render_clear_frame(ctx: *mut DsapiContext) -> i32 {
+    with_engine_mut(ctx, |engine| {
+        engine.clear_render_frame();
+        Status::Ok
+    }) as i32
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `ctx` must be a valid context pointer from `dsapi_context_create`.
+/// `out_chunk` must be a valid writable pointer to `DsapiRenderFrameChunk`.
+/// `out_bytes` must be a valid writable pointer of `out_bytes_cap` bytes.
+pub unsafe extern "C" fn dsapi_render_frame_read_chunk(
+    ctx: *mut DsapiContext,
+    offset: u32,
+    max_bytes: u32,
+    out_chunk: *mut DsapiRenderFrameChunk,
+    out_bytes: *mut u8,
+    out_bytes_cap: u32,
+) -> i32 {
+    if out_chunk.is_null() || out_bytes.is_null() {
+        return Status::NullPointer as i32;
+    }
+
+    let offset = match usize::try_from(offset) {
+        Ok(v) => v,
+        Err(_) => return Status::OutOfRange as i32,
+    };
+    let max_bytes = match usize::try_from(max_bytes) {
+        Ok(v) => v,
+        Err(_) => return Status::OutOfRange as i32,
+    };
+    let out_bytes_cap = match usize::try_from(out_bytes_cap) {
+        Ok(v) => v,
+        Err(_) => return Status::OutOfRange as i32,
+    };
+
+    with_engine_ref(ctx, |engine| {
+        match engine.render_frame_read_chunk(offset, max_bytes) {
+            Ok(chunk) => {
+                if chunk.chunk_bytes.len() > out_bytes_cap {
+                    return Status::OutOfRange;
+                }
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        chunk.chunk_bytes.as_ptr(),
+                        out_bytes,
+                        chunk.chunk_bytes.len(),
+                    );
+                    ptr::write(
+                        out_chunk,
+                        DsapiRenderFrameChunk {
+                            frame_seq: chunk.frame_seq,
+                            total_bytes: chunk.total_bytes,
+                            offset: chunk.offset,
+                            chunk_len: chunk.chunk_bytes.len() as u32,
+                        },
+                    );
+                }
+                Status::Ok
+            }
+            Err(e) => e,
+        }
+    }) as i32
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `ctx` must be a valid context pointer from `dsapi_context_create`.
+/// `out_present` must be a valid writable pointer to `DsapiRenderPresentInfo`.
+pub unsafe extern "C" fn dsapi_render_present(
+    ctx: *mut DsapiContext,
+    out_present: *mut DsapiRenderPresentInfo,
+) -> i32 {
+    if out_present.is_null() {
+        return Status::NullPointer as i32;
+    }
+
+    with_engine_mut(ctx, |engine| match engine.render_present() {
+        Ok(info) => {
+            let info: DsapiRenderPresentInfo = info.into();
+            unsafe {
+                ptr::write(out_present, info);
+            }
+            Status::Ok
+        }
+        Err(e) => e,
+    }) as i32
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `ctx` must be a valid context pointer from `dsapi_context_create`.
+/// `out_present` must be a valid writable pointer to `DsapiRenderPresentInfo`.
+pub unsafe extern "C" fn dsapi_render_get_present(
+    ctx: *mut DsapiContext,
+    out_present: *mut DsapiRenderPresentInfo,
+) -> i32 {
+    if out_present.is_null() {
+        return Status::NullPointer as i32;
+    }
+
+    with_engine_ref(ctx, |engine| match engine.render_present_get() {
+        Some(info) => {
+            let info: DsapiRenderPresentInfo = info.into();
+            unsafe {
+                ptr::write(out_present, info);
+            }
+            Status::Ok
+        }
+        None => Status::OutOfRange,
     }) as i32
 }

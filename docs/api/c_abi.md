@@ -28,6 +28,17 @@
 - `dsapi_touch_clear`
 - `dsapi_touch_count`
 
+## 渲染接口
+
+- `dsapi_render_submit_stats`
+- `dsapi_render_get_stats`
+- `dsapi_render_submit_frame_rgba`
+- `dsapi_render_get_frame_info`
+- `dsapi_render_clear_frame`
+- `dsapi_render_frame_read_chunk`
+- `dsapi_render_present`
+- `dsapi_render_get_present`
+
 ## 状态码
 
 - `0`: OK

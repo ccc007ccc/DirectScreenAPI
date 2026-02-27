@@ -21,6 +21,7 @@
 - 新增调试导出命令 `RENDER_DUMP_PPM`
 - 新增帧分块读取命令 `RENDER_FRAME_READ_BASE64`
 - 新增 `scripts/daemon_frame_pull.sh`，可按分块协议拉取完整 RGBA 帧
+- C ABI 增加渲染接口（统计、帧提交、分块读取、呈现状态）
 
 ## 0.1.0 - 基石重构版本
 

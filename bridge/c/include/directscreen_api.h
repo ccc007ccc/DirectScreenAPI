@@ -35,6 +35,37 @@ typedef struct dsapi_route_result {
     int32_t region_id;
 } dsapi_route_result_t;
 
+typedef struct dsapi_render_stats {
+    uint64_t frame_seq;
+    uint32_t draw_calls;
+    uint32_t frost_passes;
+    uint32_t text_calls;
+} dsapi_render_stats_t;
+
+typedef struct dsapi_render_frame_info {
+    uint64_t frame_seq;
+    uint32_t width;
+    uint32_t height;
+    uint32_t byte_len;
+    uint32_t checksum_fnv1a32;
+} dsapi_render_frame_info_t;
+
+typedef struct dsapi_render_frame_chunk {
+    uint64_t frame_seq;
+    uint32_t total_bytes;
+    uint32_t offset;
+    uint32_t chunk_len;
+} dsapi_render_frame_chunk_t;
+
+typedef struct dsapi_render_present_info {
+    uint64_t present_seq;
+    uint64_t frame_seq;
+    uint32_t width;
+    uint32_t height;
+    uint32_t byte_len;
+    uint32_t checksum_fnv1a32;
+} dsapi_render_present_info_t;
+
 const char* dsapi_version(void);
 
 dsapi_context_t* dsapi_context_create(void);
@@ -94,6 +125,51 @@ int32_t dsapi_touch_cancel(
 
 int32_t dsapi_touch_clear(dsapi_context_t* ctx);
 int32_t dsapi_touch_count(dsapi_context_t* ctx, uint32_t* out_count);
+
+int32_t dsapi_render_submit_stats(
+    dsapi_context_t* ctx,
+    uint32_t draw_calls,
+    uint32_t frost_passes,
+    uint32_t text_calls,
+    dsapi_render_stats_t* out_stats
+);
+
+int32_t dsapi_render_get_stats(dsapi_context_t* ctx, dsapi_render_stats_t* out_stats);
+
+int32_t dsapi_render_submit_frame_rgba(
+    dsapi_context_t* ctx,
+    uint32_t width,
+    uint32_t height,
+    const uint8_t* pixels_rgba8,
+    uint32_t pixels_len,
+    dsapi_render_frame_info_t* out_info
+);
+
+int32_t dsapi_render_get_frame_info(
+    dsapi_context_t* ctx,
+    dsapi_render_frame_info_t* out_info
+);
+
+int32_t dsapi_render_clear_frame(dsapi_context_t* ctx);
+
+int32_t dsapi_render_frame_read_chunk(
+    dsapi_context_t* ctx,
+    uint32_t offset,
+    uint32_t max_bytes,
+    dsapi_render_frame_chunk_t* out_chunk,
+    uint8_t* out_bytes,
+    uint32_t out_bytes_cap
+);
+
+int32_t dsapi_render_present(
+    dsapi_context_t* ctx,
+    dsapi_render_present_info_t* out_present
+);
+
+int32_t dsapi_render_get_present(
+    dsapi_context_t* ctx,
+    dsapi_render_present_info_t* out_present
+);
 
 #ifdef __cplusplus
 }
