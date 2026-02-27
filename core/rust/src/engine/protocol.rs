@@ -1,4 +1,4 @@
-use crate::api::{Decision, RectRegion, Status};
+use crate::api::{Decision, RectRegion, Status, TouchEvent};
 use crate::engine::RuntimeEngine;
 use crate::DIRECTSCREEN_CORE_VERSION;
 
@@ -36,6 +36,19 @@ fn parse_u32(token: &str) -> Result<u32, Status> {
 
 fn parse_f32(token: &str) -> Result<f32, Status> {
     token.parse::<f32>().map_err(|_| Status::InvalidArgument)
+}
+
+fn parse_touch_event(
+    tokens: &[&str],
+    pointer_idx: usize,
+    x_idx: usize,
+    y_idx: usize,
+) -> Result<TouchEvent, Status> {
+    Ok(TouchEvent {
+        pointer_id: parse_i32(tokens[pointer_idx])?,
+        x: parse_f32(tokens[x_idx])?,
+        y: parse_f32(tokens[y_idx])?,
+    })
 }
 
 pub fn execute_command(engine: &mut RuntimeEngine, line: &str) -> CommandOutcome {
@@ -149,6 +162,75 @@ pub fn execute_command(engine: &mut RuntimeEngine, line: &str) -> CommandOutcome
                 }
             }
         }
+        "TOUCH_DOWN" => {
+            if tokens.len() != 4 {
+                Err(Status::InvalidArgument)
+            } else {
+                match parse_touch_event(&tokens, 1, 2, 3) {
+                    Ok(event) => match engine.touch_down(event) {
+                        Ok(routed) => Ok(format!(
+                            "OK {} {}",
+                            routed.decision as i32, routed.region_id
+                        )),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        "TOUCH_MOVE" => {
+            if tokens.len() != 4 {
+                Err(Status::InvalidArgument)
+            } else {
+                match parse_touch_event(&tokens, 1, 2, 3) {
+                    Ok(event) => match engine.touch_move(event) {
+                        Ok(routed) => Ok(format!(
+                            "OK {} {}",
+                            routed.decision as i32, routed.region_id
+                        )),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        "TOUCH_UP" => {
+            if tokens.len() != 4 {
+                Err(Status::InvalidArgument)
+            } else {
+                match parse_touch_event(&tokens, 1, 2, 3) {
+                    Ok(event) => match engine.touch_up(event) {
+                        Ok(routed) => Ok(format!(
+                            "OK {} {}",
+                            routed.decision as i32, routed.region_id
+                        )),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        "TOUCH_CANCEL" => {
+            if tokens.len() != 2 {
+                Err(Status::InvalidArgument)
+            } else {
+                match parse_i32(tokens[1]) {
+                    Ok(pointer_id) => match engine.touch_cancel(pointer_id) {
+                        Ok(routed) => Ok(format!(
+                            "OK {} {}",
+                            routed.decision as i32, routed.region_id
+                        )),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        "TOUCH_CLEAR" => {
+            engine.clear_touches();
+            Ok("OK".to_string())
+        }
+        "TOUCH_COUNT" => Ok(format!("OK {}", engine.active_touch_count())),
         "SHUTDOWN" => Ok("OK SHUTDOWN".to_string()),
         _ => Err(Status::InvalidArgument),
     };
@@ -179,5 +261,27 @@ mod tests {
         let shutdown = execute_command(&mut engine, "SHUTDOWN");
         assert_eq!(shutdown.response_line, "OK SHUTDOWN");
         assert!(shutdown.should_shutdown);
+    }
+
+    #[test]
+    fn touch_flow_commands_keep_pointer_state() {
+        let mut engine = RuntimeEngine::default();
+        let add = execute_command(&mut engine, "ROUTE_ADD_RECT 10 block 0 0 100 100");
+        assert_eq!(add.response_line, "OK");
+
+        let down = execute_command(&mut engine, "TOUCH_DOWN 1 10 10");
+        assert_eq!(down.response_line, "OK 1 10");
+
+        let move_cmd = execute_command(&mut engine, "TOUCH_MOVE 1 200 200");
+        assert_eq!(move_cmd.response_line, "OK 1 10");
+
+        let count = execute_command(&mut engine, "TOUCH_COUNT");
+        assert_eq!(count.response_line, "OK 1");
+
+        let up = execute_command(&mut engine, "TOUCH_UP 1 200 200");
+        assert_eq!(up.response_line, "OK 1 10");
+
+        let count_after = execute_command(&mut engine, "TOUCH_COUNT");
+        assert_eq!(count_after.response_line, "OK 0");
     }
 }

@@ -2,7 +2,7 @@ use std::ffi::c_char;
 use std::ptr;
 use std::sync::Mutex;
 
-use crate::api::{Decision, DisplayState, RectRegion, RouteResult, Status};
+use crate::api::{Decision, DisplayState, RectRegion, RouteResult, Status, TouchEvent};
 use crate::engine::RuntimeEngine;
 use crate::DIRECTSCREEN_CORE_VERSION;
 
@@ -61,6 +61,10 @@ impl From<RouteResult> for DsapiRouteResult {
             region_id: v.region_id,
         }
     }
+}
+
+fn touch_event_from(pointer_id: i32, x: f32, y: f32) -> TouchEvent {
+    TouchEvent { pointer_id, x, y }
 }
 
 fn with_engine_mut(ctx: *mut DsapiContext, f: impl FnOnce(&mut RuntimeEngine) -> Status) -> Status {
@@ -228,6 +232,141 @@ pub unsafe extern "C" fn dsapi_route_point(
         let routed: DsapiRouteResult = engine.route_point(x, y).into();
         unsafe {
             ptr::write(out_result, routed);
+        }
+        Status::Ok
+    }) as i32
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `ctx` must be a valid context pointer from `dsapi_context_create`.
+/// `out_result` must be a valid, writable pointer to `DsapiRouteResult`.
+pub unsafe extern "C" fn dsapi_touch_down(
+    ctx: *mut DsapiContext,
+    pointer_id: i32,
+    x: f32,
+    y: f32,
+    out_result: *mut DsapiRouteResult,
+) -> i32 {
+    if out_result.is_null() {
+        return Status::NullPointer as i32;
+    }
+
+    let event = touch_event_from(pointer_id, x, y);
+    with_engine_mut(ctx, |engine| match engine.touch_down(event) {
+        Ok(routed) => {
+            unsafe {
+                ptr::write(out_result, routed.into());
+            }
+            Status::Ok
+        }
+        Err(e) => e,
+    }) as i32
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `ctx` must be a valid context pointer from `dsapi_context_create`.
+/// `out_result` must be a valid, writable pointer to `DsapiRouteResult`.
+pub unsafe extern "C" fn dsapi_touch_move(
+    ctx: *mut DsapiContext,
+    pointer_id: i32,
+    x: f32,
+    y: f32,
+    out_result: *mut DsapiRouteResult,
+) -> i32 {
+    if out_result.is_null() {
+        return Status::NullPointer as i32;
+    }
+
+    let event = touch_event_from(pointer_id, x, y);
+    with_engine_mut(ctx, |engine| match engine.touch_move(event) {
+        Ok(routed) => {
+            unsafe {
+                ptr::write(out_result, routed.into());
+            }
+            Status::Ok
+        }
+        Err(e) => e,
+    }) as i32
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `ctx` must be a valid context pointer from `dsapi_context_create`.
+/// `out_result` must be a valid, writable pointer to `DsapiRouteResult`.
+pub unsafe extern "C" fn dsapi_touch_up(
+    ctx: *mut DsapiContext,
+    pointer_id: i32,
+    x: f32,
+    y: f32,
+    out_result: *mut DsapiRouteResult,
+) -> i32 {
+    if out_result.is_null() {
+        return Status::NullPointer as i32;
+    }
+
+    let event = touch_event_from(pointer_id, x, y);
+    with_engine_mut(ctx, |engine| match engine.touch_up(event) {
+        Ok(routed) => {
+            unsafe {
+                ptr::write(out_result, routed.into());
+            }
+            Status::Ok
+        }
+        Err(e) => e,
+    }) as i32
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `ctx` must be a valid context pointer from `dsapi_context_create`.
+/// `out_result` must be a valid, writable pointer to `DsapiRouteResult`.
+pub unsafe extern "C" fn dsapi_touch_cancel(
+    ctx: *mut DsapiContext,
+    pointer_id: i32,
+    out_result: *mut DsapiRouteResult,
+) -> i32 {
+    if out_result.is_null() {
+        return Status::NullPointer as i32;
+    }
+
+    with_engine_mut(ctx, |engine| match engine.touch_cancel(pointer_id) {
+        Ok(routed) => {
+            unsafe {
+                ptr::write(out_result, routed.into());
+            }
+            Status::Ok
+        }
+        Err(e) => e,
+    }) as i32
+}
+
+#[no_mangle]
+pub extern "C" fn dsapi_touch_clear(ctx: *mut DsapiContext) -> i32 {
+    with_engine_mut(ctx, |engine| {
+        engine.clear_touches();
+        Status::Ok
+    }) as i32
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `ctx` must be a valid context pointer from `dsapi_context_create`.
+/// `out_count` must be a valid, writable pointer to `u32`.
+pub unsafe extern "C" fn dsapi_touch_count(ctx: *mut DsapiContext, out_count: *mut u32) -> i32 {
+    if out_count.is_null() {
+        return Status::NullPointer as i32;
+    }
+
+    with_engine_ref(ctx, |engine| {
+        unsafe {
+            ptr::write(out_count, engine.active_touch_count() as u32);
         }
         Status::Ok
     }) as i32

@@ -10,7 +10,7 @@
 - 单行命令请求
 - 单行响应结果
 
-## 协议命令（v0.1）
+## 协议命令（v0.1+）
 
 - `PING`
 - `VERSION`
@@ -20,6 +20,12 @@
 - `ROUTE_CLEAR`
 - `ROUTE_ADD_RECT <id> <pass|block> <x> <y> <w> <h>`
 - `ROUTE_POINT <x> <y>`
+- `TOUCH_DOWN <pointer_id> <x> <y>`
+- `TOUCH_MOVE <pointer_id> <x> <y>`
+- `TOUCH_UP <pointer_id> <x> <y>`
+- `TOUCH_CANCEL <pointer_id>`
+- `TOUCH_CLEAR`
+- `TOUCH_COUNT`
 - `SHUTDOWN`
 
 ## 响应格式

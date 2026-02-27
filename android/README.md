@@ -8,6 +8,7 @@
 - 已接入显示探测实现（`AndroidDisplayAdapter`）
 - 已提供命令入口（`AndroidAdapterMain`）
 - 已可通过脚本构建并被 `app_process` 调用
+- Input 接口采用触控会话语义（Down/Move/Up/Cancel）
 
 设计约束：
 

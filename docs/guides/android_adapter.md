@@ -55,6 +55,7 @@
 ## 环境变量
 
 - `DSAPI_ANDROID_OUT_DIR`：Android 构建产物目录，默认 `artifacts/android`
+- `DSAPI_ANDROID_BUILD_MODE`：`display_probe`（默认）或 `all`
 - `DSAPI_RUN_AS_ROOT`：是否使用 `su -c` 执行 probe，默认 `1`
 - `DSAPI_APP_PROCESS_BIN`：指定 `app_process` 可执行路径，默认 `app_process`
 
@@ -68,6 +69,7 @@
 ## 当前边界
 
 - 已实现：显示参数探测与同步
+- 已定义：触控会话接口契约（Down/Move/Up/Cancel）
 - 未实现：触摸输入适配、渲染提交适配、事件回调桥接
 
 该边界用于保证重构阶段的稳定性，后续能力扩展在此基础上逐步推进。

@@ -5,6 +5,7 @@ DirectScreenAPI 采用“核心与适配分离”结构：
 1. 核心运行时（`core/rust`）
 - 领域状态模型
 - 路由逻辑与校验
+- 触控会话状态机
 - 确定性行为约束
 
 2. ABI 桥接层（`core/rust/src/ffi` + `bridge/c/include`）

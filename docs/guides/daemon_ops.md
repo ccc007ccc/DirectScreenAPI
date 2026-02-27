@@ -19,6 +19,10 @@
 ./scripts/daemon_cmd.sh DISPLAY_GET
 ./scripts/daemon_cmd.sh ROUTE_ADD_RECT 9 block 100 100 280 280
 ./scripts/daemon_cmd.sh ROUTE_POINT 120 120
+./scripts/daemon_cmd.sh TOUCH_DOWN 1 120 120
+./scripts/daemon_cmd.sh TOUCH_MOVE 1 300 300
+./scripts/daemon_cmd.sh TOUCH_UP 1 300 300
+./scripts/daemon_cmd.sh TOUCH_COUNT
 ```
 
 同步 Android 实际显示参数：

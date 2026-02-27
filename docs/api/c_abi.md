@@ -19,6 +19,15 @@
 - `dsapi_region_add_rect`
 - `dsapi_route_point`
 
+## 触控会话接口
+
+- `dsapi_touch_down`
+- `dsapi_touch_move`
+- `dsapi_touch_up`
+- `dsapi_touch_cancel`
+- `dsapi_touch_clear`
+- `dsapi_touch_count`
+
 ## 状态码
 
 - `0`: OK

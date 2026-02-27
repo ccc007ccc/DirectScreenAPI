@@ -16,7 +16,23 @@ public final class AdapterBootstrap {
         renderAdapter.onDisplayChanged(snapshot);
     }
 
-    public InputAdapter.RouteDecision routePoint(float x, float y) {
-        return inputAdapter.routePoint(x, y);
+    public TouchRouteResult onTouchDown(TouchEvent event) {
+        return inputAdapter.onTouchDown(event);
+    }
+
+    public TouchRouteResult onTouchMove(TouchEvent event) {
+        return inputAdapter.onTouchMove(event);
+    }
+
+    public TouchRouteResult onTouchUp(TouchEvent event) {
+        return inputAdapter.onTouchUp(event);
+    }
+
+    public TouchRouteResult onTouchCancel(int pointerId) {
+        return inputAdapter.onTouchCancel(pointerId);
+    }
+
+    public int activeTouchCount() {
+        return inputAdapter.activeTouchCount();
     }
 }

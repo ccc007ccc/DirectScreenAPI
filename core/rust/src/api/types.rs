@@ -8,6 +8,8 @@ pub enum Status {
     InternalError = 4,
 }
 
+pub const TOUCH_MAX_POINTERS: usize = 16;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum Decision {
@@ -105,5 +107,24 @@ impl RouteResult {
             decision: Decision::Pass,
             region_id: -1,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TouchEvent {
+    pub pointer_id: i32,
+    pub x: f32,
+    pub y: f32,
+}
+
+impl TouchEvent {
+    pub fn validate(&self) -> Result<(), Status> {
+        if self.pointer_id < 0 {
+            return Err(Status::OutOfRange);
+        }
+        if !self.x.is_finite() || !self.y.is_finite() {
+            return Err(Status::InvalidArgument);
+        }
+        Ok(())
     }
 }

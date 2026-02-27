@@ -62,6 +62,39 @@ int32_t dsapi_route_point(
     dsapi_route_result_t* out_result
 );
 
+int32_t dsapi_touch_down(
+    dsapi_context_t* ctx,
+    int32_t pointer_id,
+    float x,
+    float y,
+    dsapi_route_result_t* out_result
+);
+
+int32_t dsapi_touch_move(
+    dsapi_context_t* ctx,
+    int32_t pointer_id,
+    float x,
+    float y,
+    dsapi_route_result_t* out_result
+);
+
+int32_t dsapi_touch_up(
+    dsapi_context_t* ctx,
+    int32_t pointer_id,
+    float x,
+    float y,
+    dsapi_route_result_t* out_result
+);
+
+int32_t dsapi_touch_cancel(
+    dsapi_context_t* ctx,
+    int32_t pointer_id,
+    dsapi_route_result_t* out_result
+);
+
+int32_t dsapi_touch_clear(dsapi_context_t* ctx);
+int32_t dsapi_touch_count(dsapi_context_t* ctx, uint32_t* out_count);
+
 #ifdef __cplusplus
 }
 #endif
