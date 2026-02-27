@@ -1,3 +1,6 @@
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use base64::Engine;
+
 use crate::api::{Decision, RectRegion, Status, TouchEvent};
 use crate::engine::RuntimeEngine;
 use crate::DIRECTSCREEN_CORE_VERSION;
@@ -263,6 +266,61 @@ pub fn execute_command(engine: &mut RuntimeEngine, line: &str) -> CommandOutcome
                 ))
             }
         }
+        "RENDER_FRAME_SUBMIT_RGBA" => {
+            if tokens.len() != 4 {
+                Err(Status::InvalidArgument)
+            } else {
+                match (parse_u32(tokens[1]), parse_u32(tokens[2])) {
+                    (Ok(width), Ok(height)) => {
+                        let pixels_rgba8 = BASE64_STD
+                            .decode(tokens[3])
+                            .map_err(|_| Status::InvalidArgument);
+                        match pixels_rgba8 {
+                            Ok(pixels_rgba8) => {
+                                match engine.submit_render_frame_rgba(width, height, pixels_rgba8) {
+                                    Ok(frame) => Ok(format!(
+                                        "OK {} {} {} RGBA8888 {} {}",
+                                        frame.frame_seq,
+                                        frame.width,
+                                        frame.height,
+                                        frame.byte_len,
+                                        frame.checksum_fnv1a32
+                                    )),
+                                    Err(e) => Err(e),
+                                }
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    _ => Err(Status::InvalidArgument),
+                }
+            }
+        }
+        "RENDER_FRAME_GET" => {
+            if tokens.len() != 1 {
+                Err(Status::InvalidArgument)
+            } else {
+                match engine.render_frame_info() {
+                    Some(frame) => Ok(format!(
+                        "OK {} {} {} RGBA8888 {} {}",
+                        frame.frame_seq,
+                        frame.width,
+                        frame.height,
+                        frame.byte_len,
+                        frame.checksum_fnv1a32
+                    )),
+                    None => Err(Status::OutOfRange),
+                }
+            }
+        }
+        "RENDER_FRAME_CLEAR" => {
+            if tokens.len() != 1 {
+                Err(Status::InvalidArgument)
+            } else {
+                engine.clear_render_frame();
+                Ok("OK".to_string())
+            }
+        }
         "SHUTDOWN" => Ok("OK SHUTDOWN".to_string()),
         _ => Err(Status::InvalidArgument),
     };
@@ -353,5 +411,52 @@ mod tests {
         assert!(tokens[2].parse::<u32>().is_ok());
         assert!(tokens[3].parse::<u32>().is_ok());
         assert!(tokens[4].parse::<u32>().is_ok());
+    }
+
+    #[test]
+    fn render_frame_submit_get_and_clear_commands() {
+        let mut engine = RuntimeEngine::default();
+        let payload = BASE64_STD.encode([
+            255u8, 0u8, 0u8, 255u8, 0u8, 255u8, 0u8, 255u8, 0u8, 0u8, 255u8, 255u8, 255u8, 255u8,
+            255u8, 255u8,
+        ]);
+
+        let submit = execute_command(
+            &mut engine,
+            &format!("RENDER_FRAME_SUBMIT_RGBA 2 2 {}", payload),
+        );
+        let submit_tokens: Vec<&str> = submit.response_line.split_whitespace().collect();
+        assert_eq!(submit_tokens.len(), 7);
+        assert_eq!(submit_tokens[0], "OK");
+        assert_eq!(submit_tokens[2], "2");
+        assert_eq!(submit_tokens[3], "2");
+        assert_eq!(submit_tokens[4], "RGBA8888");
+        assert_eq!(submit_tokens[5], "16");
+        assert!(submit_tokens[1].parse::<u64>().is_ok());
+        assert!(submit_tokens[6].parse::<u32>().is_ok());
+
+        let get = execute_command(&mut engine, "RENDER_FRAME_GET");
+        assert_eq!(get.response_line, submit.response_line);
+
+        let clear = execute_command(&mut engine, "RENDER_FRAME_CLEAR");
+        assert_eq!(clear.response_line, "OK");
+
+        let get_after_clear = execute_command(&mut engine, "RENDER_FRAME_GET");
+        assert_eq!(get_after_clear.response_line, "ERR OUT_OF_RANGE");
+    }
+
+    #[test]
+    fn render_frame_submit_rejects_bad_payload() {
+        let mut engine = RuntimeEngine::default();
+
+        let bad_base64 = execute_command(&mut engine, "RENDER_FRAME_SUBMIT_RGBA 2 2 !!!");
+        assert_eq!(bad_base64.response_line, "ERR INVALID_ARGUMENT");
+
+        let too_short = BASE64_STD.encode([0u8; 15]);
+        let bad_len = execute_command(
+            &mut engine,
+            &format!("RENDER_FRAME_SUBMIT_RGBA 2 2 {}", too_short),
+        );
+        assert_eq!(bad_len.response_line, "ERR INVALID_ARGUMENT");
     }
 }

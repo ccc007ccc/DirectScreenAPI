@@ -15,6 +15,9 @@ fn usage() {
     println!("  dsapictl ROUTE_POINT 120 140");
     println!("  dsapictl RENDER_SUBMIT 12 2 3");
     println!("  dsapictl RENDER_GET");
+    println!("  dsapictl RENDER_FRAME_SUBMIT_RGBA 2 2 <base64_rgba>");
+    println!("  dsapictl RENDER_FRAME_GET");
+    println!("  dsapictl RENDER_FRAME_CLEAR");
 }
 
 fn main() {

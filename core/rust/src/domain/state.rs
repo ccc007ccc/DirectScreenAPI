@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::api::{
-    Decision, DisplayState, RectRegion, RenderStats, RouteResult, Status, TouchEvent,
-    TOUCH_MAX_POINTERS,
+    Decision, DisplayState, RectRegion, RenderFrameInfo, RenderStats, RouteResult, Status,
+    TouchEvent, RENDER_MAX_FRAME_BYTES, TOUCH_MAX_POINTERS,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -12,12 +12,20 @@ struct ActiveTouch {
     routed: RouteResult,
 }
 
+#[derive(Debug, Clone)]
+struct StoredRenderFrame {
+    info: RenderFrameInfo,
+    pixels_rgba8: Vec<u8>,
+}
+
 #[derive(Debug)]
 pub struct RuntimeState {
     pub display: DisplayState,
     pub render: RenderStats,
+    render_frame_seq: u64,
     pub default_decision: Decision,
     pub regions: Vec<RectRegion>,
+    last_render_frame: Option<StoredRenderFrame>,
     active_touches: HashMap<i32, ActiveTouch>,
 }
 
@@ -26,8 +34,10 @@ impl Default for RuntimeState {
         Self {
             display: DisplayState::default(),
             render: RenderStats::default(),
+            render_frame_seq: 0,
             default_decision: Decision::Pass,
             regions: Vec::new(),
+            last_render_frame: None,
             active_touches: HashMap::new(),
         }
     }
@@ -144,4 +154,60 @@ impl RuntimeState {
     pub fn render_stats(&self) -> RenderStats {
         self.render
     }
+
+    pub fn submit_render_frame_rgba(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixels_rgba8: Vec<u8>,
+    ) -> Result<RenderFrameInfo, Status> {
+        if width == 0 || height == 0 {
+            return Err(Status::InvalidArgument);
+        }
+
+        let expected_len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|v| v.checked_mul(4usize))
+            .ok_or(Status::OutOfRange)?;
+        if expected_len > RENDER_MAX_FRAME_BYTES {
+            return Err(Status::OutOfRange);
+        }
+        if pixels_rgba8.len() != expected_len {
+            return Err(Status::InvalidArgument);
+        }
+
+        self.render_frame_seq = self.render_frame_seq.saturating_add(1);
+        let info = RenderFrameInfo {
+            frame_seq: self.render_frame_seq,
+            width,
+            height,
+            byte_len: expected_len as u32,
+            checksum_fnv1a32: fnv1a32(&pixels_rgba8),
+        };
+        self.last_render_frame = Some(StoredRenderFrame { info, pixels_rgba8 });
+        Ok(info)
+    }
+
+    pub fn render_frame_info(&self) -> Option<RenderFrameInfo> {
+        self.last_render_frame.as_ref().map(|v| v.info)
+    }
+
+    pub fn clear_render_frame(&mut self) {
+        self.last_render_frame = None;
+    }
+
+    pub fn render_frame_byte_len(&self) -> Option<usize> {
+        self.last_render_frame
+            .as_ref()
+            .map(|f| f.pixels_rgba8.len())
+    }
+}
+
+fn fnv1a32(data: &[u8]) -> u32 {
+    let mut hash = 0x811c9dc5u32;
+    for b in data {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(0x01000193u32);
+    }
+    hash
 }

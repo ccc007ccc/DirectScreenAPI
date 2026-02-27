@@ -1,6 +1,6 @@
 mod types;
 
 pub use types::{
-    Decision, DisplayState, RectRegion, RenderStats, RouteResult, Status, TouchEvent,
-    TOUCH_MAX_POINTERS,
+    Decision, DisplayState, RectRegion, RenderFrameInfo, RenderStats, RouteResult, Status,
+    TouchEvent, RENDER_MAX_FRAME_BYTES, TOUCH_MAX_POINTERS,
 };

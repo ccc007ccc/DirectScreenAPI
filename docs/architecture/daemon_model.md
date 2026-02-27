@@ -29,6 +29,9 @@
 - `TOUCH_COUNT`
 - `RENDER_SUBMIT <draw_calls> <frost_passes> <text_calls>`
 - `RENDER_GET`
+- `RENDER_FRAME_SUBMIT_RGBA <width> <height> <base64_rgba8>`
+- `RENDER_FRAME_GET`
+- `RENDER_FRAME_CLEAR`
 - `SHUTDOWN`
 
 ## 响应格式

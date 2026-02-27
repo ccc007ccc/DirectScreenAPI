@@ -1,5 +1,6 @@
 use crate::api::{
-    Decision, DisplayState, RectRegion, RenderStats, RouteResult, Status, TouchEvent,
+    Decision, DisplayState, RectRegion, RenderFrameInfo, RenderStats, RouteResult, Status,
+    TouchEvent,
 };
 use crate::domain::RuntimeState;
 
@@ -69,6 +70,28 @@ impl RuntimeEngine {
 
     pub fn render_stats(&self) -> RenderStats {
         self.state.render_stats()
+    }
+
+    pub fn submit_render_frame_rgba(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixels_rgba8: Vec<u8>,
+    ) -> Result<RenderFrameInfo, Status> {
+        self.state
+            .submit_render_frame_rgba(width, height, pixels_rgba8)
+    }
+
+    pub fn render_frame_info(&self) -> Option<RenderFrameInfo> {
+        self.state.render_frame_info()
+    }
+
+    pub fn clear_render_frame(&mut self) {
+        self.state.clear_render_frame();
+    }
+
+    pub fn render_frame_byte_len(&self) -> Option<usize> {
+        self.state.render_frame_byte_len()
     }
 }
 
@@ -192,5 +215,42 @@ mod tests {
 
         let got = engine.render_stats();
         assert_eq!(got, second);
+    }
+
+    #[test]
+    fn render_frame_submit_get_and_clear() {
+        let mut engine = RuntimeEngine::default();
+        let pixels = vec![
+            255u8, 0u8, 0u8, 255u8, 0u8, 255u8, 0u8, 255u8, 0u8, 0u8, 255u8, 255u8, 255u8, 255u8,
+            255u8, 255u8,
+        ];
+        let first = engine
+            .submit_render_frame_rgba(2, 2, pixels.clone())
+            .expect("submit first frame");
+        assert_eq!(first.frame_seq, 1);
+        assert_eq!(first.width, 2);
+        assert_eq!(first.height, 2);
+        assert_eq!(first.byte_len, 16);
+        assert_ne!(first.checksum_fnv1a32, 0);
+        assert_eq!(engine.render_frame_byte_len(), Some(16));
+
+        let second = engine
+            .submit_render_frame_rgba(2, 2, pixels)
+            .expect("submit second frame");
+        assert_eq!(second.frame_seq, 2);
+
+        let got = engine.render_frame_info().expect("frame info should exist");
+        assert_eq!(got.frame_seq, 2);
+
+        engine.clear_render_frame();
+        assert_eq!(engine.render_frame_info(), None);
+        assert_eq!(engine.render_frame_byte_len(), None);
+    }
+
+    #[test]
+    fn render_frame_rejects_invalid_length() {
+        let mut engine = RuntimeEngine::default();
+        let out = engine.submit_render_frame_rgba(2, 2, vec![1u8; 15]);
+        assert_eq!(out, Err(Status::InvalidArgument));
     }
 }

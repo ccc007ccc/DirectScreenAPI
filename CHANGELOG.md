@@ -16,6 +16,7 @@
 - 触摸桥接支持显示参数变化自动重映射
 - `dsapid` 支持并发连接处理
 - 新增渲染统计命令（`RENDER_SUBMIT` / `RENDER_GET`）
+- 新增像素帧提交命令（`RENDER_FRAME_SUBMIT_RGBA` / `RENDER_FRAME_GET` / `RENDER_FRAME_CLEAR`）
 
 ## 0.1.0 - 基石重构版本
 
