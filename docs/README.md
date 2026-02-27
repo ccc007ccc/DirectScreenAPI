@@ -14,6 +14,7 @@
 
 - `guides/build.md`
 - `guides/daemon_ops.md`
+- `guides/android_adapter.md`
 - `guides/stability_policy.md`
 
 ## 治理

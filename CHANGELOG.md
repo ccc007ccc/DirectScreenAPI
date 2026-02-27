@@ -1,5 +1,13 @@
 # 变更日志
 
+## 未发布
+
+- 新增 Android 显示探测实现（`AndroidDisplayAdapter`）
+- 新增 Android 适配入口（`AndroidAdapterMain`）
+- 新增 Android 适配构建脚本与显示探测脚本
+- 新增显示参数同步脚本（同步到 `dsapid` 的 `DISPLAY_SET`）
+- 新增 Android 适配中文指南并更新索引
+
 ## 0.1.0 - 基石重构版本
 
 - 初始化全新仓库结构（不迁移历史实现）

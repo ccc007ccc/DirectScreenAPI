@@ -18,6 +18,12 @@ cd core/rust
 cargo run --bin dsapi -- version
 ```
 
+## 构建 Android 适配层
+
+```sh
+./scripts/build_android_adapter.sh
+```
+
 ## 构建并运行 C 示例
 
 ```sh

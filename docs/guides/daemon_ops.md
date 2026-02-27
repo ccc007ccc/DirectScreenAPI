@@ -21,6 +21,12 @@
 ./scripts/daemon_cmd.sh ROUTE_POINT 120 120
 ```
 
+同步 Android 实际显示参数：
+
+```sh
+./scripts/daemon_sync_display.sh
+```
+
 ## 停止
 
 ```sh
