@@ -27,6 +27,9 @@
 ./scripts/daemon_cmd.sh RENDER_GET
 ./scripts/daemon_cmd.sh RENDER_FRAME_SUBMIT_RGBA 1 1 /wAA/w==
 ./scripts/daemon_cmd.sh RENDER_FRAME_GET
+./scripts/daemon_cmd.sh RENDER_PRESENT
+./scripts/daemon_cmd.sh RENDER_PRESENT_GET
+./scripts/daemon_cmd.sh RENDER_DUMP_PPM
 ./scripts/daemon_cmd.sh RENDER_FRAME_CLEAR
 ```
 
@@ -62,5 +65,6 @@
 - `DSAPI_TOUCH_AUTO_SYNC_DISPLAY`
 - `DSAPI_TOUCH_SYNC_DISPLAY_EVERY_SEC`
 - `DSAPI_TOUCH_MONITOR_INTERVAL_SEC`
+- `DSAPI_RENDER_OUTPUT_DIR`
 
 可用于多实例隔离运行与路径定制。

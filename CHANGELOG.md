@@ -17,6 +17,8 @@
 - `dsapid` 支持并发连接处理
 - 新增渲染统计命令（`RENDER_SUBMIT` / `RENDER_GET`）
 - 新增像素帧提交命令（`RENDER_FRAME_SUBMIT_RGBA` / `RENDER_FRAME_GET` / `RENDER_FRAME_CLEAR`）
+- 新增呈现命令（`RENDER_PRESENT` / `RENDER_PRESENT_GET`）作为内存主链路
+- 新增调试导出命令 `RENDER_DUMP_PPM`
 
 ## 0.1.0 - 基石重构版本
 

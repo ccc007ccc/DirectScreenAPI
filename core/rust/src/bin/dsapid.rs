@@ -40,6 +40,17 @@ fn parse_socket_arg(args: &[String]) -> String {
     default_socket_path()
 }
 
+fn parse_render_output_dir_arg(args: &[String]) -> String {
+    let mut i = 1usize;
+    while i < args.len() {
+        if args[i] == "--render-output-dir" && (i + 1) < args.len() {
+            return args[i + 1].clone();
+        }
+        i += 1;
+    }
+    std::env::var("DSAPI_RENDER_OUTPUT_DIR").unwrap_or_else(|_| "artifacts/render".to_string())
+}
+
 fn ensure_parent(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -101,6 +112,7 @@ fn handle_client(
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let socket_path = parse_socket_arg(&args);
+    let render_output_dir = parse_render_output_dir_arg(&args);
     let socket_path = PathBuf::from(socket_path);
 
     if let Err(e) = ensure_parent(&socket_path) {
@@ -131,8 +143,12 @@ fn main() {
 
     println!("daemon_status=started socket={}", socket_path.display());
 
-    let engine = Arc::new(Mutex::new(RuntimeEngine::default()));
+    let engine = Arc::new(Mutex::new(RuntimeEngine::new_with_render_output_dir(
+        render_output_dir.clone(),
+    )));
     let shutdown = Arc::new(AtomicBool::new(false));
+
+    println!("daemon_render_output_dir={}", render_output_dir);
 
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {

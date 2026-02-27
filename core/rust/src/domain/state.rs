@@ -201,6 +201,12 @@ impl RuntimeState {
             .as_ref()
             .map(|f| f.pixels_rgba8.len())
     }
+
+    pub fn render_frame_snapshot(&self) -> Option<(RenderFrameInfo, Vec<u8>)> {
+        self.last_render_frame
+            .as_ref()
+            .map(|f| (f.info, f.pixels_rgba8.clone()))
+    }
 }
 
 fn fnv1a32(data: &[u8]) -> u32 {

@@ -321,6 +321,52 @@ pub fn execute_command(engine: &mut RuntimeEngine, line: &str) -> CommandOutcome
                 Ok("OK".to_string())
             }
         }
+        "RENDER_PRESENT" => {
+            if tokens.len() != 1 {
+                Err(Status::InvalidArgument)
+            } else {
+                match engine.render_present() {
+                    Ok(present) => Ok(format!(
+                        "OK {} {} {} {} RGBA8888 {} {}",
+                        present.present_seq,
+                        present.frame_seq,
+                        present.width,
+                        present.height,
+                        present.byte_len,
+                        present.checksum_fnv1a32
+                    )),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        "RENDER_PRESENT_GET" => {
+            if tokens.len() != 1 {
+                Err(Status::InvalidArgument)
+            } else {
+                match engine.render_present_get() {
+                    Some(present) => Ok(format!(
+                        "OK {} {} {} {} RGBA8888 {} {}",
+                        present.present_seq,
+                        present.frame_seq,
+                        present.width,
+                        present.height,
+                        present.byte_len,
+                        present.checksum_fnv1a32
+                    )),
+                    None => Err(Status::OutOfRange),
+                }
+            }
+        }
+        "RENDER_DUMP_PPM" => {
+            if tokens.len() != 1 {
+                Err(Status::InvalidArgument)
+            } else {
+                match engine.render_dump_ppm() {
+                    Ok(path) => Ok(format!("OK {}", path)),
+                    Err(e) => Err(e),
+                }
+            }
+        }
         "SHUTDOWN" => Ok("OK SHUTDOWN".to_string()),
         _ => Err(Status::InvalidArgument),
     };
@@ -458,5 +504,49 @@ mod tests {
             &format!("RENDER_FRAME_SUBMIT_RGBA 2 2 {}", too_short),
         );
         assert_eq!(bad_len.response_line, "ERR INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn render_present_and_get_commands() {
+        let mut engine =
+            RuntimeEngine::new_with_render_output_dir("artifacts/test_protocol_present");
+        let payload = BASE64_STD.encode([
+            255u8, 0u8, 0u8, 255u8, 0u8, 255u8, 0u8, 255u8, 0u8, 0u8, 255u8, 255u8, 255u8, 255u8,
+            255u8, 255u8,
+        ]);
+        let submit = execute_command(
+            &mut engine,
+            &format!("RENDER_FRAME_SUBMIT_RGBA 2 2 {}", payload),
+        );
+        assert!(submit.response_line.starts_with("OK "));
+
+        let present = execute_command(&mut engine, "RENDER_PRESENT");
+        let present_tokens: Vec<&str> = present.response_line.split_whitespace().collect();
+        assert_eq!(present_tokens.len(), 8);
+        assert_eq!(present_tokens[0], "OK");
+        assert_eq!(present_tokens[3], "2");
+        assert_eq!(present_tokens[4], "2");
+        assert_eq!(present_tokens[5], "RGBA8888");
+        assert_eq!(present_tokens[6], "16");
+        assert!(present_tokens[1].parse::<u64>().is_ok());
+        assert!(present_tokens[2].parse::<u64>().is_ok());
+        assert!(present_tokens[7].parse::<u32>().is_ok());
+
+        let get = execute_command(&mut engine, "RENDER_PRESENT_GET");
+        assert_eq!(get.response_line, present.response_line);
+
+        let dump = execute_command(&mut engine, "RENDER_DUMP_PPM");
+        assert!(dump.response_line.starts_with("OK "));
+        let dump_path = dump.response_line.trim_start_matches("OK ").trim();
+        assert!(std::path::Path::new(dump_path).exists());
+    }
+
+    #[test]
+    fn render_present_without_frame_is_out_of_range() {
+        let mut engine = RuntimeEngine::default();
+        let present = execute_command(&mut engine, "RENDER_PRESENT");
+        assert_eq!(present.response_line, "ERR OUT_OF_RANGE");
+        let get = execute_command(&mut engine, "RENDER_PRESENT_GET");
+        assert_eq!(get.response_line, "ERR OUT_OF_RANGE");
     }
 }

@@ -3,13 +3,46 @@ use crate::api::{
     TouchEvent,
 };
 use crate::domain::RuntimeState;
+use std::fs::{create_dir_all, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderPresentInfo {
+    pub present_seq: u64,
+    pub frame_seq: u64,
+    pub width: u32,
+    pub height: u32,
+    pub byte_len: u32,
+    pub checksum_fnv1a32: u32,
+}
+
+#[derive(Debug)]
 pub struct RuntimeEngine {
     state: RuntimeState,
+    present_seq: u64,
+    dump_seq: u64,
+    last_present: Option<RenderPresentInfo>,
+    render_output_dir: PathBuf,
+}
+
+impl Default for RuntimeEngine {
+    fn default() -> Self {
+        Self::new_with_render_output_dir("artifacts/render")
+    }
 }
 
 impl RuntimeEngine {
+    pub fn new_with_render_output_dir(render_output_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            state: RuntimeState::default(),
+            present_seq: 0,
+            dump_seq: 0,
+            last_present: None,
+            render_output_dir: render_output_dir.into(),
+        }
+    }
+
     pub fn set_display_state(&mut self, display: DisplayState) -> Result<(), Status> {
         self.state.set_display(display)
     }
@@ -93,6 +126,73 @@ impl RuntimeEngine {
     pub fn render_frame_byte_len(&self) -> Option<usize> {
         self.state.render_frame_byte_len()
     }
+
+    pub fn render_present(&mut self) -> Result<RenderPresentInfo, Status> {
+        let (frame_info, _pixels) = self
+            .state
+            .render_frame_snapshot()
+            .ok_or(Status::OutOfRange)?;
+        self.present_seq = self.present_seq.saturating_add(1);
+
+        let info = RenderPresentInfo {
+            present_seq: self.present_seq,
+            frame_seq: frame_info.frame_seq,
+            width: frame_info.width,
+            height: frame_info.height,
+            byte_len: frame_info.byte_len,
+            checksum_fnv1a32: frame_info.checksum_fnv1a32,
+        };
+        self.last_present = Some(info.clone());
+        Ok(info)
+    }
+
+    pub fn render_present_get(&self) -> Option<RenderPresentInfo> {
+        self.last_present.clone()
+    }
+
+    pub fn render_dump_ppm(&mut self) -> Result<String, Status> {
+        let (frame_info, pixels) = self
+            .state
+            .render_frame_snapshot()
+            .ok_or(Status::OutOfRange)?;
+        self.dump_seq = self.dump_seq.saturating_add(1);
+        create_dir_all(&self.render_output_dir).map_err(|_| Status::InternalError)?;
+
+        let file_name = format!(
+            "frame_dump_{:08}_frame_{:08}.ppm",
+            self.dump_seq, frame_info.frame_seq
+        );
+        let path = self.render_output_dir.join(file_name);
+        write_ppm_rgba(path.as_path(), frame_info.width, frame_info.height, &pixels)
+            .map_err(|_| Status::InternalError)?;
+        Ok(path.display().to_string())
+    }
+}
+
+fn write_ppm_rgba(path: &Path, width: u32, height: u32, rgba8: &[u8]) -> std::io::Result<()> {
+    let expected_len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|v| v.checked_mul(4usize))
+        .ok_or_else(|| std::io::Error::other("ppm_size_overflow"))?;
+    if rgba8.len() != expected_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ppm_input_len_mismatch",
+        ));
+    }
+
+    let mut f = File::create(path)?;
+    let header = format!("P6\n{} {}\n255\n", width, height);
+    f.write_all(header.as_bytes())?;
+
+    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3usize);
+    for px in rgba8.chunks_exact(4) {
+        rgb.push(px[0]);
+        rgb.push(px[1]);
+        rgb.push(px[2]);
+    }
+    f.write_all(&rgb)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -252,5 +352,49 @@ mod tests {
         let mut engine = RuntimeEngine::default();
         let out = engine.submit_render_frame_rgba(2, 2, vec![1u8; 15]);
         assert_eq!(out, Err(Status::InvalidArgument));
+    }
+
+    #[test]
+    fn render_present_updates_metadata_without_disk_io() {
+        let mut engine = RuntimeEngine::new_with_render_output_dir("artifacts/test_render_present");
+        let pixels = vec![
+            255u8, 0u8, 0u8, 255u8, 0u8, 255u8, 0u8, 255u8, 0u8, 0u8, 255u8, 255u8, 255u8, 255u8,
+            255u8, 255u8,
+        ];
+        let frame = engine
+            .submit_render_frame_rgba(2, 2, pixels)
+            .expect("submit frame");
+        let presented = engine.render_present().expect("present frame");
+        assert_eq!(presented.present_seq, 1);
+        assert_eq!(presented.frame_seq, frame.frame_seq);
+        assert_eq!(presented.width, 2);
+        assert_eq!(presented.height, 2);
+        assert_eq!(presented.byte_len, 16);
+
+        let got = engine
+            .render_present_get()
+            .expect("present state should exist");
+        assert_eq!(got, presented);
+    }
+
+    #[test]
+    fn render_present_without_frame_returns_out_of_range() {
+        let mut engine = RuntimeEngine::default();
+        let out = engine.render_present();
+        assert_eq!(out, Err(Status::OutOfRange));
+    }
+
+    #[test]
+    fn render_dump_ppm_writes_file() {
+        let mut engine = RuntimeEngine::new_with_render_output_dir("artifacts/test_render_dump");
+        let pixels = vec![
+            255u8, 0u8, 0u8, 255u8, 0u8, 255u8, 0u8, 255u8, 0u8, 0u8, 255u8, 255u8, 255u8, 255u8,
+            255u8, 255u8,
+        ];
+        engine
+            .submit_render_frame_rgba(2, 2, pixels)
+            .expect("submit frame");
+        let path = engine.render_dump_ppm().expect("dump ppm");
+        assert!(std::path::Path::new(&path).exists());
     }
 }
