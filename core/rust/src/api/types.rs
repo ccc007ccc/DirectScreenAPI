@@ -10,6 +10,7 @@ pub enum Status {
 
 pub const TOUCH_MAX_POINTERS: usize = 16;
 pub const RENDER_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+pub const RENDER_MAX_CHUNK_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct RenderStats {
@@ -26,6 +27,14 @@ pub struct RenderFrameInfo {
     pub height: u32,
     pub byte_len: u32,
     pub checksum_fnv1a32: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct RenderFrameChunk {
+    pub frame_seq: u64,
+    pub total_bytes: u32,
+    pub offset: u32,
+    pub chunk_bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

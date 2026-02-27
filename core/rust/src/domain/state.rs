@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use crate::api::{
-    Decision, DisplayState, RectRegion, RenderFrameInfo, RenderStats, RouteResult, Status,
-    TouchEvent, RENDER_MAX_FRAME_BYTES, TOUCH_MAX_POINTERS,
+    Decision, DisplayState, RectRegion, RenderFrameChunk, RenderFrameInfo, RenderStats,
+    RouteResult, Status, TouchEvent, RENDER_MAX_CHUNK_BYTES, RENDER_MAX_FRAME_BYTES,
+    TOUCH_MAX_POINTERS,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -206,6 +207,31 @@ impl RuntimeState {
         self.last_render_frame
             .as_ref()
             .map(|f| (f.info, f.pixels_rgba8.clone()))
+    }
+
+    pub fn render_frame_read_chunk(
+        &self,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Result<RenderFrameChunk, Status> {
+        if max_bytes == 0 || max_bytes > RENDER_MAX_CHUNK_BYTES {
+            return Err(Status::OutOfRange);
+        }
+
+        let frame = self.last_render_frame.as_ref().ok_or(Status::OutOfRange)?;
+        let total = frame.pixels_rgba8.len();
+        if offset >= total {
+            return Err(Status::OutOfRange);
+        }
+        let end = offset.saturating_add(max_bytes).min(total);
+        let bytes = frame.pixels_rgba8[offset..end].to_vec();
+
+        Ok(RenderFrameChunk {
+            frame_seq: frame.info.frame_seq,
+            total_bytes: frame.info.byte_len,
+            offset: offset as u32,
+            chunk_bytes: bytes,
+        })
     }
 }
 

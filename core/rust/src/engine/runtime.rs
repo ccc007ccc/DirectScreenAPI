@@ -1,6 +1,6 @@
 use crate::api::{
-    Decision, DisplayState, RectRegion, RenderFrameInfo, RenderStats, RouteResult, Status,
-    TouchEvent,
+    Decision, DisplayState, RectRegion, RenderFrameChunk, RenderFrameInfo, RenderStats,
+    RouteResult, Status, TouchEvent,
 };
 use crate::domain::RuntimeState;
 use std::fs::{create_dir_all, File};
@@ -125,6 +125,14 @@ impl RuntimeEngine {
 
     pub fn render_frame_byte_len(&self) -> Option<usize> {
         self.state.render_frame_byte_len()
+    }
+
+    pub fn render_frame_read_chunk(
+        &self,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Result<RenderFrameChunk, Status> {
+        self.state.render_frame_read_chunk(offset, max_bytes)
     }
 
     pub fn render_present(&mut self) -> Result<RenderPresentInfo, Status> {
@@ -396,5 +404,51 @@ mod tests {
             .expect("submit frame");
         let path = engine.render_dump_ppm().expect("dump ppm");
         assert!(std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn render_frame_read_chunk_reads_partial_bytes() {
+        let mut engine = RuntimeEngine::default();
+        let pixels = (0u8..16u8).collect::<Vec<u8>>();
+        let frame = engine
+            .submit_render_frame_rgba(2, 2, pixels.clone())
+            .expect("submit frame");
+
+        let a = engine
+            .render_frame_read_chunk(0, 6)
+            .expect("read first chunk");
+        assert_eq!(a.frame_seq, frame.frame_seq);
+        assert_eq!(a.total_bytes, 16);
+        assert_eq!(a.offset, 0);
+        assert_eq!(a.chunk_bytes, pixels[0..6].to_vec());
+
+        let b = engine
+            .render_frame_read_chunk(6, 6)
+            .expect("read second chunk");
+        assert_eq!(b.offset, 6);
+        assert_eq!(b.chunk_bytes, pixels[6..12].to_vec());
+
+        let c = engine
+            .render_frame_read_chunk(12, 16)
+            .expect("read last chunk");
+        assert_eq!(c.offset, 12);
+        assert_eq!(c.chunk_bytes, pixels[12..16].to_vec());
+    }
+
+    #[test]
+    fn render_frame_read_chunk_rejects_invalid_range() {
+        let mut engine = RuntimeEngine::default();
+        let pixels = vec![1u8; 16];
+        engine
+            .submit_render_frame_rgba(2, 2, pixels)
+            .expect("submit frame");
+        assert_eq!(
+            engine.render_frame_read_chunk(16, 1),
+            Err(Status::OutOfRange)
+        );
+        assert_eq!(
+            engine.render_frame_read_chunk(0, 0),
+            Err(Status::OutOfRange)
+        );
     }
 }

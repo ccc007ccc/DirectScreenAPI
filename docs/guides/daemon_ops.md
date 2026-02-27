@@ -27,9 +27,11 @@
 ./scripts/daemon_cmd.sh RENDER_GET
 ./scripts/daemon_cmd.sh RENDER_FRAME_SUBMIT_RGBA 1 1 /wAA/w==
 ./scripts/daemon_cmd.sh RENDER_FRAME_GET
+./scripts/daemon_cmd.sh RENDER_FRAME_READ_BASE64 0 1024
 ./scripts/daemon_cmd.sh RENDER_PRESENT
 ./scripts/daemon_cmd.sh RENDER_PRESENT_GET
 ./scripts/daemon_cmd.sh RENDER_DUMP_PPM
+./scripts/daemon_frame_pull.sh artifacts/frame/latest.rgba
 ./scripts/daemon_cmd.sh RENDER_FRAME_CLEAR
 ```
 

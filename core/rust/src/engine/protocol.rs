@@ -37,6 +37,11 @@ fn parse_u32(token: &str) -> Result<u32, Status> {
     token.parse::<u32>().map_err(|_| Status::InvalidArgument)
 }
 
+fn parse_usize(token: &str) -> Result<usize, Status> {
+    let v = parse_u32(token)?;
+    usize::try_from(v).map_err(|_| Status::OutOfRange)
+}
+
 fn parse_f32(token: &str) -> Result<f32, Status> {
     token.parse::<f32>().map_err(|_| Status::InvalidArgument)
 }
@@ -313,6 +318,28 @@ pub fn execute_command(engine: &mut RuntimeEngine, line: &str) -> CommandOutcome
                 }
             }
         }
+        "RENDER_FRAME_READ_BASE64" => {
+            if tokens.len() != 3 {
+                Err(Status::InvalidArgument)
+            } else {
+                match (parse_usize(tokens[1]), parse_usize(tokens[2])) {
+                    (Ok(offset), Ok(max_bytes)) => {
+                        match engine.render_frame_read_chunk(offset, max_bytes) {
+                            Ok(chunk) => Ok(format!(
+                                "OK {} {} {} {} {}",
+                                chunk.frame_seq,
+                                chunk.total_bytes,
+                                chunk.offset,
+                                chunk.chunk_bytes.len(),
+                                BASE64_STD.encode(&chunk.chunk_bytes)
+                            )),
+                            Err(e) => Err(e),
+                        }
+                    }
+                    _ => Err(Status::InvalidArgument),
+                }
+            }
+        }
         "RENDER_FRAME_CLEAR" => {
             if tokens.len() != 1 {
                 Err(Status::InvalidArgument)
@@ -504,6 +531,44 @@ mod tests {
             &format!("RENDER_FRAME_SUBMIT_RGBA 2 2 {}", too_short),
         );
         assert_eq!(bad_len.response_line, "ERR INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn render_frame_read_base64_command_reads_chunks() {
+        let mut engine = RuntimeEngine::default();
+        let payload = BASE64_STD.encode([0u8, 1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8]);
+        let submit = execute_command(
+            &mut engine,
+            &format!("RENDER_FRAME_SUBMIT_RGBA 1 2 {}", payload),
+        );
+        assert!(submit.response_line.starts_with("OK "));
+
+        let read = execute_command(&mut engine, "RENDER_FRAME_READ_BASE64 2 3");
+        let tokens: Vec<&str> = read.response_line.split_whitespace().collect();
+        assert_eq!(tokens.len(), 6);
+        assert_eq!(tokens[0], "OK");
+        assert_eq!(tokens[2], "8");
+        assert_eq!(tokens[3], "2");
+        assert_eq!(tokens[4], "3");
+        let chunk = BASE64_STD.decode(tokens[5]).expect("decode chunk");
+        assert_eq!(chunk, vec![2u8, 3u8, 4u8]);
+    }
+
+    #[test]
+    fn render_frame_read_base64_rejects_invalid_request() {
+        let mut engine = RuntimeEngine::default();
+        let read_without_frame = execute_command(&mut engine, "RENDER_FRAME_READ_BASE64 0 16");
+        assert_eq!(read_without_frame.response_line, "ERR OUT_OF_RANGE");
+
+        let payload = BASE64_STD.encode([0u8, 1u8, 2u8, 3u8]);
+        let submit = execute_command(
+            &mut engine,
+            &format!("RENDER_FRAME_SUBMIT_RGBA 1 1 {}", payload),
+        );
+        assert!(submit.response_line.starts_with("OK "));
+
+        let bad = execute_command(&mut engine, "RENDER_FRAME_READ_BASE64 4 1");
+        assert_eq!(bad.response_line, "ERR OUT_OF_RANGE");
     }
 
     #[test]

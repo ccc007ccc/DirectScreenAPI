@@ -17,6 +17,7 @@ fn usage() {
     println!("  dsapictl RENDER_GET");
     println!("  dsapictl RENDER_FRAME_SUBMIT_RGBA 2 2 <base64_rgba>");
     println!("  dsapictl RENDER_FRAME_GET");
+    println!("  dsapictl RENDER_FRAME_READ_BASE64 0 1024");
     println!("  dsapictl RENDER_FRAME_CLEAR");
     println!("  dsapictl RENDER_PRESENT");
     println!("  dsapictl RENDER_PRESENT_GET");

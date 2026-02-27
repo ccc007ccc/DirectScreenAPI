@@ -19,6 +19,8 @@
 - 新增像素帧提交命令（`RENDER_FRAME_SUBMIT_RGBA` / `RENDER_FRAME_GET` / `RENDER_FRAME_CLEAR`）
 - 新增呈现命令（`RENDER_PRESENT` / `RENDER_PRESENT_GET`）作为内存主链路
 - 新增调试导出命令 `RENDER_DUMP_PPM`
+- 新增帧分块读取命令 `RENDER_FRAME_READ_BASE64`
+- 新增 `scripts/daemon_frame_pull.sh`，可按分块协议拉取完整 RGBA 帧
 
 ## 0.1.0 - 基石重构版本
 
