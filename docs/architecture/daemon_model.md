@@ -9,6 +9,7 @@
 - Unix Domain Socket（默认 `artifacts/run/dsapi.sock`）
 - 单行命令请求
 - 单行响应结果
+- 并发连接处理（触摸桥接与控制命令可并行）
 
 ## 协议命令（v0.1+）
 

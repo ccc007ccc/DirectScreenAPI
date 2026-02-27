@@ -37,13 +37,16 @@
 
 - 默认使用 root 采集：`DSAPI_TOUCH_RUN_AS_ROOT=1`
 - 自动探测触摸设备（`ABS_MT_POSITION_X/Y` + `ABS_MT_TRACKING_ID`）
+- 运行时按周期检查显示状态，分辨率/旋转变化后自动重建映射管线
 - 启动时执行一次 `TOUCH_CLEAR`，退出时再次清理，避免粘连触点
 
 ## 关键环境变量
 
 - `DSAPI_TOUCH_DEVICE`：手动指定触摸设备，如 `/dev/input/event6`
 - `DSAPI_TOUCH_RUN_AS_ROOT`：是否使用 `su -c`（默认 `1`）
-- `DSAPI_TOUCH_SYNC_DISPLAY`：启动前是否执行一次显示同步（默认 `1`）
+- `DSAPI_TOUCH_AUTO_SYNC_DISPLAY`：是否自动调用 `daemon_sync_display.sh`（默认 `1`）
+- `DSAPI_TOUCH_SYNC_DISPLAY_EVERY_SEC`：自动同步显示周期，默认 `1`
+- `DSAPI_TOUCH_MONITOR_INTERVAL_SEC`：显示变化监视周期，默认 `1`
 - `DSAPI_TOUCH_BRIDGE_PID_FILE`：桥接 PID 文件路径
 - `DSAPI_TOUCH_BRIDGE_LOG_FILE`：桥接日志路径
 - `DSAPI_GETEVENT_BIN`：`getevent` 可执行路径，默认 `/system/bin/getevent`
@@ -51,7 +54,7 @@
 ## 性能说明
 
 - 触摸命令通过 `dsapistream` 持续读取标准输入，不再每条事件启动新进程
-- 传输层仍保持单命令请求/响应模型，行为可预测
+- `dsapid` 支持并发连接，触摸桥接与控制命令互不阻塞
 
 ## 故障排查
 
@@ -61,3 +64,5 @@
   - daemon 未启动或 display 状态异常
 - `touch_bridge_status=failed_start`
   - 查看日志文件定位原因
+- `touch_bridge_status=display_changed`
+  - 说明已检测到显示参数变化并自动重建映射

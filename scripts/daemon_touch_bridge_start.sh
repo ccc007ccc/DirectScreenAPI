@@ -25,7 +25,7 @@ fi
 
 ./scripts/build_core.sh >/dev/null
 
-nohup ./scripts/daemon_touch_bridge_run.sh >>"$LOG_FILE" 2>&1 &
+nohup setsid ./scripts/daemon_touch_bridge_run.sh >>"$LOG_FILE" 2>&1 < /dev/null &
 pid="$!"
 echo "$pid" > "$PID_FILE"
 

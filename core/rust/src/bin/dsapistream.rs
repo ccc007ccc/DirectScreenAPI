@@ -1,22 +1,33 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
-fn send_line(socket: &str, line: &str) -> io::Result<String> {
-    let mut stream = UnixStream::connect(socket)?;
-    stream.write_all(line.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
+struct SocketClient {
+    writer: UnixStream,
+    reader: BufReader<UnixStream>,
+}
 
-    let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    let n = reader.read_line(&mut response)?;
-    if n == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "socket_closed",
-        ));
+impl SocketClient {
+    fn connect(socket: &str) -> io::Result<Self> {
+        let writer = UnixStream::connect(socket)?;
+        let reader = BufReader::new(writer.try_clone()?);
+        Ok(Self { writer, reader })
     }
-    Ok(response.trim_end().to_string())
+
+    fn send_line(&mut self, line: &str) -> io::Result<String> {
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()?;
+
+        let mut response = String::new();
+        let n = self.reader.read_line(&mut response)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "socket_closed",
+            ));
+        }
+        Ok(response.trim_end().to_string())
+    }
 }
 
 fn default_socket_path() -> String {
@@ -60,6 +71,14 @@ fn main() {
     let mut input = stdin.lock();
     let mut line = String::new();
 
+    let mut client = match SocketClient::connect(&socket) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("stream_error=connect_failed socket={} err={}", socket, e);
+            std::process::exit(2);
+        }
+    };
+
     loop {
         line.clear();
         let n = match input.read_line(&mut line) {
@@ -78,11 +97,27 @@ fn main() {
             continue;
         }
 
-        let response = match send_line(&socket, cmd) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("stream_error=send_failed cmd={} err={}", cmd, e);
-                std::process::exit(4);
+        let mut retried = false;
+        let response = loop {
+            match client.send_line(cmd) {
+                Ok(resp) => break resp,
+                Err(e) => {
+                    if retried {
+                        eprintln!("stream_error=send_failed cmd={} err={}", cmd, e);
+                        std::process::exit(4);
+                    }
+                    retried = true;
+                    client = match SocketClient::connect(&socket) {
+                        Ok(v) => v,
+                        Err(conn_err) => {
+                            eprintln!(
+                                "stream_error=reconnect_failed socket={} err={}",
+                                socket, conn_err
+                            );
+                            std::process::exit(5);
+                        }
+                    };
+                }
             }
         };
 

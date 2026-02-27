@@ -1,7 +1,11 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use directscreen_core::engine::{execute_command, RuntimeEngine};
 
@@ -43,6 +47,57 @@ fn ensure_parent(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn handle_client(
+    mut stream: UnixStream,
+    engine: Arc<Mutex<RuntimeEngine>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let reader_stream = match stream.try_clone() {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = stream.write_all(format!("ERR INTERNAL_ERROR clone_failed:{}\n", e).as_bytes());
+            return;
+        }
+    };
+
+    let mut reader = BufReader::new(reader_stream);
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let outcome = {
+                    match engine.lock() {
+                        Ok(mut guard) => execute_command(&mut guard, &line),
+                        Err(_) => {
+                            let _ = stream.write_all(b"ERR INTERNAL_ERROR lock_poisoned\n");
+                            break;
+                        }
+                    }
+                };
+
+                let response = format!("{}\n", outcome.response_line);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+
+                if outcome.should_shutdown {
+                    shutdown.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+            Err(e) => {
+                let _ =
+                    stream.write_all(format!("ERR INTERNAL_ERROR read_failed:{}\n", e).as_bytes());
+                break;
+            }
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let socket_path = parse_socket_arg(&args);
@@ -67,53 +122,36 @@ fn main() {
         }
     };
 
+    if let Err(e) = listener.set_nonblocking(true) {
+        eprintln!("daemon_error=set_nonblocking_failed err={}", e);
+        std::process::exit(4);
+    }
+
     let _guard = SocketGuard::new(socket_path.clone());
 
     println!("daemon_status=started socket={}", socket_path.display());
 
-    let mut engine = RuntimeEngine::default();
-    let mut should_stop = false;
+    let engine = Arc::new(Mutex::new(RuntimeEngine::default()));
+    let shutdown = Arc::new(AtomicBool::new(false));
 
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let engine_ref = Arc::clone(&engine);
+                let shutdown_ref = Arc::clone(&shutdown);
+                thread::spawn(move || {
+                    handle_client(stream, engine_ref, shutdown_ref);
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+            }
             Err(e) => {
                 eprintln!("daemon_warn=accept_failed err={}", e);
-                continue;
+                thread::sleep(Duration::from_millis(50));
             }
-        };
-
-        let line = {
-            let mut reader = BufReader::new(&stream);
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    let _ = stream.write_all(b"ERR INVALID_ARGUMENT empty_stream\n");
-                    continue;
-                }
-                Ok(_) => line,
-                Err(e) => {
-                    let _ = stream
-                        .write_all(format!("ERR INTERNAL_ERROR read_failed:{}\n", e).as_bytes());
-                    continue;
-                }
-            }
-        };
-
-        let outcome = execute_command(&mut engine, &line);
-        let response = format!("{}\n", outcome.response_line);
-        let _ = stream.write_all(response.as_bytes());
-        let _ = stream.flush();
-
-        if outcome.should_shutdown {
-            should_stop = true;
-            break;
         }
     }
 
-    if should_stop {
-        println!("daemon_status=stopped");
-    } else {
-        println!("daemon_status=exit");
-    }
+    println!("daemon_status=stopped");
 }
