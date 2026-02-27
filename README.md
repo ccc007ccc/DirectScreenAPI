@@ -1,39 +1,41 @@
 # DirectScreenAPI
 
-DirectScreenAPI is a foundation-first runtime for privileged Android screen interaction.
+DirectScreenAPI 是一个面向 Android 特权场景的“基础能力层”项目，目标是先打磨稳定内核，再扩展上层能力。
 
-It is designed as a long-term base layer for:
-- custom window systems
-- AI-driven UI control frameworks
-- container/desktop bridging runtimes
+本仓库当前定位：`基石重构阶段（v0.1.0）`
 
-The project focuses on stability and clear module boundaries before feature expansion.
+## 设计目标
 
-## Project Status
+- 稳定优先：先保证状态模型、协议和生命周期可控
+- 可恢复：出现异常时可确定性回收
+- 可组合：上层可扩展窗口系统、AI 控制框架、容器桥接
+- 多语言接入：以 C ABI 作为长期稳定边界
 
-Current stage: `Foundation Rewrite (v0.1.0)`
+## 当前已实现
 
-Implemented now:
-- Rust core runtime state model
-- stable C ABI surface
-- deterministic input routing engine (rect regions)
-- display state model with strict validation
-- minimal CLI and C integration example
+- Rust 核心状态引擎
+- C ABI 基线接口
+- 矩形区域路由（后添加优先）
+- 显示状态严格校验
+- 最小 CLI（`dsapi`）
+- 守护进程模型（`dsapid`）与控制端（`dsapictl`）
 
-Not implemented yet:
-- OpenGL ES backend
-- Vulkan backend
-- direct Android SurfaceControl renderer integration
-- frame capture and injection loop
+## 当前未实现
 
-## Repository Layout
+- OpenGL ES 后端
+- Vulkan 后端
+- Android SurfaceControl 真正渲染适配
+- 屏幕采集与输入注入闭环
 
-- `core/rust`: core domain/runtime/ffi implementation
-- `bridge/c`: C header and C integration example
-- `docs`: architecture, API, governance and operational guides
-- `scripts`: build and smoke scripts
+## 目录结构
 
-## Quick Start
+- `core/rust`：核心领域模型、运行时、FFI
+- `bridge/c`：C 头文件与 C 示例
+- `android`：Android 适配层占位接口
+- `docs`：架构、API、运维与治理文档
+- `scripts`：构建、检查、守护进程脚本
+
+## 快速开始
 
 ```sh
 cd core/rust
@@ -42,23 +44,29 @@ cargo test
 cargo run --bin dsapi -- version
 ```
 
-C example:
+守护进程模式：
 
 ```sh
-./scripts/build_core.sh
-cc -Ibridge/c/include bridge/c/examples/simple_route.c \
-  target/release/libdirectscreen_core.a -ldl -lpthread -lm \
-  -o artifacts/bin/dsapi_example
+./scripts/daemon_start.sh
+./scripts/daemon_status.sh
+./scripts/daemon_cmd.sh PING
+./scripts/daemon_cmd.sh DISPLAY_GET
+./scripts/daemon_stop.sh
+```
+
+C 示例：
+
+```sh
+./scripts/build_c_example.sh
 ./artifacts/bin/dsapi_example
 ```
 
-## Core Principles
+## 版本与发布
 
-- stable-first: no hidden side effects in core runtime state
-- recoverable-by-design: deterministic cleanup semantics
-- language-agnostic: C ABI is a first-class contract
-- backend-agnostic: render/input backends are pluggable interfaces
+- 变更记录：`CHANGELOG.md`
+- 发布流程：`docs/governance/release.md`
+- 路线图：`docs/governance/roadmap.md`
 
-## License
+## 许可证
 
 Apache-2.0

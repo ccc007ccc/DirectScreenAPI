@@ -1,26 +1,25 @@
-# Security Policy
+# 安全策略
 
-DirectScreenAPI targets privileged runtime scenarios.
+DirectScreenAPI 面向特权场景，安全要求高于普通应用库。
 
-## Supported Scope
+## 受理范围
 
-Security issues accepted for:
-- memory safety and UB in Rust/C boundaries
-- privilege escalation through public APIs
-- unsafe process lifecycle handling
-- unexpected persistent side effects
+- Rust/C 边界内存安全问题
+- 公共 API 导致的权限越界
+- 生命周期失控导致的残留进程/残留状态
+- 隐式持久化或不可回收副作用
 
-## Reporting
+## 报告方式
 
-Please report privately to project maintainers before public disclosure.
-Include:
-- affected version
-- minimal reproduction
-- impact scope
-- proposed mitigation (if available)
+请先私下报告，再公开披露。建议附带：
 
-## Hard Rules
+- 受影响版本
+- 最小复现步骤
+- 影响范围
+- 建议修复方向（可选）
 
-- no system partition writes in baseline runtime
-- no hidden background persistence
-- all privileged operations must be explicit and observable
+## 基线硬约束
+
+- 基线实现不得写入系统分区
+- 不允许隐藏后台持久化行为
+- 所有高权限动作必须可观测、可追踪

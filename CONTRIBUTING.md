@@ -1,27 +1,26 @@
-# Contributing
+# 贡献指南
 
-## Workflow
+## 基本流程
 
-1. Fork and create a feature branch.
-2. Keep changes scoped to a single concern.
-3. Add or update docs for behavior changes.
-4. Run local checks before opening PR.
+1. Fork 并创建功能分支。
+2. 一次提交聚焦单一问题。
+3. 行为变更必须同步更新文档。
+4. 提交 PR 前完成本地检查。
 
-## Local Checks
+## 本地检查
 
 ```sh
 ./scripts/check.sh
 ```
 
-## Commit Guidance
+## 提交信息建议
 
-Use clear commit prefixes:
-- `core:` runtime/domain changes
-- `ffi:` C ABI changes
-- `docs:` documentation changes
-- `build:` scripts and tooling
+- `core:` 核心领域/运行时变更
+- `ffi:` C ABI 或跨语言边界变更
+- `docs:` 文档变更
+- `build:` 构建或脚本变更
 
-## Compatibility Policy
+## 兼容性规则
 
-- Breaking changes to C ABI require a version bump and migration note.
-- New APIs must include input validation and error code mapping.
+- C ABI 破坏性变更必须提升版本并提供迁移说明。
+- 新增公开接口必须带输入校验与错误码定义。

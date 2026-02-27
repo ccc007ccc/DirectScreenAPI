@@ -1,10 +1,11 @@
-# Changelog
+# 变更日志
 
-## 0.1.0 - Foundation Rewrite
+## 0.1.0 - 基石重构版本
 
-- Created new repository baseline for DirectScreenAPI.
-- Implemented Rust core runtime state model.
-- Added stable C ABI surface and C integration header.
-- Added deterministic rectangle-based input routing engine.
-- Added CLI (`dsapi`) for local validation.
-- Added build/check scripts and architecture/API docs.
+- 初始化全新仓库结构（不迁移历史实现）
+- 实现 Rust 核心状态模型与路由引擎
+- 定义 C ABI v0.1 接口与 C 示例
+- 增加命令行工具 `dsapi`
+- 增加守护进程 `dsapid` 与控制端 `dsapictl`
+- 增加构建与质量检查脚本
+- 完成首版架构、API、运维与治理文档

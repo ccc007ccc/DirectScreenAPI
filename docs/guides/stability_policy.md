@@ -1,13 +1,21 @@
-# Stability Policy
+# 稳定性策略
 
-## Baseline Guarantees
+## 基线保证
 
-- All public API calls are input-validated.
-- Invalid input does not mutate runtime state.
-- Context creation/destruction is explicit and idempotent-safe.
+- 所有公开 API 必须做输入校验
+- 非法输入不得改变内部状态
+- 上下文生命周期必须显式可控
 
-## Change Rules
+## 变更约束
 
-- Domain behavior changes must be documented in `docs/` before merge.
-- New API surfaces require tests at core layer.
-- Hidden side effects are treated as bugs.
+- 行为变更必须先更新文档后合并
+- 新公开接口必须配套测试
+- 禁止引入隐式副作用
+
+## 质量门禁
+
+- `cargo fmt`
+- `cargo clippy -D warnings`
+- `cargo test`
+
+以上三项必须全部通过。

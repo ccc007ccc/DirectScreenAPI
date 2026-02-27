@@ -1,8 +1,8 @@
-# Release Process
+# 发布流程
 
-1. Run `./scripts/check.sh`.
-2. Ensure docs reflect behavior and API changes.
-3. Tag semantic version.
-4. Publish release notes with migration notes.
+1. 执行 `./scripts/check.sh`。
+2. 核对文档是否覆盖行为/API 变更。
+3. 更新 `CHANGELOG.md`。
+4. 打版本标签并生成发布说明。
 
-For ABI changes, include a dedicated compatibility section.
+若涉及 ABI 变更，发布说明必须包含兼容性与迁移部分。

@@ -1,25 +1,25 @@
-# C ABI (v0.1)
+# C ABI（v0.1）
 
-Header: `bridge/c/include/directscreen_api.h`
+头文件：`bridge/c/include/directscreen_api.h`
 
-## Context Lifecycle
+## 上下文生命周期
 
 - `dsapi_context_create`
 - `dsapi_context_destroy`
 
-## Display APIs
+## 显示状态接口
 
 - `dsapi_set_display_state`
 - `dsapi_get_display_state`
 
-## Routing APIs
+## 路由接口
 
 - `dsapi_set_default_decision`
 - `dsapi_region_clear`
 - `dsapi_region_add_rect`
 - `dsapi_route_point`
 
-## Status Codes
+## 状态码
 
 - `0`: OK
 - `1`: NULL_POINTER
@@ -27,7 +27,8 @@ Header: `bridge/c/include/directscreen_api.h`
 - `3`: OUT_OF_RANGE
 - `4`: INTERNAL_ERROR
 
-## ABI Policy
+## 兼容策略
 
-- Existing symbols are never changed in-place.
-- Breaking changes require a new major ABI version namespace.
+- 已发布符号不做原地破坏式修改
+- 破坏性变更必须提升 ABI 主版本
+- 新增接口必须补文档与错误语义

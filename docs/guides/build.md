@@ -1,24 +1,24 @@
-# Build Guide
+# 构建指南
 
-## Requirements
+## 依赖
 
-- Rust toolchain (stable)
-- C compiler (`cc`) for C example
+- Rust 稳定工具链
+- C 编译器（用于 C 示例）
 
-## Build Core
+## 构建核心
 
 ```sh
 ./scripts/build_core.sh
 ```
 
-## Run CLI
+## 运行 CLI
 
 ```sh
 cd core/rust
 cargo run --bin dsapi -- version
 ```
 
-## Build C Example
+## 构建并运行 C 示例
 
 ```sh
 ./scripts/build_c_example.sh

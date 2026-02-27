@@ -1,6 +1,9 @@
-# Command Layer
+# 命令层
 
-Reserved for future long-running daemon and admin CLI wrappers.
+该目录预留给后续常驻守护控制面与运维 CLI 封装。
 
-Current CLI implementation lives in:
+当前可执行入口：
+
 - `core/rust/src/bin/dsapi.rs`
+- `core/rust/src/bin/dsapid.rs`
+- `core/rust/src/bin/dsapictl.rs`

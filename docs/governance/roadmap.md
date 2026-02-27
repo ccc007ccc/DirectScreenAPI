@@ -1,25 +1,25 @@
-# Roadmap
+# 路线图
 
-## Phase 1 (current)
+## 阶段 1（当前）
 
-- stable core domain model
-- C ABI baseline
-- deterministic routing
+- 核心状态模型稳定化
+- C ABI 基线固定
+- 守护进程控制面落地
 
-## Phase 2
+## 阶段 2
 
-- Android adapter process (`app_process` bridge)
-- runtime lifecycle supervisor
-- structured event/log protocol
+- Android 适配层真实实现
+- 结构化事件/日志协议
+- 守护进程恢复策略增强
 
-## Phase 3
+## 阶段 3
 
-- render backend abstraction implementation
-- OpenGL ES backend
-- frame capture and input loop wiring
+- 渲染后端抽象落地
+- OpenGL ES 后端
+- 输入与渲染链路接线
 
-## Phase 4
+## 阶段 4
 
-- Vulkan backend option
-- multi-window scene graph
-- container/desktop bridge modules
+- Vulkan 后端选项
+- 多窗口场景图
+- 容器/桌面桥接模块

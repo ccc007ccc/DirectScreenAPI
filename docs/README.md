@@ -1,20 +1,22 @@
-# Documentation Index
+# 文档索引
 
-## Architecture
+## 架构
 
 - `architecture/overview.md`
 - `architecture/runtime_model.md`
+- `architecture/daemon_model.md`
 
 ## API
 
 - `api/c_abi.md`
 
-## Guides
+## 指南
 
 - `guides/build.md`
+- `guides/daemon_ops.md`
 - `guides/stability_policy.md`
 
-## Governance
+## 治理
 
 - `governance/roadmap.md`
 - `governance/release.md`

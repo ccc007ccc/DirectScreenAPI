@@ -12,3 +12,11 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 [[bin]]
 name = "dsapi"
 path = "src/bin/dsapi.rs"
+
+[[bin]]
+name = "dsapid"
+path = "src/bin/dsapid.rs"
+
+[[bin]]
+name = "dsapictl"
+path = "src/bin/dsapictl.rs"

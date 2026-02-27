@@ -1,23 +1,25 @@
-# Runtime Model
+# 运行时模型
 
-## State Model
+## 状态组成
 
-Runtime state owns:
-- display state
-- default routing policy
-- ordered region list
+运行时核心状态包含：
 
-## Determinism
+- 显示状态（分辨率/刷新率/密度/旋转）
+- 默认路由策略
+- 有序路由区域集合
 
-Routing uses last-added-first-match semantics.
-This allows predictable override behavior for dynamic UI overlays.
+## 确定性规则
 
-## Thread Model
+- 路由采用“后添加优先”
+- 非法输入返回错误，不修改状态
+- 状态变更全部显式调用触发
 
-FFI context wraps runtime engine in a mutex.
-No global mutable singleton is used.
+## 并发模型
 
-## Failure Model
+FFI 上下文内部使用互斥锁保护引擎状态。
 
-All public APIs return explicit integer status codes.
-No implicit retries, no hidden side effects.
+当前版本不使用全局可变单例。
+
+## 失败模型
+
+所有公开接口返回明确状态码，不依赖隐式重试。

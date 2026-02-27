@@ -1,25 +1,28 @@
-# Architecture Overview
+# 架构总览
 
-DirectScreenAPI is split into three stable layers:
+DirectScreenAPI 采用“核心与适配分离”结构：
 
-1. Core runtime (`core/rust`)
-- domain state
-- routing logic
-- validation and deterministic behavior
+1. 核心运行时（`core/rust`）
+- 领域状态模型
+- 路由逻辑与校验
+- 确定性行为约束
 
-2. ABI bridge (`core/rust/src/ffi`, `bridge/c/include`)
-- C-callable contract for any upper language
-- strict status codes and null-pointer guards
+2. ABI 桥接层（`core/rust/src/ffi` + `bridge/c/include`）
+- 提供稳定 C 语言边界
+- 明确状态码与参数约束
 
-3. Integrations (`bridge/c/examples`, future Android adapters)
-- thin adapters only
-- no business logic duplicated in integration layer
+3. 集成层（`bridge/c/examples`、未来 Android 适配）
+- 仅实现平台能力接线
+- 不复制核心业务逻辑
 
-## Design Goal
+4. 控制面守护进程（`dsapid`）
+- 统一持有可变运行时状态
+- 对外提供进程间控制协议
 
-The core must remain stable even when rendering/input backends evolve.
+## 目标
 
-## Non-Goal (current stage)
+在功能扩展前先固化“状态模型 + 协议模型 + 生命周期模型”。
 
-This stage does not provide a GPU renderer or Android binder integration.
-It only stabilizes the foundational contracts and process model.
+## 当前非目标
+
+当前版本不提供 GPU 渲染后端，也不提供 Android 真正渲染接入。
