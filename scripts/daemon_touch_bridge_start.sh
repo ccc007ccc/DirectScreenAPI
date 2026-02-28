@@ -6,9 +6,16 @@ cd "$ROOT_DIR"
 
 PID_FILE="${DSAPI_TOUCH_BRIDGE_PID_FILE:-artifacts/run/dsapi_touch_bridge.pid}"
 LOG_FILE="${DSAPI_TOUCH_BRIDGE_LOG_FILE:-artifacts/run/dsapi_touch_bridge.log}"
+SUPERVISE_INPUT="${DSAPI_SUPERVISE_INPUT:-0}"
 
 mkdir -p "$(dirname "$PID_FILE")"
 mkdir -p "$(dirname "$LOG_FILE")"
+
+if [ "$SUPERVISE_INPUT" = "1" ]; then
+  ./scripts/daemon_start.sh >/dev/null
+  echo "touch_bridge_status=managed_by_daemon supervise=1"
+  exit 0
+fi
 
 if [ -f "$PID_FILE" ]; then
   old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"

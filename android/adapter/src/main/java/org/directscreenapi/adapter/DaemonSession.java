@@ -9,67 +9,35 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
+import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 
 final class DaemonSession {
-    static final class RawFrame {
-        final long frameSeq;
-        final int width;
-        final int height;
-        final int byteLen;
-        final byte[] rgba8;
-
-        RawFrame(long frameSeq, int width, int height, int byteLen, byte[] rgba8) {
-            this.frameSeq = frameSeq;
-            this.width = width;
-            this.height = height;
-            this.byteLen = byteLen;
-            this.rgba8 = rgba8;
-        }
-    }
-
     static final class MappedFrame {
         final long frameSeq;
         final int width;
         final int height;
         final int byteLen;
-        final MappedByteBuffer rgba8;
-        private final FileChannel channel;
-        private final FileInputStream stream;
+        final ByteBuffer rgba8;
 
         MappedFrame(
                 long frameSeq,
                 int width,
                 int height,
                 int byteLen,
-                MappedByteBuffer rgba8,
-                FileChannel channel,
-                FileInputStream stream
+                ByteBuffer rgba8
         ) {
             this.frameSeq = frameSeq;
             this.width = width;
             this.height = height;
             this.byteLen = byteLen;
             this.rgba8 = rgba8;
-            this.channel = channel;
-            this.stream = stream;
         }
 
         void closeQuietly() {
-            if (channel != null) {
-                try {
-                    channel.close();
-                } catch (Throwable ignored) {
-                }
-            }
-            if (stream != null) {
-                try {
-                    stream.close();
-                } catch (Throwable ignored) {
-                }
-            }
+            // no-op: mapped buffer lifecycle is session-scoped.
         }
     }
 
@@ -92,6 +60,10 @@ final class DaemonSession {
     private Object rawSocket;
     private InputStream rawInput;
     private OutputStream rawOutput;
+    private FileInputStream rawFrameFdStream;
+    private FileChannel rawFrameFdChannel;
+    private MappedByteBuffer rawFrameMapped;
+    private int rawFrameCapacity;
 
     DaemonSession(String socketPath) {
         this.socketPath = socketPath;
@@ -118,110 +90,59 @@ final class DaemonSession {
         throw last != null ? last : new IOException("daemon_command_failed");
     }
 
-    synchronized RawFrame frameGetRaw() throws Exception {
+    synchronized MappedFrame frameWaitBoundPresent(long lastFrameSeq, int timeoutMs) throws Exception {
         Exception last = null;
         for (int attempt = 0; attempt < 2; attempt++) {
             try {
                 ensureRawConnected();
-                writeAsciiLine(rawOutput, "RENDER_FRAME_GET_RAW");
+                bindFrameFdIfNeeded();
+                long safeSeq = Math.max(0L, lastFrameSeq);
+                int safeTimeout = Math.max(1, timeoutMs);
+                writeAsciiLine(rawOutput, "RENDER_FRAME_WAIT_BOUND_PRESENT " + safeSeq + " " + safeTimeout);
                 String line = readAsciiLine(rawInput);
                 if (line == null) {
                     throw new IOException("daemon_eof");
                 }
                 String trimmed = line.trim();
+                if ("OK TIMEOUT".equals(trimmed)) {
+                    return null;
+                }
                 if (trimmed.startsWith("ERR ")) {
-                    if ("ERR OUT_OF_RANGE".equals(trimmed)) {
-                        return null;
-                    }
-                    throw new IOException("daemon_frame_raw_err=" + trimmed);
+                    throw new IOException("daemon_wait_bound_present_err=" + trimmed);
                 }
                 if (!trimmed.startsWith("OK ")) {
-                    throw new IOException("daemon_frame_raw_bad_line");
+                    throw new IOException("daemon_wait_bound_present_bad_line");
                 }
                 String[] tokens = trimmed.split("\\s+");
-                if (tokens.length < 5) {
-                    throw new IOException("daemon_frame_raw_tokens_invalid");
-                }
-                long frameSeq = parseLong(tokens[1], -1L);
-                int width = parseInt(tokens[2], -1);
-                int height = parseInt(tokens[3], -1);
-                int byteLen = parseInt(tokens[4], -1);
-                if (frameSeq < 0 || width <= 0 || height <= 0 || byteLen <= 0) {
-                    throw new IOException("daemon_frame_raw_header_invalid");
-                }
-                byte[] rgba = new byte[byteLen];
-                readFully(rawInput, rgba, 0, byteLen);
-                return new RawFrame(frameSeq, width, height, byteLen, rgba);
-            } catch (Exception e) {
-                last = e;
-                closeRawQuietly();
-            }
-        }
-        throw last != null ? last : new IOException("daemon_frame_raw_failed");
-    }
-
-    synchronized MappedFrame frameGetMapped() throws Exception {
-        Exception last = null;
-        for (int attempt = 0; attempt < 2; attempt++) {
-            try {
-                ensureRawConnected();
-                writeAsciiLine(rawOutput, "RENDER_FRAME_GET_FD");
-                String line = readAsciiLine(rawInput);
-                if (line == null) {
-                    throw new IOException("daemon_eof");
-                }
-                String trimmed = line.trim();
-                if (trimmed.startsWith("ERR ")) {
-                    if ("ERR OUT_OF_RANGE".equals(trimmed)) {
-                        return null;
-                    }
-                    throw new IOException("daemon_frame_fd_err=" + trimmed);
-                }
-                if (!trimmed.startsWith("OK ")) {
-                    throw new IOException("daemon_frame_fd_bad_line");
-                }
-                String[] tokens = trimmed.split("\\s+");
-                if (tokens.length < 5) {
-                    throw new IOException("daemon_frame_fd_tokens_invalid");
+                if (tokens.length < 7) {
+                    throw new IOException("daemon_wait_bound_present_tokens_invalid");
                 }
 
                 long frameSeq = parseLong(tokens[1], -1L);
                 int width = parseInt(tokens[2], -1);
                 int height = parseInt(tokens[3], -1);
-                int byteLen = parseInt(tokens[4], -1);
+                int byteLen = parseInt(tokens[5], -1);
                 if (frameSeq < 0 || width <= 0 || height <= 0 || byteLen <= 0) {
-                    throw new IOException("daemon_frame_fd_header_invalid");
+                    throw new IOException("daemon_wait_bound_present_header_invalid");
+                }
+                if (rawFrameMapped == null || rawFrameCapacity <= 0) {
+                    throw new IOException("daemon_wait_bound_present_uninitialized");
+                }
+                if (byteLen > rawFrameCapacity) {
+                    throw new IOException("daemon_wait_bound_present_len_over_capacity");
                 }
 
-                FileDescriptor fd = pollSingleAncillaryFd(rawSocket);
-                FileInputStream stream = new FileInputStream(fd);
-                FileChannel channel = stream.getChannel();
-                try {
-                    MappedByteBuffer mapped = channel.map(FileChannel.MapMode.READ_ONLY, 0L, byteLen);
-                    return new MappedFrame(frameSeq, width, height, byteLen, mapped, channel, stream);
-                } catch (Throwable t) {
-                    try {
-                        channel.close();
-                    } catch (Throwable ignored) {
-                    }
-                    try {
-                        stream.close();
-                    } catch (Throwable ignored) {
-                    }
-                    throw t;
-                }
+                ByteBuffer view = rawFrameMapped.duplicate();
+                view.position(0);
+                view.limit(byteLen);
+                ByteBuffer rgba = view.slice();
+                return new MappedFrame(frameSeq, width, height, byteLen, rgba);
             } catch (Exception e) {
                 last = e;
                 closeRawQuietly();
             }
         }
-        throw last != null ? last : new IOException("daemon_frame_fd_failed");
-    }
-
-    synchronized String frameWait(long lastFrameSeq, int timeoutMs) throws Exception {
-        long safeSeq = Math.max(0L, lastFrameSeq);
-        int safeTimeout = Math.max(1, timeoutMs);
-        return command("RENDER_FRAME_WAIT " + safeSeq + " " + safeTimeout);
+        throw last != null ? last : new IOException("daemon_wait_bound_present_failed");
     }
 
     synchronized void closeQuietly() {
@@ -298,6 +219,23 @@ final class DaemonSession {
     }
 
     private void closeRawQuietly() {
+        if (rawFrameFdChannel != null) {
+            try {
+                rawFrameFdChannel.close();
+            } catch (Throwable ignored) {
+            }
+            rawFrameFdChannel = null;
+        }
+        if (rawFrameFdStream != null) {
+            try {
+                rawFrameFdStream.close();
+            } catch (Throwable ignored) {
+            }
+            rawFrameFdStream = null;
+        }
+        rawFrameMapped = null;
+        rawFrameCapacity = 0;
+
         if (rawInput != null) {
             try {
                 rawInput.close();
@@ -315,6 +253,51 @@ final class DaemonSession {
         if (rawSocket != null) {
             closeSocketQuietly(rawSocket);
             rawSocket = null;
+        }
+    }
+
+    private void bindFrameFdIfNeeded() throws Exception {
+        if (rawFrameMapped != null && rawFrameCapacity > 0) {
+            return;
+        }
+
+        writeAsciiLine(rawOutput, "RENDER_FRAME_BIND_FD");
+        String line = readAsciiLine(rawInput);
+        if (line == null) {
+            throw new IOException("daemon_eof");
+        }
+        String trimmed = line.trim();
+        if (!trimmed.startsWith("OK ")) {
+            throw new IOException("daemon_bind_fd_bad_line");
+        }
+        String[] tokens = trimmed.split("\\s+");
+        if (tokens.length < 3 || !"BOUND".equals(tokens[1])) {
+            throw new IOException("daemon_bind_fd_tokens_invalid");
+        }
+        int capacity = parseInt(tokens[2], -1);
+        if (capacity <= 0) {
+            throw new IOException("daemon_bind_fd_capacity_invalid");
+        }
+
+        FileDescriptor fd = pollSingleAncillaryFd(rawSocket);
+        FileInputStream stream = new FileInputStream(fd);
+        FileChannel channel = stream.getChannel();
+        try {
+            MappedByteBuffer mapped = channel.map(FileChannel.MapMode.READ_ONLY, 0L, capacity);
+            rawFrameFdStream = stream;
+            rawFrameFdChannel = channel;
+            rawFrameMapped = mapped;
+            rawFrameCapacity = capacity;
+        } catch (Throwable t) {
+            try {
+                channel.close();
+            } catch (Throwable ignored) {
+            }
+            try {
+                stream.close();
+            } catch (Throwable ignored) {
+            }
+            throw t;
         }
     }
 
@@ -345,18 +328,6 @@ final class DaemonSession {
             }
         }
         return sb.toString();
-    }
-
-    private static void readFully(InputStream is, byte[] out, int offset, int len) throws IOException {
-        int pos = offset;
-        int end = offset + len;
-        while (pos < end) {
-            int n = is.read(out, pos, end - pos);
-            if (n < 0) {
-                throw new IOException("daemon_raw_eof");
-            }
-            pos += n;
-        }
     }
 
     private static int parseInt(String s, int fallback) {

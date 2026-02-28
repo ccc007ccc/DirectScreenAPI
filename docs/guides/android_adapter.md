@@ -72,7 +72,7 @@
 - `DSAPI_ANDROID_BUILD_MODE`：`display_probe`（默认）、`presenter` 或 `all`
 - `DSAPI_RUN_AS_ROOT`：是否使用 `su -c` 执行 probe，默认 `1`
 - `DSAPI_APP_PROCESS_BIN`：指定 `app_process` 可执行路径，默认 `app_process`
-- `DSAPI_PRESENTER_POLL_MS`：presenter 帧等待超时（`RENDER_FRAME_WAIT`），默认 `8`
+- `DSAPI_PRESENTER_POLL_MS`：presenter 帧等待超时（`RENDER_FRAME_WAIT_BOUND_PRESENT`），默认 `8`
 - `DSAPI_PRESENTER_LAYER_Z`：presenter 图层 Z 值，默认 `1000000`
 - `DSAPI_PRESENTER_LAYER_NAME`：presenter 图层名，默认 `DirectScreenAPI`
 
@@ -89,7 +89,7 @@
 
 - 已实现：显示参数探测与同步
 - 已实现：`SurfaceControl` RGBA 上屏 presenter
-- 已实现：presenter 通过 `RENDER_FRAME_WAIT + RENDER_FRAME_GET_FD` 事件驱动共享内存取帧
+- 已实现：presenter 通过 `RENDER_FRAME_BIND_FD + RENDER_FRAME_WAIT_BOUND_PRESENT` 事件驱动共享内存取帧（FD 绑定一次后复用）
 - 已定义：触控会话接口契约（Down/Move/Up/Cancel）
 - 未实现：触摸输入适配、事件回调桥接
 

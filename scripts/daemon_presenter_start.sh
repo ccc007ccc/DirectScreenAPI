@@ -6,9 +6,16 @@ cd "$ROOT_DIR"
 
 PID_FILE="${DSAPI_PRESENTER_PID_FILE:-artifacts/run/dsapi_presenter.pid}"
 LOG_FILE="${DSAPI_PRESENTER_LOG_FILE:-artifacts/run/dsapi_presenter.log}"
+SUPERVISE_PRESENTER="${DSAPI_SUPERVISE_PRESENTER:-0}"
 
 mkdir -p "$(dirname "$PID_FILE")"
 mkdir -p "$(dirname "$LOG_FILE")"
+
+if [ "$SUPERVISE_PRESENTER" = "1" ]; then
+  ./scripts/daemon_start.sh >/dev/null
+  echo "presenter_status=managed_by_daemon supervise=1"
+  exit 0
+fi
 
 if [ -f "$PID_FILE" ]; then
   old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"

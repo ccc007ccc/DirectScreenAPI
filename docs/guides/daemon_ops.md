@@ -57,6 +57,12 @@
 ./scripts/daemon_touch_bridge_status.sh
 ```
 
+Supervisor 启动（推荐统一进程编排）：
+
+```sh
+DSAPI_SUPERVISE_PRESENTER=1 DSAPI_SUPERVISE_INPUT=1 ./scripts/daemon_start.sh
+```
+
 ## 停止
 
 ```sh
@@ -77,5 +83,10 @@
 - `DSAPI_TOUCH_SYNC_DISPLAY_EVERY_SEC`
 - `DSAPI_TOUCH_MONITOR_INTERVAL_SEC`
 - `DSAPI_RENDER_OUTPUT_DIR`
+- `DSAPI_SUPERVISE_PRESENTER`（`1` 时由 daemon 托管 presenter）
+- `DSAPI_SUPERVISE_INPUT`（`1` 时由 daemon 托管 input bridge）
+- `DSAPI_SUPERVISE_PRESENTER_CMD`
+- `DSAPI_SUPERVISE_INPUT_CMD`
+- `DSAPI_SUPERVISE_RESTART_MS`
 
 可用于多实例隔离运行与路径定制。

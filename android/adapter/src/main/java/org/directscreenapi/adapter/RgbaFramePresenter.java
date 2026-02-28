@@ -6,20 +6,6 @@ import java.util.Locale;
 final class RgbaFramePresenter {
     private static final int DISPLAY_SYNC_INTERVAL_MS = 1000;
 
-    private static final class FrameInfo {
-        final long frameSeq;
-        final int width;
-        final int height;
-        final int byteLen;
-
-        FrameInfo(long frameSeq, int width, int height, int byteLen) {
-            this.frameSeq = frameSeq;
-            this.width = width;
-            this.height = height;
-            this.byteLen = byteLen;
-        }
-    }
-
     private final DaemonSession daemon;
     private final AndroidDisplayAdapter displayAdapter;
     private final int pollMs;
@@ -96,23 +82,12 @@ final class RgbaFramePresenter {
                 lastDisplaySyncMs = now;
             }
 
-            FrameInfo info;
-            try {
-                info = waitNextFrame(lastFrameSeq, pollMs);
-            } catch (Throwable t) {
-                logConnectWarn("frame_wait_failed", t);
-                continue;
-            }
-
-            if (info == null || info.frameSeq == lastFrameSeq) {
-                continue;
-            }
-
             DaemonSession.MappedFrame mappedFrame;
             try {
-                mappedFrame = daemon.frameGetMapped();
+                mappedFrame = daemon.frameWaitBoundPresent(lastFrameSeq, pollMs);
             } catch (Throwable t) {
-                throw new IllegalStateException("presenter_frame_fd_required", t);
+                logConnectWarn("frame_wait_bound_present_failed", t);
+                continue;
             }
             if (mappedFrame == null || mappedFrame.frameSeq == lastFrameSeq) {
                 if (mappedFrame != null) {
@@ -123,7 +98,6 @@ final class RgbaFramePresenter {
 
             try {
                 drawFrame(mappedFrame.width, mappedFrame.height, mappedFrame.rgba8);
-                daemon.command("RENDER_PRESENT");
                 lastFrameSeq = mappedFrame.frameSeq;
                 markFramePresented(mappedFrame.byteLen);
             } catch (Throwable t) {
@@ -180,32 +154,6 @@ final class RgbaFramePresenter {
         }
     }
 
-    private FrameInfo waitNextFrame(long lastSeq, int timeoutMs) throws Exception {
-        String line = daemon.frameWait(lastSeq, timeoutMs);
-        if ("OK TIMEOUT".equals(line)) {
-            return null;
-        }
-        return parseFrameInfo(line);
-    }
-
-    private FrameInfo parseFrameInfo(String line) throws Exception {
-        if (!line.startsWith("OK ")) {
-            return null;
-        }
-        String[] tokens = line.split("\\s+");
-        if (tokens.length < 7) {
-            throw new IllegalStateException("frame_info_tokens_invalid");
-        }
-        long frameSeq = parseLong(tokens[1], -1L);
-        int width = parseInt(tokens[2], -1);
-        int height = parseInt(tokens[3], -1);
-        int byteLen = parseInt(tokens[5], -1);
-        if (frameSeq < 0 || width <= 0 || height <= 0 || byteLen <= 0) {
-            throw new IllegalStateException("frame_info_invalid_values");
-        }
-        return new FrameInfo(frameSeq, width, height, byteLen);
-    }
-
     private void drawFrame(int frameWidth, int frameHeight, ByteBuffer rgba) throws Exception {
         ensureBitmap(frameWidth, frameHeight);
         rgba.position(0);
@@ -240,22 +188,6 @@ final class RgbaFramePresenter {
         );
         bitmapWidth = width;
         bitmapHeight = height;
-    }
-
-    private static int parseInt(String s, int fallback) {
-        try {
-            return Integer.parseInt(s);
-        } catch (Throwable ignored) {
-            return fallback;
-        }
-    }
-
-    private static long parseLong(String s, long fallback) {
-        try {
-            return Long.parseLong(s);
-        } catch (Throwable ignored) {
-            return fallback;
-        }
     }
 
     private void markFramePresented(int byteLen) {

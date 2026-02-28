@@ -6,6 +6,12 @@ cd "$ROOT_DIR"
 
 PID_FILE="${DSAPI_PRESENTER_PID_FILE:-artifacts/run/dsapi_presenter.pid}"
 RUN_AS_ROOT="${DSAPI_RUN_AS_ROOT:-1}"
+SUPERVISE_PRESENTER="${DSAPI_SUPERVISE_PRESENTER:-0}"
+
+if [ "$SUPERVISE_PRESENTER" = "1" ]; then
+  echo "presenter_status=managed_by_daemon supervise=1 action=use_daemon_stop"
+  exit 0
+fi
 
 if [ -f "$PID_FILE" ]; then
   pid="$(cat "$PID_FILE" 2>/dev/null || true)"
