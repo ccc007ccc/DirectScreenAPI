@@ -1,5 +1,6 @@
 pub mod api;
 pub mod backend;
+pub mod client;
 pub mod domain;
 pub mod engine;
 pub mod ffi;

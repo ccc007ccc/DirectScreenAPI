@@ -29,7 +29,13 @@ path = "src/bin/dsapistream.rs"
 name = "dsapiinput"
 path = "src/bin/dsapiinput.rs"
 
+[[bin]]
+name = "test_touch_ui"
+path = "src/bin/test_touch_ui.rs"
+
 [dependencies]
 base64 = "0.22"
+font8x8 = "0.3"
 libc = "0.2"
 nix = { version = "0.29", features = ["socket", "uio"] }
+tiny-skia = "0.11"
