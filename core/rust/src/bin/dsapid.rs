@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use directscreen_core::api::{Status, RENDER_MAX_FRAME_BYTES};
 use directscreen_core::engine::{execute_command, RuntimeEngine};
 
 struct SocketGuard {
@@ -58,6 +59,175 @@ fn ensure_parent(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RawFrameSubmitRequest {
+    width: u32,
+    height: u32,
+    byte_len: usize,
+}
+
+fn status_name(status: Status) -> &'static str {
+    match status {
+        Status::Ok => "OK",
+        Status::NullPointer => "NULL_POINTER",
+        Status::InvalidArgument => "INVALID_ARGUMENT",
+        Status::OutOfRange => "OUT_OF_RANGE",
+        Status::InternalError => "INTERNAL_ERROR",
+    }
+}
+
+fn parse_u32(token: &str) -> Result<u32, Status> {
+    token.parse::<u32>().map_err(|_| Status::InvalidArgument)
+}
+
+fn parse_raw_frame_submit_request(line: &str) -> Result<Option<RawFrameSubmitRequest>, Status> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let mut tokens = trimmed.split_whitespace();
+    let Some(cmd) = tokens.next() else {
+        return Ok(None);
+    };
+
+    if !cmd.eq_ignore_ascii_case("RENDER_FRAME_SUBMIT_RGBA_RAW") {
+        return Ok(None);
+    }
+
+    let width = parse_u32(tokens.next().ok_or(Status::InvalidArgument)?)?;
+    let height = parse_u32(tokens.next().ok_or(Status::InvalidArgument)?)?;
+    let byte_len_u32 = parse_u32(tokens.next().ok_or(Status::InvalidArgument)?)?;
+    if tokens.next().is_some() {
+        return Err(Status::InvalidArgument);
+    }
+    if width == 0 || height == 0 {
+        return Err(Status::InvalidArgument);
+    }
+
+    let byte_len = usize::try_from(byte_len_u32).map_err(|_| Status::OutOfRange)?;
+    let expected_len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|v| v.checked_mul(4usize))
+        .ok_or(Status::OutOfRange)?;
+    if expected_len != byte_len {
+        return Err(Status::InvalidArgument);
+    }
+    if expected_len > RENDER_MAX_FRAME_BYTES {
+        return Err(Status::OutOfRange);
+    }
+
+    Ok(Some(RawFrameSubmitRequest {
+        width,
+        height,
+        byte_len,
+    }))
+}
+
+fn parse_frame_get_raw_request(line: &str) -> Result<bool, Status> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+
+    let mut tokens = trimmed.split_whitespace();
+    let Some(cmd) = tokens.next() else {
+        return Ok(false);
+    };
+    if !cmd.eq_ignore_ascii_case("RENDER_FRAME_GET_RAW") {
+        return Ok(false);
+    }
+    if tokens.next().is_some() {
+        return Err(Status::InvalidArgument);
+    }
+    Ok(true)
+}
+
+fn write_status_error(stream: &mut UnixStream, status: Status) {
+    let _ = stream.write_all(format!("ERR {}\n", status_name(status)).as_bytes());
+    let _ = stream.flush();
+}
+
+fn write_internal_error(stream: &mut UnixStream, msg: &str) {
+    let _ = stream.write_all(format!("ERR INTERNAL_ERROR {}\n", msg).as_bytes());
+    let _ = stream.flush();
+}
+
+fn handle_raw_frame_submit(
+    stream: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    engine: &Arc<Mutex<RuntimeEngine>>,
+    req: RawFrameSubmitRequest,
+) -> std::io::Result<()> {
+    stream.write_all(b"OK READY\n")?;
+    stream.flush()?;
+
+    let mut pixels_rgba8 = vec![0u8; req.byte_len];
+    reader.read_exact(&mut pixels_rgba8)?;
+
+    let response = match engine.lock() {
+        Ok(mut guard) => {
+            match guard.submit_render_frame_rgba(req.width, req.height, pixels_rgba8) {
+                Ok(frame) => format!(
+                    "OK {} {} {} RGBA8888 {} {}",
+                    frame.frame_seq,
+                    frame.width,
+                    frame.height,
+                    frame.byte_len,
+                    frame.checksum_fnv1a32
+                ),
+                Err(status) => format!("ERR {}", status_name(status)),
+            }
+        }
+        Err(_) => {
+            return Err(std::io::Error::other("lock_poisoned"));
+        }
+    };
+
+    stream.write_all(response.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn handle_frame_get_raw(
+    stream: &mut UnixStream,
+    engine: &Arc<Mutex<RuntimeEngine>>,
+) -> std::io::Result<()> {
+    const RAW_CHUNK_BYTES: usize = 1024 * 1024;
+
+    let guard = engine
+        .lock()
+        .map_err(|_| std::io::Error::other("lock_poisoned"))?;
+    let Some(frame) = guard.render_frame_info() else {
+        write_status_error(stream, Status::OutOfRange);
+        return Ok(());
+    };
+
+    let header = format!(
+        "OK {} {} {} {}\n",
+        frame.frame_seq, frame.width, frame.height, frame.byte_len
+    );
+    stream.write_all(header.as_bytes())?;
+
+    let total = frame.byte_len as usize;
+    let mut offset = 0usize;
+    while offset < total {
+        let ask = (total - offset).min(RAW_CHUNK_BYTES);
+        let chunk = guard
+            .render_frame_read_chunk(offset, ask)
+            .map_err(|_| std::io::Error::other("frame_chunk_read_failed"))?;
+        if chunk.chunk_bytes.is_empty() {
+            return Err(std::io::Error::other("frame_chunk_empty"));
+        }
+        stream.write_all(&chunk.chunk_bytes)?;
+        offset += chunk.chunk_bytes.len();
+    }
+
+    stream.flush()?;
+    Ok(())
+}
+
 fn handle_client(
     mut stream: UnixStream,
     engine: Arc<Mutex<RuntimeEngine>>,
@@ -81,6 +251,38 @@ fn handle_client(
         match reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {
+                let raw_get = match parse_frame_get_raw_request(&line) {
+                    Ok(v) => v,
+                    Err(status) => {
+                        write_status_error(&mut stream, status);
+                        continue;
+                    }
+                };
+                if raw_get {
+                    if let Err(e) = handle_frame_get_raw(&mut stream, &engine) {
+                        write_internal_error(&mut stream, &format!("raw_get_failed:{}", e));
+                        break;
+                    }
+                    continue;
+                }
+
+                let raw_submit = match parse_raw_frame_submit_request(&line) {
+                    Ok(v) => v,
+                    Err(status) => {
+                        write_status_error(&mut stream, status);
+                        continue;
+                    }
+                };
+
+                if let Some(req) = raw_submit {
+                    if let Err(e) = handle_raw_frame_submit(&mut stream, &mut reader, &engine, req)
+                    {
+                        write_internal_error(&mut stream, &format!("raw_read_failed:{}", e));
+                        break;
+                    }
+                    continue;
+                }
+
                 let outcome = {
                     match engine.lock() {
                         Ok(mut guard) => execute_command(&mut guard, &line),
@@ -170,4 +372,44 @@ fn main() {
     }
 
     println!("daemon_status=stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_raw_frame_submit_request_accepts_valid_header() {
+        let req = parse_raw_frame_submit_request("RENDER_FRAME_SUBMIT_RGBA_RAW 2 1 8")
+            .expect("parse ok")
+            .expect("has request");
+        assert_eq!(req.width, 2);
+        assert_eq!(req.height, 1);
+        assert_eq!(req.byte_len, 8);
+    }
+
+    #[test]
+    fn parse_raw_frame_submit_request_rejects_mismatched_len() {
+        let out = parse_raw_frame_submit_request("RENDER_FRAME_SUBMIT_RGBA_RAW 2 1 7")
+            .expect_err("must reject");
+        assert_eq!(out, Status::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_raw_frame_submit_request_ignores_other_commands() {
+        let out = parse_raw_frame_submit_request("PING").expect("parse ping");
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn parse_frame_get_raw_request_accepts_header() {
+        let out = parse_frame_get_raw_request("RENDER_FRAME_GET_RAW").expect("parse raw get");
+        assert!(out);
+    }
+
+    #[test]
+    fn parse_frame_get_raw_request_rejects_extra_tokens() {
+        let out = parse_frame_get_raw_request("RENDER_FRAME_GET_RAW extra").expect_err("reject");
+        assert_eq!(out, Status::InvalidArgument);
+    }
 }

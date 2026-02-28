@@ -35,6 +35,11 @@
 ./scripts/daemon_cmd.sh RENDER_FRAME_CLEAR
 ```
 
+`RENDER_FRAME_SUBMIT_RGBA_RAW` 需要先读写握手再发送二进制 body，不适合
+`daemon_cmd.sh` 这种逐行文本工具；请使用长连接客户端（如 FrostUI runtime）。
+
+`RENDER_FRAME_GET_RAW` 会返回二进制 RGBA body，同样不适合 `daemon_cmd.sh`。
+
 同步 Android 实际显示参数：
 
 ```sh

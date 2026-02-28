@@ -9,6 +9,7 @@
 - Unix Domain Socket（默认 `artifacts/run/dsapi.sock`）
 - 单行命令请求
 - 单行响应结果
+- 二进制帧提交扩展（`RENDER_FRAME_SUBMIT_RGBA_RAW` 先握手再传定长 body）
 - 并发连接处理（触摸桥接与控制命令可并行）
 
 ## 协议命令（v0.1+）
@@ -29,7 +30,9 @@
 - `TOUCH_COUNT`
 - `RENDER_SUBMIT <draw_calls> <frost_passes> <text_calls>`
 - `RENDER_GET`
+- `RENDER_FRAME_SUBMIT_RGBA_RAW <width> <height> <byte_len>`（收到 `OK READY` 后发送 `byte_len` 原始 RGBA8）
 - `RENDER_FRAME_SUBMIT_RGBA <width> <height> <base64_rgba8>`
+- `RENDER_FRAME_GET_RAW`（`OK <frame_seq> <w> <h> <byte_len>` 后紧跟 `byte_len` 原始 RGBA8）
 - `RENDER_FRAME_GET`
 - `RENDER_FRAME_READ_BASE64 <offset> <max_bytes>`
 - `RENDER_FRAME_CLEAR`

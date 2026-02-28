@@ -136,10 +136,7 @@ impl RuntimeEngine {
     }
 
     pub fn render_present(&mut self) -> Result<RenderPresentInfo, Status> {
-        let (frame_info, _pixels) = self
-            .state
-            .render_frame_snapshot()
-            .ok_or(Status::OutOfRange)?;
+        let frame_info = self.state.render_frame_info().ok_or(Status::OutOfRange)?;
         self.present_seq = self.present_seq.saturating_add(1);
 
         let info = RenderPresentInfo {

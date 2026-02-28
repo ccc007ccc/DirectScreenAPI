@@ -1,0 +1,129 @@
+package org.directscreenapi.adapter;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
+
+final class SurfaceLayerSession {
+    private final Object surfaceControl;
+    private final Object surface;
+    private final Class<?> transactionClass;
+    private final Method lockCanvasMethod;
+    private final Method lockHardwareCanvasMethod;
+    private final Method unlockCanvasAndPostMethod;
+
+    private SurfaceLayerSession(
+            Object surfaceControl,
+            Object surface,
+            Class<?> transactionClass,
+            Method lockCanvasMethod,
+            Method lockHardwareCanvasMethod,
+            Method unlockCanvasAndPostMethod
+    ) {
+        this.surfaceControl = surfaceControl;
+        this.surface = surface;
+        this.transactionClass = transactionClass;
+        this.lockCanvasMethod = lockCanvasMethod;
+        this.lockHardwareCanvasMethod = lockHardwareCanvasMethod;
+        this.unlockCanvasAndPostMethod = unlockCanvasAndPostMethod;
+    }
+
+    static SurfaceLayerSession create(int width, int height, int zLayer, String layerName) throws Exception {
+        Class<?> builderClass = Class.forName("android.view.SurfaceControl$Builder");
+        Class<?> transactionClass = Class.forName("android.view.SurfaceControl$Transaction");
+        Class<?> rectClass = Class.forName("android.graphics.Rect");
+        Class<?> surfaceClass = Class.forName("android.view.Surface");
+        Class<?> surfaceControlClass = Class.forName("android.view.SurfaceControl");
+
+        Object builder = builderClass.getDeclaredConstructor().newInstance();
+        ReflectBridge.invoke(builder, "setName", layerName);
+        try {
+            ReflectBridge.invoke(builder, "setCallsite", "DirectScreenAPI");
+        } catch (Throwable ignored) {
+        }
+        ReflectBridge.invoke(builder, "setBufferSize", Integer.valueOf(width), Integer.valueOf(height));
+        ReflectBridge.invoke(builder, "setFormat", Integer.valueOf(1)); // RGBA_8888
+        ReflectBridge.invoke(builder, "setOpaque", Boolean.FALSE);
+        ReflectBridge.invoke(builder, "setHidden", Boolean.FALSE);
+        Object sc = ReflectBridge.invoke(builder, "build");
+
+        Object txShow = transactionClass.getDeclaredConstructor().newInstance();
+        ReflectBridge.invoke(txShow, "setLayer", sc, Integer.valueOf(zLayer));
+        ReflectBridge.invoke(txShow, "setPosition", sc, Float.valueOf(0f), Float.valueOf(0f));
+        Object fullRect = rectClass.getDeclaredConstructor(int.class, int.class, int.class, int.class)
+                .newInstance(0, 0, width, height);
+        ReflectBridge.invoke(txShow, "setWindowCrop", sc, fullRect);
+        try {
+            ReflectBridge.invoke(txShow, "setTrustedOverlay", sc, Boolean.TRUE);
+        } catch (Throwable ignored) {
+        }
+        ReflectBridge.invoke(txShow, "show", sc);
+        ReflectBridge.invoke(txShow, "apply");
+        ReflectBridge.invoke(txShow, "close");
+
+        Object surface = createSurfaceFromSurfaceControl(surfaceClass, surfaceControlClass, sc);
+        Method lockCanvas = ReflectBridge.findMethodByArity(surfaceClass, "lockCanvas", 1);
+        Method unlockCanvasAndPost = ReflectBridge.findMethodByArity(surfaceClass, "unlockCanvasAndPost", 1);
+        Method lockHardwareCanvas = null;
+        try {
+            lockHardwareCanvas = ReflectBridge.findMethodByArity(surfaceClass, "lockHardwareCanvas", 0);
+        } catch (Throwable ignored) {
+        }
+
+        return new SurfaceLayerSession(
+                sc,
+                surface,
+                transactionClass,
+                lockCanvas,
+                lockHardwareCanvas,
+                unlockCanvasAndPost
+        );
+    }
+
+    Object lockFrame() throws Exception {
+        if (lockHardwareCanvasMethod != null) {
+            return lockHardwareCanvasMethod.invoke(surface);
+        }
+        return lockCanvasMethod.invoke(surface, new Object[]{null});
+    }
+
+    void unlockFrame(Object canvas) throws Exception {
+        unlockCanvasAndPostMethod.invoke(surface, canvas);
+    }
+
+    void closeQuietly() {
+        try {
+            Object txRemove = transactionClass.getDeclaredConstructor().newInstance();
+            ReflectBridge.invoke(txRemove, "remove", surfaceControl);
+            ReflectBridge.invoke(txRemove, "apply");
+            ReflectBridge.invoke(txRemove, "close");
+        } catch (Throwable ignored) {
+        }
+        try {
+            ReflectBridge.invoke(surface, "release");
+        } catch (Throwable ignored) {
+        }
+        try {
+            ReflectBridge.invoke(surfaceControl, "release");
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static Object createSurfaceFromSurfaceControl(
+            Class<?> surfaceClass,
+            Class<?> surfaceControlClass,
+            Object surfaceControl
+    ) throws Exception {
+        for (Constructor<?> c : surfaceClass.getDeclaredConstructors()) {
+            Class<?>[] params = c.getParameterTypes();
+            if (params.length == 1 && params[0].getName().equals(surfaceControlClass.getName())) {
+                c.setAccessible(true);
+                return c.newInstance(surfaceControl);
+            }
+        }
+
+        Object surface = surfaceClass.getDeclaredConstructor().newInstance();
+        Method copyFrom = ReflectBridge.findMethod(surfaceClass, "copyFrom", surfaceControl);
+        copyFrom.invoke(surface, surfaceControl);
+        return surface;
+    }
+}

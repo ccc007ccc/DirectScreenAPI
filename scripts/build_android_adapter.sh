@@ -32,13 +32,42 @@ if [ ! -d "$SRC_DIR" ]; then
 fi
 
 JAVA_FILES=""
-if [ "$BUILD_MODE" = "all" ]; then
-  JAVA_FILES="$(find "$SRC_DIR" -type f -name '*.java' | sort)"
-else
-  for rel in \
-    org/directscreenapi/adapter/DisplayAdapter.java \
-    org/directscreenapi/adapter/AndroidDisplayAdapter.java \
-    org/directscreenapi/adapter/AndroidAdapterMain.java
+required_sources=""
+
+case "$BUILD_MODE" in
+  display_probe)
+    required_sources="
+org/directscreenapi/adapter/DisplayAdapter.java
+org/directscreenapi/adapter/AndroidDisplayAdapter.java
+org/directscreenapi/adapter/AndroidAdapterMain.java
+org/directscreenapi/adapter/ReflectBridge.java
+org/directscreenapi/adapter/DaemonSession.java
+org/directscreenapi/adapter/SurfaceLayerSession.java
+org/directscreenapi/adapter/RgbaFramePresenter.java
+"
+    ;;
+  presenter)
+    required_sources="
+org/directscreenapi/adapter/DisplayAdapter.java
+org/directscreenapi/adapter/AndroidDisplayAdapter.java
+org/directscreenapi/adapter/AndroidAdapterMain.java
+org/directscreenapi/adapter/ReflectBridge.java
+org/directscreenapi/adapter/DaemonSession.java
+org/directscreenapi/adapter/SurfaceLayerSession.java
+org/directscreenapi/adapter/RgbaFramePresenter.java
+"
+    ;;
+  all)
+    JAVA_FILES="$(find "$SRC_DIR" -type f -name '*.java' | sort)"
+    ;;
+  *)
+    echo "android_adapter_error=invalid_build_mode mode=$BUILD_MODE"
+    exit 3
+    ;;
+esac
+
+if [ -n "$required_sources" ]; then
+  for rel in $required_sources
   do
     file="$SRC_DIR/$rel"
     if [ ! -f "$file" ]; then
