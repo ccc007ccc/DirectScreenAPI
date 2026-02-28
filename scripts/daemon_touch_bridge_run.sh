@@ -4,13 +4,21 @@ set -eu
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-SOCKET_PATH="${DSAPI_SOCKET_PATH:-artifacts/run/dsapi.sock}"
+CONTROL_SOCKET_PATH="${DSAPI_CONTROL_SOCKET_PATH:-${DSAPI_SOCKET_PATH:-artifacts/run/dsapi.sock}}"
+DATA_SOCKET_PATH="${DSAPI_DATA_SOCKET_PATH:-}"
 GETEVENT_BIN="${DSAPI_GETEVENT_BIN:-/system/bin/getevent}"
 RUN_AS_ROOT="${DSAPI_TOUCH_RUN_AS_ROOT:-1}"
 TOUCH_DEVICE="${DSAPI_TOUCH_DEVICE:-}"
 MONITOR_INTERVAL_SEC="${DSAPI_TOUCH_MONITOR_INTERVAL_SEC:-1}"
 AUTO_SYNC_DISPLAY="${DSAPI_TOUCH_AUTO_SYNC_DISPLAY:-1}"
 SYNC_DISPLAY_EVERY_SEC="${DSAPI_TOUCH_SYNC_DISPLAY_EVERY_SEC:-1}"
+
+if [ -z "$DATA_SOCKET_PATH" ]; then
+  case "$CONTROL_SOCKET_PATH" in
+    *.sock) DATA_SOCKET_PATH="${CONTROL_SOCKET_PATH%.sock}.data.sock" ;;
+    *) DATA_SOCKET_PATH="${CONTROL_SOCKET_PATH}.data" ;;
+  esac
+fi
 
 PIPE_PID=""
 last_sync_ts=0
@@ -68,7 +76,7 @@ extract_abs_max() {
 }
 
 read_display_line() {
-  ./target/release/dsapictl --socket "$SOCKET_PATH" DISPLAY_GET 2>/dev/null || true
+  ./target/release/dsapictl --socket "$CONTROL_SOCKET_PATH" DISPLAY_GET 2>/dev/null || true
 }
 
 parse_display() {
@@ -117,7 +125,7 @@ start_pipeline() {
   h="$2"
   rot="$3"
 
-  cmd="./target/release/dsapiinput --socket '$SOCKET_PATH' --device '$TOUCH_DEVICE' --max-x '$max_x' --max-y '$max_y' --width '$w' --height '$h' --rotation '$rot' --quiet"
+  cmd="./target/release/dsapiinput --control-socket '$CONTROL_SOCKET_PATH' --data-socket '$DATA_SOCKET_PATH' --device '$TOUCH_DEVICE' --max-x '$max_x' --max-y '$max_y' --width '$w' --height '$h' --rotation '$rot' --quiet"
 
   if [ "$RUN_AS_ROOT" = "1" ]; then
     su -c "$cmd" &
@@ -129,8 +137,8 @@ start_pipeline() {
 
 cleanup() {
   stop_pipeline
-  if [ -x ./target/release/dsapictl ] && [ -S "$SOCKET_PATH" ]; then
-    ./target/release/dsapictl --socket "$SOCKET_PATH" TOUCH_CLEAR >/dev/null 2>&1 || true
+  if [ -x ./target/release/dsapictl ] && [ -S "$CONTROL_SOCKET_PATH" ]; then
+    ./target/release/dsapictl --socket "$CONTROL_SOCKET_PATH" TOUCH_CLEAR >/dev/null 2>&1 || true
   fi
 }
 
@@ -140,8 +148,12 @@ if [ ! -x ./target/release/dsapiinput ] || [ ! -x ./target/release/dsapictl ]; t
   ./scripts/build_core.sh >/dev/null
 fi
 
-if [ ! -S "$SOCKET_PATH" ]; then
-  echo "touch_bridge_error=daemon_socket_missing socket=$SOCKET_PATH"
+if [ ! -S "$CONTROL_SOCKET_PATH" ]; then
+  echo "touch_bridge_error=daemon_control_socket_missing socket=$CONTROL_SOCKET_PATH"
+  exit 2
+fi
+if [ ! -S "$DATA_SOCKET_PATH" ]; then
+  echo "touch_bridge_error=daemon_data_socket_missing socket=$DATA_SOCKET_PATH"
   exit 2
 fi
 
@@ -161,7 +173,7 @@ if ! is_uint "$max_x" || ! is_uint "$max_y"; then
   exit 5
 fi
 
-./target/release/dsapictl --socket "$SOCKET_PATH" TOUCH_CLEAR >/dev/null 2>&1 || true
+./target/release/dsapictl --socket "$CONTROL_SOCKET_PATH" TOUCH_CLEAR >/dev/null 2>&1 || true
 
 current_display_line=""
 
@@ -179,7 +191,7 @@ while true; do
       echo "touch_bridge_status=display_changed old='$current_display_line' new='$display_line'"
     fi
     current_display_line="$display_line"
-    ./target/release/dsapictl --socket "$SOCKET_PATH" TOUCH_CLEAR >/dev/null 2>&1 || true
+    ./target/release/dsapictl --socket "$CONTROL_SOCKET_PATH" TOUCH_CLEAR >/dev/null 2>&1 || true
     stop_pipeline
     start_pipeline "$display_w" "$display_h" "$display_rot"
     echo "touch_bridge_status=running device=$TOUCH_DEVICE max_x=$max_x max_y=$max_y display_w=$display_w display_h=$display_h rotation=$display_rot"

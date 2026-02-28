@@ -34,7 +34,6 @@ name = "test_touch_ui"
 path = "src/bin/test_touch_ui.rs"
 
 [dependencies]
-base64 = "0.22"
 evdev = "0.12"
 font8x8 = "0.3"
 libc = "0.2"

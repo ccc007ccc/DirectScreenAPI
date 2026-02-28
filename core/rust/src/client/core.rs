@@ -88,16 +88,28 @@ fn parse_f32_token(token: &str, field: &str) -> Result<f32> {
 
 #[derive(Debug)]
 pub struct DsapiClient {
-    socket_path: PathBuf,
+    control_socket_path: PathBuf,
+    data_socket_path: PathBuf,
     control: SocketConnection,
 }
 
 impl DsapiClient {
     pub fn connect<P: AsRef<Path>>(socket_path: P) -> Result<Self> {
-        let socket_path = socket_path.as_ref().to_path_buf();
-        let control = SocketConnection::connect(&socket_path)?;
+        let control_socket_path = socket_path.as_ref().to_path_buf();
+        let data_socket_path = derive_data_socket_path(&control_socket_path);
+        Self::connect_with_data_socket(control_socket_path, data_socket_path)
+    }
+
+    pub fn connect_with_data_socket<P: AsRef<Path>, Q: AsRef<Path>>(
+        control_socket_path: P,
+        data_socket_path: Q,
+    ) -> Result<Self> {
+        let control_socket_path = control_socket_path.as_ref().to_path_buf();
+        let data_socket_path = data_socket_path.as_ref().to_path_buf();
+        let control = SocketConnection::connect(&control_socket_path)?;
         Ok(Self {
-            socket_path,
+            control_socket_path,
+            data_socket_path,
             control,
         })
     }
@@ -143,7 +155,7 @@ impl DsapiClient {
         // 渲染会话绑定显示分辨率/旋转/刷新率，并在 submit_frame 内完成适配。
         let display = self.get_display_info()?;
         RenderSession::connect(
-            self.socket_path.clone(),
+            self.data_socket_path.clone(),
             display.width,
             display.height,
             display.rotation,
@@ -153,11 +165,11 @@ impl DsapiClient {
 
     pub fn subscribe_touch(&self, route_name: &str) -> Result<TouchStream> {
         // route_name 作为上层业务标识保留，底层握手走 STREAM_TOUCH_V1。
-        TouchStream::connect(self.socket_path.clone(), route_name)
+        TouchStream::connect(self.data_socket_path.clone(), route_name)
     }
 
     pub fn subscribe_display(&self) -> Result<DisplayStream> {
-        DisplayStream::connect(self.socket_path.clone())
+        DisplayStream::connect(self.control_socket_path.clone())
     }
 
     pub fn render_present(&mut self) -> Result<()> {
@@ -194,6 +206,14 @@ impl DsapiClient {
         }
         Ok(())
     }
+}
+
+fn derive_data_socket_path(control_socket_path: &Path) -> PathBuf {
+    let text = control_socket_path.to_string_lossy();
+    if let Some(prefix) = text.strip_suffix(".sock") {
+        return PathBuf::from(format!("{}.data.sock", prefix));
+    }
+    PathBuf::from(format!("{}.data", text))
 }
 
 #[cfg(test)]

@@ -4,7 +4,9 @@
 
 ## 上下文生命周期
 
+- `dsapi_abi_version`
 - `dsapi_context_create`
+- `dsapi_context_create_with_abi`
 - `dsapi_context_destroy`
 
 ## 显示状态接口
@@ -52,3 +54,4 @@
 - 已发布符号不做原地破坏式修改
 - 破坏性变更必须提升 ABI 主版本
 - 新增接口必须补文档与错误语义
+- 建议优先调用 `dsapi_context_create_with_abi(DSAPI_ABI_VERSION, ...)` 做运行时 ABI 协商

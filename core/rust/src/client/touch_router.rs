@@ -28,7 +28,8 @@ const TOUCH_PACKET_UP: u8 = 3;
 
 #[derive(Debug, Clone)]
 pub struct TouchRouterConfig {
-    pub socket_path: String,
+    pub control_socket_path: String,
+    pub data_socket_path: String,
     pub route_name: String,
     pub device_path: String,
     pub screen_width: u32,
@@ -268,11 +269,12 @@ fn run_touch_router<S>(
 where
     S: Copy + Send + 'static,
 {
-    let client = DsapiClient::connect(&cfg.socket_path)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("touch_client_connect:{}", e)))?;
+    let client =
+        DsapiClient::connect_with_data_socket(&cfg.control_socket_path, &cfg.data_socket_path)
+            .map_err(|e| io::Error::other(format!("touch_client_connect:{}", e)))?;
     let mut touch_stream = client
         .subscribe_touch(&cfg.route_name)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("touch_subscribe:{}", e)))?;
+        .map_err(|e| io::Error::other(format!("touch_subscribe:{}", e)))?;
 
     let mut device = Device::open(&cfg.device_path)?;
     device.grab()?;
@@ -311,7 +313,7 @@ where
 
         touch_stream
             .clear()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("touch_clear:{}", e)))?;
+            .map_err(|e| io::Error::other(format!("touch_clear:{}", e)))?;
         let _ = tx.send(TouchMessage {
             phase: TouchPhase::Clear,
             pointer_id: -1,
@@ -345,10 +347,7 @@ where
                         break;
                     }
                     Err(e) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("fetch_events_failed:{}", e),
-                        ));
+                        return Err(io::Error::other(format!("fetch_events_failed:{}", e)));
                     }
                 };
 
@@ -497,10 +496,7 @@ where
                                         to_client_touch_event(p.kind, p.pointer_id, x, y)
                                     {
                                         touch_stream.send_event(event).map_err(|e| {
-                                            io::Error::new(
-                                                io::ErrorKind::Other,
-                                                format!("touch_send_failed:{}", e),
-                                            )
+                                            io::Error::other(format!("touch_send_failed:{}", e))
                                         })?;
                                     }
 
@@ -586,7 +582,8 @@ fn build_passthrough_frame_events(
                     continue;
                 }
 
-                let route = slot_route_for_frame(cur_slot, frame_slot_routes, slots, pointer_routes);
+                let route =
+                    slot_route_for_frame(cur_slot, frame_slot_routes, slots, pointer_routes);
                 if route != PointerRoute::PassThrough {
                     continue;
                 }
@@ -757,7 +754,7 @@ fn build_virtual_touch_device(device: &Device) -> io::Result<VirtualDevice> {
     let mut key_set: AttributeSet<Key> = device
         .supported_keys()
         .map(|keys| keys.iter().collect())
-        .unwrap_or_else(AttributeSet::new);
+        .unwrap_or_default();
     key_set.insert(Key::BTN_TOUCH);
 
     let mut props: AttributeSet<PropType> = device.properties().iter().collect();
@@ -877,10 +874,7 @@ fn wait_ready(device_fd: RawFd, wake_read_fd: RawFd) -> io::Result<bool> {
         return Ok(false);
     }
     if (fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "device_poll_error_or_hup",
-        ));
+        return Err(io::Error::other("device_poll_error_or_hup"));
     }
     Ok((fds[0].revents & libc::POLLIN) != 0)
 }

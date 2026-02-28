@@ -72,8 +72,8 @@ final class RgbaFramePresenter {
     private final Object xferSrc;
     private final Object paint;
 
-    RgbaFramePresenter(String socketPath, int pollMs, int zLayer, String layerName) throws Exception {
-        this.daemon = new DaemonSession(socketPath);
+    RgbaFramePresenter(String controlSocketPath, String dataSocketPath, int pollMs, int zLayer, String layerName) throws Exception {
+        this.daemon = new DaemonSession(controlSocketPath, dataSocketPath);
         this.displayAdapter = new AndroidDisplayAdapter();
         this.pollMs = Math.max(1, pollMs);
         this.zLayer = zLayer;

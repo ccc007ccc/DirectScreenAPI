@@ -52,8 +52,6 @@
 ```sh
 ./scripts/daemon_presenter_start.sh
 ./scripts/daemon_presenter_status.sh
-./scripts/daemon_cmd.sh RENDER_FRAME_SUBMIT_RGBA 1 1 AQIDBA==
-./scripts/daemon_cmd.sh RENDER_PRESENT
 ```
 
 ## 输出格式约定
@@ -70,6 +68,8 @@
 
 - `DSAPI_ANDROID_OUT_DIR`：Android 构建产物目录，默认 `artifacts/android`
 - `DSAPI_ANDROID_BUILD_MODE`：`display_probe`（默认）、`presenter` 或 `all`
+- `DSAPI_CONTROL_SOCKET_PATH`：控制面 socket，默认 `artifacts/run/dsapi.sock`
+- `DSAPI_DATA_SOCKET_PATH`：数据面 socket，默认 `<control>.data.sock`
 - `DSAPI_RUN_AS_ROOT`：是否使用 `su -c` 执行 probe，默认 `1`
 - `DSAPI_APP_PROCESS_BIN`：指定 `app_process` 可执行路径，默认 `app_process`
 - `DSAPI_PRESENTER_POLL_MS`：presenter 帧等待超时（`RENDER_FRAME_WAIT_BOUND_PRESENT`），默认 `8`

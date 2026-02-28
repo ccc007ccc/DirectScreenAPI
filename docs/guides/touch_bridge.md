@@ -49,6 +49,8 @@
 - `DSAPI_TOUCH_BRIDGE_PID_FILE`：桥接 PID 文件路径
 - `DSAPI_TOUCH_BRIDGE_LOG_FILE`：桥接日志路径
 - `DSAPI_GETEVENT_BIN`：`getevent` 可执行路径，默认 `/system/bin/getevent`
+- `DSAPI_CONTROL_SOCKET_PATH`：控制面 socket，默认 `artifacts/run/dsapi.sock`
+- `DSAPI_DATA_SOCKET_PATH`：数据面 socket，默认 `<control>.data.sock`
 
 ## 性能说明
 

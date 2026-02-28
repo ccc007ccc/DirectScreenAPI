@@ -4,90 +4,91 @@ set -eu
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-SOCKET_PATH="${DSAPI_SOCKET_PATH:-artifacts/run/dsapi.sock}"
+DATA_SOCKET_PATH="${DSAPI_DATA_SOCKET_PATH:-}"
 OUT_PATH="${1:-}"
-CHUNK_BYTES="${2:-65536}"
 
 if [ -z "$OUT_PATH" ]; then
-  echo "usage: daemon_frame_pull.sh <out_rgba_path> [chunk_bytes]"
+  echo "usage: daemon_frame_pull.sh <out_rgba_path>"
   exit 1
 fi
 
-if [ "$CHUNK_BYTES" -le 0 ] 2>/dev/null; then
-  echo "frame_pull_error=invalid_chunk_bytes value=$CHUNK_BYTES"
+if [ -z "$DATA_SOCKET_PATH" ]; then
+  control="${DSAPI_CONTROL_SOCKET_PATH:-${DSAPI_SOCKET_PATH:-artifacts/run/dsapi.sock}}"
+  case "$control" in
+    *.sock) DATA_SOCKET_PATH="${control%.sock}.data.sock" ;;
+    *) DATA_SOCKET_PATH="${control}.data" ;;
+  esac
+fi
+
+if [ ! -S "$DATA_SOCKET_PATH" ]; then
+  echo "frame_pull_error=data_socket_missing socket=$DATA_SOCKET_PATH"
   exit 2
 fi
 
-if ! command -v base64 >/dev/null 2>&1; then
-  echo "frame_pull_error=base64_not_found"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "frame_pull_error=python3_not_found"
   exit 3
 fi
 
-frame_line="$(./target/release/dsapictl --socket "$SOCKET_PATH" RENDER_FRAME_GET 2>/dev/null || true)"
-if [ -z "$frame_line" ]; then
-  echo "frame_pull_error=daemon_unreachable socket=$SOCKET_PATH"
-  exit 4
-fi
-
-set -- $frame_line
-if [ "$#" -ne 7 ] || [ "$1" != "OK" ] || [ "$5" != "RGBA8888" ]; then
-  echo "frame_pull_error=invalid_frame_info line='$frame_line'"
-  exit 5
-fi
-
-FRAME_SEQ="$2"
-WIDTH="$3"
-HEIGHT="$4"
-TOTAL_BYTES="$6"
-CHECKSUM="$7"
-
-TMP_PATH="$OUT_PATH.tmp.$$"
 mkdir -p "$(dirname "$OUT_PATH")"
-: > "$TMP_PATH"
+TMP_PATH="$OUT_PATH.tmp.$$"
 
-offset=0
-while [ "$offset" -lt "$TOTAL_BYTES" ]; do
-  chunk_line="$(./target/release/dsapictl --socket "$SOCKET_PATH" RENDER_FRAME_READ_BASE64 "$offset" "$CHUNK_BYTES" 2>/dev/null || true)"
-  if [ -z "$chunk_line" ]; then
-    rm -f "$TMP_PATH"
-    echo "frame_pull_error=chunk_read_failed offset=$offset"
-    exit 6
-  fi
+python3 - "$DATA_SOCKET_PATH" "$TMP_PATH" <<'PY'
+import os
+import socket
+import sys
 
-  set -- $chunk_line
-  if [ "$#" -ne 6 ] || [ "$1" != "OK" ]; then
-    rm -f "$TMP_PATH"
-    echo "frame_pull_error=invalid_chunk_line line='$chunk_line'"
-    exit 7
-  fi
+sock_path = sys.argv[1]
+tmp_path = sys.argv[2]
 
-  READ_FRAME_SEQ="$2"
-  READ_TOTAL_BYTES="$3"
-  READ_OFFSET="$4"
-  READ_CHUNK_BYTES="$5"
-  READ_PAYLOAD="$6"
+def fail(msg: str, code: int) -> None:
+    print(msg)
+    sys.exit(code)
 
-  if [ "$READ_FRAME_SEQ" != "$FRAME_SEQ" ] || [ "$READ_TOTAL_BYTES" != "$TOTAL_BYTES" ] || [ "$READ_OFFSET" != "$offset" ]; then
-    rm -f "$TMP_PATH"
-    echo "frame_pull_error=chunk_mismatch line='$chunk_line'"
-    exit 8
-  fi
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect(sock_path)
+    s.sendall(b"RENDER_FRAME_GET_RAW\n")
+    line = bytearray()
+    while True:
+        b = s.recv(1)
+        if not b:
+            fail("frame_pull_error=header_eof", 4)
+        if b == b"\n":
+            break
+        if b != b"\r":
+            line.extend(b)
+        if len(line) > 4096:
+            fail("frame_pull_error=header_too_long", 4)
 
-  if ! printf '%s' "$READ_PAYLOAD" | base64 -d >> "$TMP_PATH"; then
-    rm -f "$TMP_PATH"
-    echo "frame_pull_error=base64_decode_failed offset=$offset"
-    exit 9
-  fi
+    text = line.decode("utf-8", "replace").strip()
+    parts = text.split()
+    if len(parts) != 5 or parts[0] != "OK":
+        fail(f"frame_pull_error=bad_header line='{text}'", 5)
 
-  offset=$((offset + READ_CHUNK_BYTES))
-done
+    frame_seq = parts[1]
+    width = parts[2]
+    height = parts[3]
+    byte_len = int(parts[4])
+    if byte_len <= 0:
+        fail("frame_pull_error=invalid_byte_len", 6)
 
-actual_bytes="$(wc -c < "$TMP_PATH" | tr -d '[:space:]')"
-if [ "$actual_bytes" != "$TOTAL_BYTES" ]; then
-  rm -f "$TMP_PATH"
-  echo "frame_pull_error=byte_count_mismatch expected=$TOTAL_BYTES actual=$actual_bytes"
-  exit 10
-fi
+    remain = byte_len
+    with open(tmp_path, "wb") as f:
+        while remain > 0:
+            chunk = s.recv(min(1024 * 1024, remain))
+            if not chunk:
+                fail("frame_pull_error=body_eof", 7)
+            f.write(chunk)
+            remain -= len(chunk)
+
+    actual = os.path.getsize(tmp_path)
+    if actual != byte_len:
+        fail(f"frame_pull_error=byte_count_mismatch expected={byte_len} actual={actual}", 8)
+    print(f"frame_pull=ok frame_seq={frame_seq} size={width}x{height} bytes={byte_len}")
+finally:
+    s.close()
+PY
 
 mv "$TMP_PATH" "$OUT_PATH"
-echo "frame_pull=ok frame_seq=$FRAME_SEQ size=${WIDTH}x${HEIGHT} bytes=$TOTAL_BYTES checksum=$CHECKSUM out=$OUT_PATH"
+echo "frame_pull_out=$OUT_PATH"

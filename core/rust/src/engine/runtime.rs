@@ -71,7 +71,7 @@ struct TouchState {
     active_touches: HashMap<i32, ActiveTouch>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct RenderState {
     render: RenderStats,
     render_frame_seq: u64,
@@ -79,19 +79,6 @@ struct RenderState {
     present_seq: u64,
     dump_seq: u64,
     last_present: Option<RenderPresentInfo>,
-}
-
-impl Default for RenderState {
-    fn default() -> Self {
-        Self {
-            render: RenderStats::default(),
-            render_frame_seq: 0,
-            last_render_frame: None,
-            present_seq: 0,
-            dump_seq: 0,
-            last_present: None,
-        }
-    }
 }
 
 #[derive(Debug)]

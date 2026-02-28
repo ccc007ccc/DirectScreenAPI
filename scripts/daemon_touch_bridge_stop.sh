@@ -4,9 +4,17 @@ set -eu
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-SOCKET_PATH="${DSAPI_SOCKET_PATH:-artifacts/run/dsapi.sock}"
+CONTROL_SOCKET_PATH="${DSAPI_CONTROL_SOCKET_PATH:-${DSAPI_SOCKET_PATH:-artifacts/run/dsapi.sock}}"
+DATA_SOCKET_PATH="${DSAPI_DATA_SOCKET_PATH:-}"
 PID_FILE="${DSAPI_TOUCH_BRIDGE_PID_FILE:-artifacts/run/dsapi_touch_bridge.pid}"
 SUPERVISE_INPUT="${DSAPI_SUPERVISE_INPUT:-0}"
+
+if [ -z "$DATA_SOCKET_PATH" ]; then
+  case "$CONTROL_SOCKET_PATH" in
+    *.sock) DATA_SOCKET_PATH="${CONTROL_SOCKET_PATH%.sock}.data.sock" ;;
+    *) DATA_SOCKET_PATH="${CONTROL_SOCKET_PATH}.data" ;;
+  esac
+fi
 
 if [ "$SUPERVISE_INPUT" = "1" ]; then
   echo "touch_bridge_status=managed_by_daemon supervise=1 action=use_daemon_stop"
@@ -23,11 +31,10 @@ if [ -f "$PID_FILE" ]; then
   rm -f "$PID_FILE"
 fi
 
-pkill -f "target/release/dsapiinput --socket $SOCKET_PATH" >/dev/null 2>&1 || true
-pkill -f "target/release/dsapistream --socket $SOCKET_PATH --quiet" >/dev/null 2>&1 || true
+pkill -f "target/release/dsapiinput --control-socket $CONTROL_SOCKET_PATH --data-socket $DATA_SOCKET_PATH" >/dev/null 2>&1 || true
 
-if [ -x ./target/release/dsapictl ] && [ -S "$SOCKET_PATH" ]; then
-  ./target/release/dsapictl --socket "$SOCKET_PATH" TOUCH_CLEAR >/dev/null 2>&1 || true
+if [ -x ./target/release/dsapictl ] && [ -S "$CONTROL_SOCKET_PATH" ]; then
+  ./target/release/dsapictl --socket "$CONTROL_SOCKET_PATH" TOUCH_CLEAR >/dev/null 2>&1 || true
 fi
 
 echo "touch_bridge_status=stopped"

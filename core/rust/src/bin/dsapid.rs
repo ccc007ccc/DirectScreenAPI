@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
 use std::io::{BufRead, BufReader, IoSlice, Read, Write};
@@ -12,7 +13,7 @@ use std::time::Duration;
 
 use directscreen_core::api::{RouteResult, Status, TouchEvent, RENDER_MAX_FRAME_BYTES};
 use directscreen_core::engine::{execute_command, RuntimeEngine};
-use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+use nix::sys::socket::{getsockopt, sendmsg, sockopt, ControlMessage, MsgFlags};
 
 struct SocketGuard {
     path: PathBuf,
@@ -30,17 +31,26 @@ impl Drop for SocketGuard {
     }
 }
 
-fn default_socket_path() -> String {
+fn default_control_socket_path() -> String {
     "artifacts/run/dsapi.sock".to_string()
+}
+
+fn derive_data_socket_path(control_socket_path: &str) -> String {
+    if let Some(prefix) = control_socket_path.strip_suffix(".sock") {
+        return format!("{}.data.sock", prefix);
+    }
+    format!("{}.data", control_socket_path)
 }
 
 #[derive(Debug, Clone)]
 struct DaemonConfig {
-    socket_path: String,
+    control_socket_path: String,
+    data_socket_path: String,
     render_output_dir: String,
     supervise_presenter_cmd: Option<String>,
     supervise_input_cmd: Option<String>,
     supervise_restart_ms: u64,
+    allowed_uids: HashSet<u32>,
 }
 
 fn parse_u64_arg(token: &str) -> Result<u64, String> {
@@ -50,7 +60,18 @@ fn parse_u64_arg(token: &str) -> Result<u64, String> {
 }
 
 fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
-    let mut socket_path = default_socket_path();
+    let mut control_socket_path = std::env::var("DSAPI_CONTROL_SOCKET_PATH")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::env::var("DSAPI_SOCKET_PATH")
+                .ok()
+                .filter(|v| !v.is_empty())
+        })
+        .unwrap_or_else(default_control_socket_path);
+    let mut data_socket_path = std::env::var("DSAPI_DATA_SOCKET_PATH")
+        .ok()
+        .filter(|v| !v.is_empty());
     let mut render_output_dir =
         std::env::var("DSAPI_RENDER_OUTPUT_DIR").unwrap_or_else(|_| "artifacts/render".to_string());
     let mut supervise_presenter_cmd = std::env::var("DSAPI_SUPERVISE_PRESENTER_CMD")
@@ -72,7 +93,21 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 if (i + 1) >= args.len() {
                     return Err("missing_socket_path".to_string());
                 }
-                socket_path = args[i + 1].clone();
+                control_socket_path = args[i + 1].clone();
+                i += 2;
+            }
+            "--control-socket" => {
+                if (i + 1) >= args.len() {
+                    return Err("missing_control_socket_path".to_string());
+                }
+                control_socket_path = args[i + 1].clone();
+                i += 2;
+            }
+            "--data-socket" => {
+                if (i + 1) >= args.len() {
+                    return Err("missing_data_socket_path".to_string());
+                }
+                data_socket_path = Some(args[i + 1].clone());
                 i += 2;
             }
             "--render-output-dir" => {
@@ -111,13 +146,53 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
         supervise_restart_ms = 50;
     }
 
+    let data_socket_path = data_socket_path
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| derive_data_socket_path(&control_socket_path));
+    if control_socket_path == data_socket_path {
+        return Err("control_socket_and_data_socket_must_differ".to_string());
+    }
+
+    let allowed_uids = parse_allowed_uids_from_env()?;
+
     Ok(DaemonConfig {
-        socket_path,
+        control_socket_path,
+        data_socket_path,
         render_output_dir,
         supervise_presenter_cmd,
         supervise_input_cmd,
         supervise_restart_ms,
+        allowed_uids,
     })
+}
+
+fn parse_allowed_uids_from_env() -> Result<HashSet<u32>, String> {
+    let default_uid = unsafe { libc::geteuid() as u32 };
+    let raw = match std::env::var("DSAPI_ALLOWED_UIDS") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            let mut out = HashSet::new();
+            out.insert(default_uid);
+            return Ok(out);
+        }
+    };
+
+    let mut out = HashSet::new();
+    for token in raw.split(',') {
+        let t = token.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let uid = t
+            .parse::<u32>()
+            .map_err(|_| format!("invalid_allowed_uid:{}", t))?;
+        out.insert(uid);
+    }
+
+    if out.is_empty() {
+        return Err("allowed_uids_empty".to_string());
+    }
+    Ok(out)
 }
 
 fn ensure_parent(path: &Path) -> std::io::Result<()> {
@@ -316,6 +391,11 @@ fn parse_display_stream_v1_request(line: &str) -> Result<bool, Status> {
         return Err(Status::InvalidArgument);
     }
     Ok(true)
+}
+
+fn socket_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    let creds = getsockopt(stream, sockopt::PeerCredentials).map_err(std::io::Error::other)?;
+    Ok(creds.uid())
 }
 
 fn write_status_error(stream: &mut UnixStream, status: Status) {
@@ -727,7 +807,80 @@ fn handle_display_stream_v1(
     Ok(())
 }
 
-fn handle_client(mut stream: UnixStream, engine: Arc<RuntimeEngine>, shutdown: Arc<AtomicBool>) {
+fn handle_control_client(
+    mut stream: UnixStream,
+    engine: Arc<RuntimeEngine>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let reader_stream = match stream.try_clone() {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = stream.write_all(format!("ERR INTERNAL_ERROR clone_failed:{}\n", e).as_bytes());
+            return;
+        }
+    };
+
+    let mut reader = BufReader::new(reader_stream);
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let display_stream = match parse_display_stream_v1_request(&line) {
+                    Ok(v) => v,
+                    Err(status) => {
+                        write_status_error(&mut stream, status);
+                        continue;
+                    }
+                };
+                if display_stream {
+                    if let Err(e) = handle_display_stream_v1(&mut stream, &engine, &shutdown) {
+                        write_internal_error(&mut stream, &format!("display_stream_failed:{}", e));
+                    }
+                    break;
+                }
+
+                if line.trim().eq_ignore_ascii_case("STREAM_TOUCH_V1")
+                    || line.trim().starts_with("RENDER_FRAME_SUBMIT_RGBA_RAW ")
+                    || line.trim().eq_ignore_ascii_case("RENDER_FRAME_GET_RAW")
+                    || line.trim().eq_ignore_ascii_case("RENDER_FRAME_GET_FD")
+                    || line.trim().eq_ignore_ascii_case("RENDER_FRAME_BIND_FD")
+                    || line.trim().eq_ignore_ascii_case("RENDER_FRAME_GET_BOUND")
+                    || line.trim().starts_with("RENDER_FRAME_WAIT_BOUND_PRESENT ")
+                {
+                    write_status_error(&mut stream, Status::InvalidArgument);
+                    continue;
+                }
+
+                let outcome = execute_command(&engine, &line);
+
+                let response = format!("{}\n", outcome.response_line);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+
+                if outcome.should_shutdown {
+                    shutdown.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+            Err(e) => {
+                let _ =
+                    stream.write_all(format!("ERR INTERNAL_ERROR read_failed:{}\n", e).as_bytes());
+                break;
+            }
+        }
+    }
+}
+
+fn handle_data_client(
+    mut stream: UnixStream,
+    engine: Arc<RuntimeEngine>,
+    shutdown: Arc<AtomicBool>,
+) {
     let reader_stream = match stream.try_clone() {
         Ok(v) => v,
         Err(e) => {
@@ -856,20 +1009,6 @@ fn handle_client(mut stream: UnixStream, engine: Arc<RuntimeEngine>, shutdown: A
                     continue;
                 }
 
-                let display_stream = match parse_display_stream_v1_request(&line) {
-                    Ok(v) => v,
-                    Err(status) => {
-                        write_status_error(&mut stream, status);
-                        continue;
-                    }
-                };
-                if display_stream {
-                    if let Err(e) = handle_display_stream_v1(&mut stream, &engine, &shutdown) {
-                        write_internal_error(&mut stream, &format!("display_stream_failed:{}", e));
-                    }
-                    break;
-                }
-
                 if line.trim().eq_ignore_ascii_case("STREAM_TOUCH_V1") {
                     if let Err(e) =
                         handle_touch_stream_v1(&mut stream, &mut reader, &engine, &shutdown)
@@ -879,16 +1018,7 @@ fn handle_client(mut stream: UnixStream, engine: Arc<RuntimeEngine>, shutdown: A
                     break;
                 }
 
-                let outcome = execute_command(&engine, &line);
-
-                let response = format!("{}\n", outcome.response_line);
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
-
-                if outcome.should_shutdown {
-                    shutdown.store(true, Ordering::SeqCst);
-                    break;
-                }
+                write_status_error(&mut stream, Status::InvalidArgument);
             }
             Err(e) => {
                 let _ =
@@ -978,35 +1108,76 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let socket_path = PathBuf::from(cfg.socket_path.clone());
+    let control_socket_path = PathBuf::from(cfg.control_socket_path.clone());
+    let data_socket_path = PathBuf::from(cfg.data_socket_path.clone());
 
-    if let Err(e) = ensure_parent(&socket_path) {
-        eprintln!("daemon_error=mkdir_failed err={}", e);
+    if let Err(e) = ensure_parent(&control_socket_path) {
+        eprintln!("daemon_error=mkdir_failed socket_kind=control err={}", e);
+        std::process::exit(2);
+    }
+    if let Err(e) = ensure_parent(&data_socket_path) {
+        eprintln!("daemon_error=mkdir_failed socket_kind=data err={}", e);
         std::process::exit(2);
     }
 
-    let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_file(&control_socket_path);
+    let _ = fs::remove_file(&data_socket_path);
 
-    let listener = match UnixListener::bind(&socket_path) {
+    let control_listener = match UnixListener::bind(&control_socket_path) {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
-                "daemon_error=bind_failed path={} err={}",
-                socket_path.display(),
+                "daemon_error=bind_failed socket_kind=control path={} err={}",
+                control_socket_path.display(),
+                e
+            );
+            std::process::exit(3);
+        }
+    };
+    let data_listener = match UnixListener::bind(&data_socket_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "daemon_error=bind_failed socket_kind=data path={} err={}",
+                data_socket_path.display(),
                 e
             );
             std::process::exit(3);
         }
     };
 
-    if let Err(e) = listener.set_nonblocking(true) {
-        eprintln!("daemon_error=set_nonblocking_failed err={}", e);
+    if let Err(e) = control_listener.set_nonblocking(true) {
+        eprintln!(
+            "daemon_error=set_nonblocking_failed socket_kind=control err={}",
+            e
+        );
+        std::process::exit(4);
+    }
+    if let Err(e) = data_listener.set_nonblocking(true) {
+        eprintln!(
+            "daemon_error=set_nonblocking_failed socket_kind=data err={}",
+            e
+        );
         std::process::exit(4);
     }
 
-    let _guard = SocketGuard::new(socket_path.clone());
+    let _control_guard = SocketGuard::new(control_socket_path.clone());
+    let _data_guard = SocketGuard::new(data_socket_path.clone());
 
-    println!("daemon_status=started socket={}", socket_path.display());
+    let mut allowed_uids_sorted: Vec<u32> = cfg.allowed_uids.iter().copied().collect();
+    allowed_uids_sorted.sort_unstable();
+    let allowed_uids = Arc::new(cfg.allowed_uids.clone());
+    let allowed_uids_csv = allowed_uids_sorted
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "daemon_status=started control_socket={} data_socket={}",
+        control_socket_path.display(),
+        data_socket_path.display()
+    );
+    println!("daemon_auth_allowed_uids={}", allowed_uids_csv);
 
     let engine = Arc::new(RuntimeEngine::new_with_render_output_dir(
         cfg.render_output_dir.clone(),
@@ -1037,21 +1208,72 @@ fn main() {
     }
 
     while !shutdown.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                let engine_ref = Arc::clone(&engine);
-                let shutdown_ref = Arc::clone(&shutdown);
-                thread::spawn(move || {
-                    handle_client(stream, engine_ref, shutdown_ref);
-                });
+        let mut accepted = false;
+
+        match control_listener.accept() {
+            Ok((mut stream, _addr)) => {
+                accepted = true;
+                match socket_peer_uid(&stream) {
+                    Ok(uid) if allowed_uids.contains(&uid) => {
+                        let engine_ref = Arc::clone(&engine);
+                        let shutdown_ref = Arc::clone(&shutdown);
+                        thread::spawn(move || {
+                            handle_control_client(stream, engine_ref, shutdown_ref);
+                        });
+                    }
+                    Ok(uid) => {
+                        let _ = stream.write_all(b"ERR FORBIDDEN\n");
+                        let _ = stream.flush();
+                        eprintln!("daemon_warn=forbidden_peer socket_kind=control uid={}", uid);
+                    }
+                    Err(e) => {
+                        let _ = stream.write_all(b"ERR INTERNAL_ERROR peer_cred_failed\n");
+                        let _ = stream.flush();
+                        eprintln!("daemon_warn=peer_cred_failed socket_kind=control err={}", e);
+                    }
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20));
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
-                eprintln!("daemon_warn=accept_failed err={}", e);
-                thread::sleep(Duration::from_millis(50));
+                accepted = true;
+                eprintln!("daemon_warn=accept_failed socket_kind=control err={}", e);
             }
+        }
+
+        match data_listener.accept() {
+            Ok((mut stream, _addr)) => {
+                accepted = true;
+                match socket_peer_uid(&stream) {
+                    Ok(uid) if allowed_uids.contains(&uid) => {
+                        let engine_ref = Arc::clone(&engine);
+                        let shutdown_ref = Arc::clone(&shutdown);
+                        thread::spawn(move || {
+                            handle_data_client(stream, engine_ref, shutdown_ref);
+                        });
+                    }
+                    Ok(uid) => {
+                        let _ = stream.write_all(b"ERR FORBIDDEN\n");
+                        let _ = stream.flush();
+                        eprintln!("daemon_warn=forbidden_peer socket_kind=data uid={}", uid);
+                    }
+                    Err(e) => {
+                        let _ = stream.write_all(b"ERR INTERNAL_ERROR peer_cred_failed\n");
+                        let _ = stream.flush();
+                        eprintln!("daemon_warn=peer_cred_failed socket_kind=data err={}", e);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                accepted = true;
+                eprintln!("daemon_warn=accept_failed socket_kind=data err={}", e);
+            }
+        }
+
+        if !accepted {
+            thread::sleep(Duration::from_millis(20));
+        } else {
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -1092,7 +1314,8 @@ mod tests {
             "777".to_string(),
         ];
         let cfg = parse_daemon_config(&args).expect("parse daemon cfg");
-        assert_eq!(cfg.socket_path, "/tmp/a.sock");
+        assert_eq!(cfg.control_socket_path, "/tmp/a.sock");
+        assert_eq!(cfg.data_socket_path, "/tmp/a.data.sock");
         assert_eq!(cfg.render_output_dir, "/tmp/render");
         assert_eq!(
             cfg.supervise_presenter_cmd.as_deref(),
@@ -1100,6 +1323,7 @@ mod tests {
         );
         assert_eq!(cfg.supervise_input_cmd.as_deref(), Some("echo input"));
         assert_eq!(cfg.supervise_restart_ms, 777);
+        assert!(!cfg.allowed_uids.is_empty());
     }
 
     #[test]

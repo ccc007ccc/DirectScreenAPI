@@ -4,7 +4,8 @@ set -eu
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-SOCKET_PATH="${DSAPI_SOCKET_PATH:-artifacts/run/dsapi.sock}"
+CONTROL_SOCKET_PATH="${DSAPI_CONTROL_SOCKET_PATH:-${DSAPI_SOCKET_PATH:-artifacts/run/dsapi.sock}}"
+DATA_SOCKET_PATH="${DSAPI_DATA_SOCKET_PATH:-}"
 PID_FILE="${DSAPI_PID_FILE:-artifacts/run/dsapid.pid}"
 LOG_FILE="${DSAPI_LOG_FILE:-artifacts/run/dsapid.log}"
 SUPERVISE_PRESENTER="${DSAPI_SUPERVISE_PRESENTER:-0}"
@@ -14,7 +15,15 @@ SUPERVISE_INPUT_CMD="${DSAPI_SUPERVISE_INPUT_CMD:-./scripts/daemon_touch_bridge_
 SUPERVISE_RESTART_MS="${DSAPI_SUPERVISE_RESTART_MS:-500}"
 RENDER_OUTPUT_DIR="${DSAPI_RENDER_OUTPUT_DIR:-artifacts/render}"
 
-mkdir -p "$(dirname "$SOCKET_PATH")"
+if [ -z "$DATA_SOCKET_PATH" ]; then
+  case "$CONTROL_SOCKET_PATH" in
+    *.sock) DATA_SOCKET_PATH="${CONTROL_SOCKET_PATH%.sock}.data.sock" ;;
+    *) DATA_SOCKET_PATH="${CONTROL_SOCKET_PATH}.data" ;;
+  esac
+fi
+
+mkdir -p "$(dirname "$CONTROL_SOCKET_PATH")"
+mkdir -p "$(dirname "$DATA_SOCKET_PATH")"
 mkdir -p "$(dirname "$PID_FILE")"
 mkdir -p "$(dirname "$LOG_FILE")"
 
@@ -29,7 +38,7 @@ fi
 
 ./scripts/build_core.sh >/dev/null
 
-set -- ./target/release/dsapid --socket "$SOCKET_PATH" --render-output-dir "$RENDER_OUTPUT_DIR" --supervise-restart-ms "$SUPERVISE_RESTART_MS"
+set -- ./target/release/dsapid --control-socket "$CONTROL_SOCKET_PATH" --data-socket "$DATA_SOCKET_PATH" --render-output-dir "$RENDER_OUTPUT_DIR" --supervise-restart-ms "$SUPERVISE_RESTART_MS"
 if [ "$SUPERVISE_PRESENTER" = "1" ]; then
   set -- "$@" --supervise-presenter "$SUPERVISE_PRESENT_CMD"
 fi
@@ -43,7 +52,7 @@ echo "$new_pid" > "$PID_FILE"
 
 sleep 0.2
 if kill -0 "$new_pid" >/dev/null 2>&1; then
-  echo "daemon_status=started pid=$new_pid socket=$SOCKET_PATH"
+  echo "daemon_status=started pid=$new_pid control_socket=$CONTROL_SOCKET_PATH data_socket=$DATA_SOCKET_PATH"
   exit 0
 fi
 

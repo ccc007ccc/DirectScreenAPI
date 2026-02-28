@@ -7,6 +7,8 @@
 extern "C" {
 #endif
 
+#define DSAPI_ABI_VERSION 0x00010000u
+
 typedef struct dsapi_context dsapi_context_t;
 
 typedef enum dsapi_status {
@@ -67,8 +69,10 @@ typedef struct dsapi_render_present_info {
 } dsapi_render_present_info_t;
 
 const char* dsapi_version(void);
+uint32_t dsapi_abi_version(void);
 
 dsapi_context_t* dsapi_context_create(void);
+int32_t dsapi_context_create_with_abi(uint32_t abi_version, dsapi_context_t** out_ctx);
 void dsapi_context_destroy(dsapi_context_t* ctx);
 
 int32_t dsapi_set_default_decision(dsapi_context_t* ctx, int32_t decision);

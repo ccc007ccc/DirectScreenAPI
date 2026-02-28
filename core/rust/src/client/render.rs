@@ -113,9 +113,7 @@ impl RenderSession {
 
     pub fn set_rotation(&mut self, rotation: u32) -> Result<()> {
         if rotation > 3 {
-            return Err(DsapiError::ParseError(
-                "rotation_must_be_0_3".to_string(),
-            ));
+            return Err(DsapiError::ParseError("rotation_must_be_0_3".to_string()));
         }
         self.rotation = rotation;
         let (logical_w, logical_h) =
@@ -184,7 +182,12 @@ impl RenderSession {
     }
 
     fn submit_display_frame(&mut self, rgba_buffer: &[u8], width: u32, height: u32) -> Result<()> {
-        let command = format!("RENDER_FRAME_SUBMIT_RGBA_RAW {} {} {}", width, height, rgba_buffer.len());
+        let command = format!(
+            "RENDER_FRAME_SUBMIT_RGBA_RAW {} {} {}",
+            width,
+            height,
+            rgba_buffer.len()
+        );
         let ready = self.connection.send_line(&command)?;
         if ready != "OK READY" {
             return Err(DsapiError::ProtocolError(format!(

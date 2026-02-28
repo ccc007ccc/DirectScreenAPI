@@ -70,6 +70,7 @@ pub struct DsapiRenderFrameChunk {
 }
 
 const VERSION_CSTR: &[u8] = b"0.1.0\0";
+const DSAPI_ABI_VERSION: u32 = 0x0001_0000;
 
 impl From<DsapiDisplayState> for DisplayState {
     fn from(v: DsapiDisplayState) -> Self {
@@ -169,10 +170,35 @@ pub extern "C" fn dsapi_version() -> *const c_char {
 }
 
 #[no_mangle]
+pub extern "C" fn dsapi_abi_version() -> u32 {
+    DSAPI_ABI_VERSION
+}
+
+#[no_mangle]
 pub extern "C" fn dsapi_context_create() -> *mut DsapiContext {
     Box::into_raw(Box::new(DsapiContext {
         engine: RuntimeEngine::default(),
     }))
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `out_ctx` must be a valid, writable pointer.
+pub unsafe extern "C" fn dsapi_context_create_with_abi(
+    abi_version: u32,
+    out_ctx: *mut *mut DsapiContext,
+) -> i32 {
+    if out_ctx.is_null() {
+        return Status::NullPointer as i32;
+    }
+    if abi_version != DSAPI_ABI_VERSION {
+        return Status::InvalidArgument as i32;
+    }
+    unsafe {
+        ptr::write(out_ctx, dsapi_context_create());
+    }
+    Status::Ok as i32
 }
 
 #[no_mangle]

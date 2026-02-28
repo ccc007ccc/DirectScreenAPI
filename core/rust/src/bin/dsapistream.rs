@@ -30,30 +30,30 @@ impl SocketClient {
     }
 }
 
-fn default_socket_path() -> String {
+fn default_control_socket_path() -> String {
     "artifacts/run/dsapi.sock".to_string()
 }
 
 fn usage() {
     println!("usage:");
-    println!("  dsapistream [--socket <path>] [--quiet]");
+    println!("  dsapistream [--control-socket <path>] [--quiet]");
     println!("read commands from stdin, write one response per input line");
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let mut socket = default_socket_path();
+    let mut control_socket = default_control_socket_path();
     let mut quiet = false;
 
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--socket" => {
+            "--control-socket" => {
                 if i + 1 >= args.len() {
                     usage();
                     std::process::exit(1);
                 }
-                socket = args[i + 1].clone();
+                control_socket = args[i + 1].clone();
                 i += 2;
             }
             "--quiet" => {
@@ -71,10 +71,13 @@ fn main() {
     let mut input = stdin.lock();
     let mut line = String::new();
 
-    let mut client = match SocketClient::connect(&socket) {
+    let mut client = match SocketClient::connect(&control_socket) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("stream_error=connect_failed socket={} err={}", socket, e);
+            eprintln!(
+                "stream_error=connect_failed control_socket={} err={}",
+                control_socket, e
+            );
             std::process::exit(2);
         }
     };
@@ -107,12 +110,12 @@ fn main() {
                         std::process::exit(4);
                     }
                     retried = true;
-                    client = match SocketClient::connect(&socket) {
+                    client = match SocketClient::connect(&control_socket) {
                         Ok(v) => v,
                         Err(conn_err) => {
                             eprintln!(
-                                "stream_error=reconnect_failed socket={} err={}",
-                                socket, conn_err
+                                "stream_error=reconnect_failed control_socket={} err={}",
+                                control_socket, conn_err
                             );
                             std::process::exit(5);
                         }

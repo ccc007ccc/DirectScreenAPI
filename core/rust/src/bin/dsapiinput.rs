@@ -46,20 +46,27 @@ struct PendingTouch {
 
 #[derive(Debug)]
 struct Args {
-    socket: String,
+    data_socket: String,
     device: String,
     cfg: Config,
     quiet: bool,
 }
 
-fn default_socket_path() -> String {
+fn default_control_socket_path() -> String {
     "artifacts/run/dsapi.sock".to_string()
+}
+
+fn derive_data_socket_path(control_socket_path: &str) -> String {
+    if let Some(prefix) = control_socket_path.strip_suffix(".sock") {
+        return format!("{}.data.sock", prefix);
+    }
+    format!("{}.data", control_socket_path)
 }
 
 fn usage() {
     eprintln!("usage:");
     eprintln!(
-        "  dsapiinput --device <event_path> --max-x <n> --max-y <n> --width <n> --height <n> [--rotation <0-3>] [--socket <path>] [--quiet]"
+        "  dsapiinput --device <event_path> --max-x <n> --max-y <n> --width <n> --height <n> [--rotation <0-3>] [--control-socket <path>] [--data-socket <path>] [--quiet]"
     );
 }
 
@@ -69,7 +76,8 @@ fn parse_i32_arg(v: &str, key: &str) -> Result<i32, String> {
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
-    let mut socket = default_socket_path();
+    let mut control_socket = default_control_socket_path();
+    let mut data_socket: Option<String> = None;
     let mut device = String::new();
     let mut max_x = None::<i32>;
     let mut max_y = None::<i32>;
@@ -81,11 +89,18 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--socket" => {
+            "--control-socket" => {
                 if i + 1 >= args.len() {
-                    return Err("missing_socket_path".to_string());
+                    return Err("missing_control_socket_path".to_string());
                 }
-                socket = args[i + 1].clone();
+                control_socket = args[i + 1].clone();
+                i += 2;
+            }
+            "--data-socket" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_data_socket_path".to_string());
+                }
+                data_socket = Some(args[i + 1].clone());
                 i += 2;
             }
             "--device" => {
@@ -157,8 +172,13 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         return Err("rotation_must_be_0_3".to_string());
     }
 
+    let data_socket = data_socket.unwrap_or_else(|| derive_data_socket_path(&control_socket));
+    if data_socket == control_socket {
+        return Err("control_socket_and_data_socket_must_differ".to_string());
+    }
+
     Ok(Args {
-        socket,
+        data_socket,
         device,
         cfg,
         quiet,
@@ -266,12 +286,12 @@ fn main() {
         }
     };
 
-    let mut writer = match connect_touch_stream(&cfg.socket) {
+    let mut writer = match connect_touch_stream(&cfg.data_socket) {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
                 "input_bridge_error=daemon_connect_failed socket={} err={}",
-                cfg.socket, e
+                cfg.data_socket, e
             );
             std::process::exit(4);
         }

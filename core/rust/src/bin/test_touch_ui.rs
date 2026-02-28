@@ -1,6 +1,6 @@
 use directscreen_core::client::{
-    DisplayEvent, DsapiClient, TouchMessage, TouchPhase, TouchRouterConfig, TouchRouterHandle,
-    spawn_touch_router,
+    spawn_touch_router, DisplayEvent, DsapiClient, TouchMessage, TouchPhase, TouchRouterConfig,
+    TouchRouterHandle,
 };
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 use std::sync::mpsc::{self, Receiver};
@@ -21,7 +21,8 @@ const MIN_WINDOW_H: f32 = 400.0;
 
 #[derive(Debug, Clone)]
 struct Args {
-    socket: String,
+    control_socket: String,
+    data_socket: String,
     device: String,
     rotation: Option<i32>,
     target_fps: u32,
@@ -405,16 +406,22 @@ impl UiState {
     }
 }
 
-fn default_socket_path() -> String {
+fn default_control_socket_path() -> String {
     "artifacts/run/dsapi.sock".to_string()
+}
+
+fn derive_data_socket_path(control_socket_path: &str) -> String {
+    if let Some(prefix) = control_socket_path.strip_suffix(".sock") {
+        return format!("{}.data.sock", prefix);
+    }
+    format!("{}.data", control_socket_path)
 }
 
 fn usage() {
     eprintln!("usage:");
     eprintln!(
-        "  test_touch_ui --device <event_path> [--socket <path>] [--rotation <0-3>] [--target-fps <n>] [--quiet]"
+        "  test_touch_ui --device <event_path> [--control-socket <path>] [--data-socket <path>] [--rotation <0-3>] [--target-fps <n>] [--quiet]"
     );
-    eprintln!("  legacy args still accepted but ignored: --max-x <n> --max-y <n>");
 }
 
 fn parse_i32_arg(v: &str, name: &str) -> Result<i32, String> {
@@ -428,23 +435,28 @@ fn parse_u32_arg(v: &str, name: &str) -> Result<u32, String> {
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
-    let mut socket = default_socket_path();
+    let mut control_socket = default_control_socket_path();
+    let mut data_socket = None::<String>;
     let mut device = String::new();
     let mut rotation = None::<i32>;
     let mut target_fps = 60u32;
     let mut quiet = false;
 
-    let mut _legacy_max_x = None::<i32>;
-    let mut _legacy_max_y = None::<i32>;
-
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--socket" => {
+            "--control-socket" => {
                 if i + 1 >= args.len() {
-                    return Err("missing_socket_path".to_string());
+                    return Err("missing_control_socket_path".to_string());
                 }
-                socket = args[i + 1].clone();
+                control_socket = args[i + 1].clone();
+                i += 2;
+            }
+            "--data-socket" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_data_socket_path".to_string());
+                }
+                data_socket = Some(args[i + 1].clone());
                 i += 2;
             }
             "--device" => {
@@ -452,20 +464,6 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                     return Err("missing_device_path".to_string());
                 }
                 device = args[i + 1].clone();
-                i += 2;
-            }
-            "--max-x" => {
-                if i + 1 >= args.len() {
-                    return Err("missing_max_x".to_string());
-                }
-                _legacy_max_x = Some(parse_i32_arg(&args[i + 1], "max_x")?);
-                i += 2;
-            }
-            "--max-y" => {
-                if i + 1 >= args.len() {
-                    return Err("missing_max_y".to_string());
-                }
-                _legacy_max_y = Some(parse_i32_arg(&args[i + 1], "max_y")?);
                 i += 2;
             }
             "--rotation" => {
@@ -504,8 +502,16 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         return Err("target_fps_must_be_positive".to_string());
     }
 
+    let data_socket = data_socket
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| derive_data_socket_path(&control_socket));
+    if control_socket == data_socket {
+        return Err("control_socket_and_data_socket_must_differ".to_string());
+    }
+
     Ok(Args {
-        socket,
+        control_socket,
+        data_socket,
         device,
         rotation,
         target_fps,
@@ -694,7 +700,7 @@ fn draw_char(
                 continue;
             }
 
-            let px = x + (col as i32) * scale;
+            let px = x + col * scale;
             let py = y + (row as i32) * scale;
             fill_rect_masked(pixmap, px, py, scale, scale, color, clip_mask);
         }
@@ -895,6 +901,55 @@ fn render_transparent_frame_and_present(
     let _ = client.render_present();
 }
 
+fn spawn_display_forwarder(
+    control_socket: String,
+    data_socket: String,
+    quiet: bool,
+    display_tx: mpsc::Sender<DisplayEvent>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || loop {
+        let client = match DsapiClient::connect_with_data_socket(&control_socket, &data_socket) {
+            Ok(v) => v,
+            Err(e) => {
+                if !quiet {
+                    eprintln!("touch_ui_warn=display_client_connect_failed err={}", e);
+                }
+                thread::sleep(Duration::from_millis(300));
+                continue;
+            }
+        };
+
+        let mut display_stream = match client.subscribe_display() {
+            Ok(v) => v,
+            Err(e) => {
+                if !quiet {
+                    eprintln!("touch_ui_warn=display_subscribe_failed err={}", e);
+                }
+                thread::sleep(Duration::from_millis(300));
+                continue;
+            }
+        };
+
+        loop {
+            match display_stream.next_event() {
+                Ok(event) => {
+                    if display_tx.send(event).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    if !quiet {
+                        eprintln!("touch_ui_warn=display_stream_closed err={}", e);
+                    }
+                    break;
+                }
+            }
+        }
+
+        thread::sleep(Duration::from_millis(300));
+    })
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cfg = match parse_args(&args) {
@@ -906,16 +961,17 @@ fn main() {
         }
     };
 
-    let mut client = match DsapiClient::connect(&cfg.socket) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!(
-                "touch_ui_error=daemon_connect_failed socket={} err={}",
-                cfg.socket, e
-            );
-            std::process::exit(2);
-        }
-    };
+    let mut client =
+        match DsapiClient::connect_with_data_socket(&cfg.control_socket, &cfg.data_socket) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "touch_ui_error=daemon_connect_failed control_socket={} data_socket={} err={}",
+                    cfg.control_socket, cfg.data_socket, e
+                );
+                std::process::exit(2);
+            }
+        };
 
     let mut display = match client.get_display_info() {
         Ok(v) => v,
@@ -958,34 +1014,18 @@ fn main() {
     let mut ui = UiState::new(screen_w as f32, screen_h as f32);
     let route_state = Arc::new(Mutex::new(ui.route_snapshot()));
 
-    let mut display_stream = match client.subscribe_display() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("touch_ui_error=display_subscribe_failed err={}", e);
-            std::process::exit(14);
-        }
-    };
     let (display_tx, display_rx) = mpsc::channel::<DisplayEvent>();
-    let display_quiet = cfg.quiet;
-    let _display_thread = thread::spawn(move || loop {
-        match display_stream.next_event() {
-            Ok(event) => {
-                if display_tx.send(event).is_err() {
-                    break;
-                }
-            }
-            Err(e) => {
-                if !display_quiet {
-                    eprintln!("touch_ui_warn=display_stream_closed err={}", e);
-                }
-                break;
-            }
-        }
-    });
+    let _display_thread = spawn_display_forwarder(
+        cfg.control_socket.clone(),
+        cfg.data_socket.clone(),
+        cfg.quiet,
+        display_tx,
+    );
 
     let (touch_tx, touch_rx) = mpsc::channel::<TouchMessage>();
     let touch_cfg = TouchRouterConfig {
-        socket_path: cfg.socket.clone(),
+        control_socket_path: cfg.control_socket.clone(),
+        data_socket_path: cfg.data_socket.clone(),
         route_name: "test_touch_ui".to_string(),
         device_path: cfg.device.clone(),
         screen_width: screen_w,
@@ -1071,9 +1111,13 @@ fn main() {
             }
 
             ui.on_screen_resize(screen_w as f32, screen_h as f32);
-            if let Err(e) = touch_router.update_display_transform(screen_w, screen_h, latest_rotation)
+            if let Err(e) =
+                touch_router.update_display_transform(screen_w, screen_h, latest_rotation)
             {
-                eprintln!("touch_ui_error=touch_router_update_transform_failed err={}", e);
+                eprintln!(
+                    "touch_ui_error=touch_router_update_transform_failed err={}",
+                    e
+                );
                 touch_router.shutdown_and_join();
                 std::process::exit(13);
             }

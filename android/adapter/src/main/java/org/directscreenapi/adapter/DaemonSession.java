@@ -53,7 +53,8 @@ final class DaemonSession {
         }
     }
 
-    private final String socketPath;
+    private final String controlSocketPath;
+    private final String dataSocketPath;
     private Object localSocket;
     private BufferedReader reader;
     private BufferedWriter writer;
@@ -65,8 +66,9 @@ final class DaemonSession {
     private MappedByteBuffer rawFrameMapped;
     private int rawFrameCapacity;
 
-    DaemonSession(String socketPath) {
-        this.socketPath = socketPath;
+    DaemonSession(String controlSocketPath, String dataSocketPath) {
+        this.controlSocketPath = controlSocketPath;
+        this.dataSocketPath = dataSocketPath;
     }
 
     synchronized String command(String cmd) throws Exception {
@@ -175,13 +177,13 @@ final class DaemonSession {
             return;
         }
 
-        SocketIo io = openSocket();
+        SocketIo io = openSocket(controlSocketPath);
         this.localSocket = io.socket;
         this.writer = new BufferedWriter(new OutputStreamWriter(io.output, StandardCharsets.UTF_8));
         this.reader = new BufferedReader(new InputStreamReader(io.input, StandardCharsets.UTF_8));
     }
 
-    private SocketIo openSocket() throws Exception {
+    private SocketIo openSocket(String path) throws Exception {
         Class<?> localSocketClass = Class.forName("android.net.LocalSocket");
         Class<?> addressClass = Class.forName("android.net.LocalSocketAddress");
         Class<?> namespaceClass = Class.forName("android.net.LocalSocketAddress$Namespace");
@@ -190,7 +192,7 @@ final class DaemonSession {
         Object socket = localSocketClass.getDeclaredConstructor().newInstance();
         Object address = addressClass
                 .getDeclaredConstructor(String.class, namespaceClass)
-                .newInstance(socketPath, namespaceFilesystem);
+                .newInstance(path, namespaceFilesystem);
         ReflectBridge.invoke(socket, "connect", address);
 
         OutputStream os = (OutputStream) ReflectBridge.invoke(socket, "getOutputStream");
@@ -202,7 +204,7 @@ final class DaemonSession {
         if (rawSocket != null && rawInput != null && rawOutput != null) {
             return;
         }
-        SocketIo io = openSocket();
+        SocketIo io = openSocket(dataSocketPath);
         rawSocket = io.socket;
         rawInput = io.input;
         rawOutput = io.output;

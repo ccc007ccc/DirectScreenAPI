@@ -4,7 +4,8 @@ set -eu
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-SOCKET_PATH="${DSAPI_SOCKET_PATH:-artifacts/run/dsapi.sock}"
+CONTROL_SOCKET_PATH="${DSAPI_CONTROL_SOCKET_PATH:-${DSAPI_SOCKET_PATH:-artifacts/run/dsapi.sock}}"
+DATA_SOCKET_PATH="${DSAPI_DATA_SOCKET_PATH:-}"
 OUT_DIR="${DSAPI_ANDROID_OUT_DIR:-artifacts/android}"
 DEX_JAR="$OUT_DIR/directscreen-adapter-dex.jar"
 MAIN_CLASS="org.directscreenapi.adapter.AndroidAdapterMain"
@@ -15,8 +16,19 @@ LAYER_Z="${DSAPI_PRESENTER_LAYER_Z:-1000000}"
 LAYER_NAME="${DSAPI_PRESENTER_LAYER_NAME:-DirectScreenAPI}"
 AUTO_REBUILD="${DSAPI_PRESENTER_AUTO_REBUILD:-1}"
 
-if [ ! -S "$SOCKET_PATH" ]; then
-  echo "presenter_error=daemon_socket_missing socket=$SOCKET_PATH"
+if [ -z "$DATA_SOCKET_PATH" ]; then
+  case "$CONTROL_SOCKET_PATH" in
+    *.sock) DATA_SOCKET_PATH="${CONTROL_SOCKET_PATH%.sock}.data.sock" ;;
+    *) DATA_SOCKET_PATH="${CONTROL_SOCKET_PATH}.data" ;;
+  esac
+fi
+
+if [ ! -S "$CONTROL_SOCKET_PATH" ]; then
+  echo "presenter_error=daemon_control_socket_missing socket=$CONTROL_SOCKET_PATH"
+  exit 2
+fi
+if [ ! -S "$DATA_SOCKET_PATH" ]; then
+  echo "presenter_error=daemon_data_socket_missing socket=$DATA_SOCKET_PATH"
   exit 2
 fi
 
@@ -43,8 +55,8 @@ if [ "$RUN_AS_ROOT" = "1" ]; then
     echo "presenter_error=su_not_found"
     exit 2
   fi
-  su -c "CLASSPATH='$DEX_JAR_ABS' '$APP_PROCESS_BIN' /system/bin '$MAIN_CLASS' present-loop '$SOCKET_PATH' '$POLL_MS' '$LAYER_Z' '$LAYER_NAME'"
+  su -c "CLASSPATH='$DEX_JAR_ABS' '$APP_PROCESS_BIN' /system/bin '$MAIN_CLASS' present-loop '$CONTROL_SOCKET_PATH' '$DATA_SOCKET_PATH' '$POLL_MS' '$LAYER_Z' '$LAYER_NAME'"
   exit 0
 fi
 
-CLASSPATH="$DEX_JAR_ABS" "$APP_PROCESS_BIN" /system/bin "$MAIN_CLASS" present-loop "$SOCKET_PATH" "$POLL_MS" "$LAYER_Z" "$LAYER_NAME"
+CLASSPATH="$DEX_JAR_ABS" "$APP_PROCESS_BIN" /system/bin "$MAIN_CLASS" present-loop "$CONTROL_SOCKET_PATH" "$DATA_SOCKET_PATH" "$POLL_MS" "$LAYER_Z" "$LAYER_NAME"

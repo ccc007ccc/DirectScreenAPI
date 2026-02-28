@@ -3,13 +3,14 @@
 #include "directscreen_api.h"
 
 int main(void) {
-    dsapi_context_t* ctx = dsapi_context_create();
-    if (!ctx) {
+    dsapi_context_t* ctx = NULL;
+    if (dsapi_context_create_with_abi(DSAPI_ABI_VERSION, &ctx) != DSAPI_OK || !ctx) {
         fprintf(stderr, "failed_to_create_context\n");
         return 1;
     }
 
     printf("version=%s\n", dsapi_version());
+    printf("abi_version=0x%08x\n", dsapi_abi_version());
 
     dsapi_display_state_t display = {
         .width = 1440,

@@ -1,5 +1,5 @@
-pub mod display;
 pub mod core;
+pub mod display;
 pub mod error;
 pub mod render;
 pub mod touch;
@@ -11,5 +11,5 @@ pub use error::{DsapiError, Result};
 pub use render::RenderSession;
 pub use touch::{TouchEvent, TouchStream};
 pub use touch_router::{
-    TouchMessage, TouchPhase, TouchRouterConfig, TouchRouterHandle, spawn_touch_router,
+    spawn_touch_router, TouchMessage, TouchPhase, TouchRouterConfig, TouchRouterHandle,
 };

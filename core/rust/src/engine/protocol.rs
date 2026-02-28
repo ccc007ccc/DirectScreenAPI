@@ -1,6 +1,3 @@
-use base64::engine::general_purpose::STANDARD as BASE64_STD;
-use base64::Engine;
-
 use crate::api::{Decision, RectRegion, Status, TouchEvent};
 use crate::engine::RuntimeEngine;
 use crate::DIRECTSCREEN_CORE_VERSION;
@@ -39,11 +36,6 @@ fn parse_u32(token: &str) -> Result<u32, Status> {
 
 fn parse_u64(token: &str) -> Result<u64, Status> {
     token.parse::<u64>().map_err(|_| Status::InvalidArgument)
-}
-
-fn parse_usize(token: &str) -> Result<usize, Status> {
-    let v = parse_u32(token)?;
-    usize::try_from(v).map_err(|_| Status::OutOfRange)
 }
 
 fn parse_f32(token: &str) -> Result<f32, Status> {
@@ -275,36 +267,6 @@ pub fn execute_command(engine: &RuntimeEngine, line: &str) -> CommandOutcome {
                 ))
             }
         }
-        "RENDER_FRAME_SUBMIT_RGBA" => {
-            if tokens.len() != 4 {
-                Err(Status::InvalidArgument)
-            } else {
-                match (parse_u32(tokens[1]), parse_u32(tokens[2])) {
-                    (Ok(width), Ok(height)) => {
-                        let pixels_rgba8 = BASE64_STD
-                            .decode(tokens[3])
-                            .map_err(|_| Status::InvalidArgument);
-                        match pixels_rgba8 {
-                            Ok(pixels_rgba8) => {
-                                match engine.submit_render_frame_rgba(width, height, pixels_rgba8) {
-                                    Ok(frame) => Ok(format!(
-                                        "OK {} {} {} RGBA8888 {} {}",
-                                        frame.frame_seq,
-                                        frame.width,
-                                        frame.height,
-                                        frame.byte_len,
-                                        frame.checksum_fnv1a32
-                                    )),
-                                    Err(e) => Err(e),
-                                }
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                    _ => Err(Status::InvalidArgument),
-                }
-            }
-        }
         "RENDER_FRAME_GET" => {
             if tokens.len() != 1 {
                 Err(Status::InvalidArgument)
@@ -338,28 +300,6 @@ pub fn execute_command(engine: &RuntimeEngine, line: &str) -> CommandOutcome {
                                 frame.checksum_fnv1a32
                             )),
                             Ok(None) => Ok("OK TIMEOUT".to_string()),
-                            Err(e) => Err(e),
-                        }
-                    }
-                    _ => Err(Status::InvalidArgument),
-                }
-            }
-        }
-        "RENDER_FRAME_READ_BASE64" => {
-            if tokens.len() != 3 {
-                Err(Status::InvalidArgument)
-            } else {
-                match (parse_usize(tokens[1]), parse_usize(tokens[2])) {
-                    (Ok(offset), Ok(max_bytes)) => {
-                        match engine.render_frame_read_chunk(offset, max_bytes) {
-                            Ok(chunk) => Ok(format!(
-                                "OK {} {} {} {} {}",
-                                chunk.frame_seq,
-                                chunk.total_bytes,
-                                chunk.offset,
-                                chunk.chunk_bytes.len(),
-                                BASE64_STD.encode(&chunk.chunk_bytes)
-                            )),
                             Err(e) => Err(e),
                         }
                     }
@@ -443,67 +383,67 @@ mod tests {
 
     #[test]
     fn ping_and_shutdown_commands() {
-        let mut engine = RuntimeEngine::default();
-        let ping = execute_command(&mut engine, "PING");
+        let engine = RuntimeEngine::default();
+        let ping = execute_command(&engine, "PING");
         assert_eq!(ping.response_line, "OK PONG");
         assert!(!ping.should_shutdown);
 
-        let shutdown = execute_command(&mut engine, "SHUTDOWN");
+        let shutdown = execute_command(&engine, "SHUTDOWN");
         assert_eq!(shutdown.response_line, "OK SHUTDOWN");
         assert!(shutdown.should_shutdown);
     }
 
     #[test]
     fn touch_flow_commands_keep_pointer_state() {
-        let mut engine = RuntimeEngine::default();
-        let add = execute_command(&mut engine, "ROUTE_ADD_RECT 10 block 0 0 100 100");
+        let engine = RuntimeEngine::default();
+        let add = execute_command(&engine, "ROUTE_ADD_RECT 10 block 0 0 100 100");
         assert_eq!(add.response_line, "OK");
 
-        let down = execute_command(&mut engine, "TOUCH_DOWN 1 10 10");
+        let down = execute_command(&engine, "TOUCH_DOWN 1 10 10");
         assert_eq!(down.response_line, "OK 1 10");
 
-        let move_cmd = execute_command(&mut engine, "TOUCH_MOVE 1 200 200");
+        let move_cmd = execute_command(&engine, "TOUCH_MOVE 1 200 200");
         assert_eq!(move_cmd.response_line, "OK 1 10");
 
-        let count = execute_command(&mut engine, "TOUCH_COUNT");
+        let count = execute_command(&engine, "TOUCH_COUNT");
         assert_eq!(count.response_line, "OK 1");
 
-        let up = execute_command(&mut engine, "TOUCH_UP 1 200 200");
+        let up = execute_command(&engine, "TOUCH_UP 1 200 200");
         assert_eq!(up.response_line, "OK 1 10");
 
-        let count_after = execute_command(&mut engine, "TOUCH_COUNT");
+        let count_after = execute_command(&engine, "TOUCH_COUNT");
         assert_eq!(count_after.response_line, "OK 0");
     }
 
     #[test]
     fn render_submit_and_get_commands() {
-        let mut engine = RuntimeEngine::default();
+        let engine = RuntimeEngine::default();
 
-        let first = execute_command(&mut engine, "RENDER_SUBMIT 8 2 3");
+        let first = execute_command(&engine, "RENDER_SUBMIT 8 2 3");
         assert_eq!(first.response_line, "OK 1 8 2 3");
 
-        let second = execute_command(&mut engine, "RENDER_SUBMIT 10 4 5");
+        let second = execute_command(&engine, "RENDER_SUBMIT 10 4 5");
         assert_eq!(second.response_line, "OK 2 10 4 5");
 
-        let get = execute_command(&mut engine, "RENDER_GET");
+        let get = execute_command(&engine, "RENDER_GET");
         assert_eq!(get.response_line, "OK 2 10 4 5");
     }
 
     #[test]
     fn render_submit_invalid_argument_rejected() {
-        let mut engine = RuntimeEngine::default();
+        let engine = RuntimeEngine::default();
 
-        let bad = execute_command(&mut engine, "RENDER_SUBMIT x 1 2");
+        let bad = execute_command(&engine, "RENDER_SUBMIT x 1 2");
         assert_eq!(bad.response_line, "ERR INVALID_ARGUMENT");
 
-        let get_bad = execute_command(&mut engine, "RENDER_GET extra");
+        let get_bad = execute_command(&engine, "RENDER_GET extra");
         assert_eq!(get_bad.response_line, "ERR INVALID_ARGUMENT");
     }
 
     #[test]
     fn render_response_tokens_are_parsable_numbers() {
-        let mut engine = RuntimeEngine::default();
-        let out = execute_command(&mut engine, "RENDER_SUBMIT 12 6 7");
+        let engine = RuntimeEngine::default();
+        let out = execute_command(&engine, "RENDER_SUBMIT 12 6 7");
         let tokens: Vec<&str> = out.response_line.split_whitespace().collect();
         assert_eq!(tokens.len(), 5);
         assert_eq!(tokens[0], "OK");
@@ -514,108 +454,51 @@ mod tests {
     }
 
     #[test]
-    fn render_frame_submit_get_and_clear_commands() {
-        let mut engine = RuntimeEngine::default();
-        let payload = BASE64_STD.encode([
+    fn render_frame_get_and_clear_commands() {
+        let engine = RuntimeEngine::default();
+        let pixels = vec![
             255u8, 0u8, 0u8, 255u8, 0u8, 255u8, 0u8, 255u8, 0u8, 0u8, 255u8, 255u8, 255u8, 255u8,
             255u8, 255u8,
-        ]);
+        ];
+        let submit = engine
+            .submit_render_frame_rgba(2, 2, pixels)
+            .expect("submit frame");
 
-        let submit = execute_command(
-            &mut engine,
-            &format!("RENDER_FRAME_SUBMIT_RGBA 2 2 {}", payload),
+        let get = execute_command(&engine, "RENDER_FRAME_GET");
+        assert_eq!(
+            get.response_line,
+            format!(
+                "OK {} {} {} RGBA8888 {} {}",
+                submit.frame_seq,
+                submit.width,
+                submit.height,
+                submit.byte_len,
+                submit.checksum_fnv1a32
+            )
         );
-        let submit_tokens: Vec<&str> = submit.response_line.split_whitespace().collect();
-        assert_eq!(submit_tokens.len(), 7);
-        assert_eq!(submit_tokens[0], "OK");
-        assert_eq!(submit_tokens[2], "2");
-        assert_eq!(submit_tokens[3], "2");
-        assert_eq!(submit_tokens[4], "RGBA8888");
-        assert_eq!(submit_tokens[5], "16");
-        assert!(submit_tokens[1].parse::<u64>().is_ok());
-        assert!(submit_tokens[6].parse::<u32>().is_ok());
 
-        let get = execute_command(&mut engine, "RENDER_FRAME_GET");
-        assert_eq!(get.response_line, submit.response_line);
-
-        let clear = execute_command(&mut engine, "RENDER_FRAME_CLEAR");
+        let clear = execute_command(&engine, "RENDER_FRAME_CLEAR");
         assert_eq!(clear.response_line, "OK");
 
-        let get_after_clear = execute_command(&mut engine, "RENDER_FRAME_GET");
+        let get_after_clear = execute_command(&engine, "RENDER_FRAME_GET");
         assert_eq!(get_after_clear.response_line, "ERR OUT_OF_RANGE");
     }
 
     #[test]
-    fn render_frame_submit_rejects_bad_payload() {
-        let mut engine = RuntimeEngine::default();
-
-        let bad_base64 = execute_command(&mut engine, "RENDER_FRAME_SUBMIT_RGBA 2 2 !!!");
-        assert_eq!(bad_base64.response_line, "ERR INVALID_ARGUMENT");
-
-        let too_short = BASE64_STD.encode([0u8; 15]);
-        let bad_len = execute_command(
-            &mut engine,
-            &format!("RENDER_FRAME_SUBMIT_RGBA 2 2 {}", too_short),
-        );
-        assert_eq!(bad_len.response_line, "ERR INVALID_ARGUMENT");
-    }
-
-    #[test]
-    fn render_frame_read_base64_command_reads_chunks() {
-        let mut engine = RuntimeEngine::default();
-        let payload = BASE64_STD.encode([0u8, 1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8]);
-        let submit = execute_command(
-            &mut engine,
-            &format!("RENDER_FRAME_SUBMIT_RGBA 1 2 {}", payload),
-        );
-        assert!(submit.response_line.starts_with("OK "));
-
-        let read = execute_command(&mut engine, "RENDER_FRAME_READ_BASE64 2 3");
-        let tokens: Vec<&str> = read.response_line.split_whitespace().collect();
-        assert_eq!(tokens.len(), 6);
-        assert_eq!(tokens[0], "OK");
-        assert_eq!(tokens[2], "8");
-        assert_eq!(tokens[3], "2");
-        assert_eq!(tokens[4], "3");
-        let chunk = BASE64_STD.decode(tokens[5]).expect("decode chunk");
-        assert_eq!(chunk, vec![2u8, 3u8, 4u8]);
-    }
-
-    #[test]
-    fn render_frame_read_base64_rejects_invalid_request() {
-        let mut engine = RuntimeEngine::default();
-        let read_without_frame = execute_command(&mut engine, "RENDER_FRAME_READ_BASE64 0 16");
-        assert_eq!(read_without_frame.response_line, "ERR OUT_OF_RANGE");
-
-        let payload = BASE64_STD.encode([0u8, 1u8, 2u8, 3u8]);
-        let submit = execute_command(
-            &mut engine,
-            &format!("RENDER_FRAME_SUBMIT_RGBA 1 1 {}", payload),
-        );
-        assert!(submit.response_line.starts_with("OK "));
-
-        let bad = execute_command(&mut engine, "RENDER_FRAME_READ_BASE64 4 1");
-        assert_eq!(bad.response_line, "ERR OUT_OF_RANGE");
-    }
-
-    #[test]
     fn render_frame_wait_command_times_out_without_new_frame() {
-        let mut engine = RuntimeEngine::default();
-        let wait = execute_command(&mut engine, "RENDER_FRAME_WAIT 0 1");
+        let engine = RuntimeEngine::default();
+        let wait = execute_command(&engine, "RENDER_FRAME_WAIT 0 1");
         assert_eq!(wait.response_line, "OK TIMEOUT");
     }
 
     #[test]
     fn render_frame_wait_command_returns_frame_when_available() {
-        let mut engine = RuntimeEngine::default();
-        let payload = BASE64_STD.encode([1u8, 2u8, 3u8, 4u8]);
-        let submit = execute_command(
-            &mut engine,
-            &format!("RENDER_FRAME_SUBMIT_RGBA 1 1 {}", payload),
-        );
-        assert!(submit.response_line.starts_with("OK "));
+        let engine = RuntimeEngine::default();
+        engine
+            .submit_render_frame_rgba(1, 1, vec![1u8, 2u8, 3u8, 4u8])
+            .expect("submit frame");
 
-        let wait = execute_command(&mut engine, "RENDER_FRAME_WAIT 0 10");
+        let wait = execute_command(&engine, "RENDER_FRAME_WAIT 0 10");
         let tokens: Vec<&str> = wait.response_line.split_whitespace().collect();
         assert_eq!(tokens.len(), 7);
         assert_eq!(tokens[0], "OK");
@@ -629,19 +512,16 @@ mod tests {
 
     #[test]
     fn render_present_and_get_commands() {
-        let mut engine =
-            RuntimeEngine::new_with_render_output_dir("artifacts/test_protocol_present");
-        let payload = BASE64_STD.encode([
+        let engine = RuntimeEngine::new_with_render_output_dir("artifacts/test_protocol_present");
+        let pixels = vec![
             255u8, 0u8, 0u8, 255u8, 0u8, 255u8, 0u8, 255u8, 0u8, 0u8, 255u8, 255u8, 255u8, 255u8,
             255u8, 255u8,
-        ]);
-        let submit = execute_command(
-            &mut engine,
-            &format!("RENDER_FRAME_SUBMIT_RGBA 2 2 {}", payload),
-        );
-        assert!(submit.response_line.starts_with("OK "));
+        ];
+        engine
+            .submit_render_frame_rgba(2, 2, pixels)
+            .expect("submit frame");
 
-        let present = execute_command(&mut engine, "RENDER_PRESENT");
+        let present = execute_command(&engine, "RENDER_PRESENT");
         let present_tokens: Vec<&str> = present.response_line.split_whitespace().collect();
         assert_eq!(present_tokens.len(), 8);
         assert_eq!(present_tokens[0], "OK");
@@ -653,10 +533,10 @@ mod tests {
         assert!(present_tokens[2].parse::<u64>().is_ok());
         assert!(present_tokens[7].parse::<u32>().is_ok());
 
-        let get = execute_command(&mut engine, "RENDER_PRESENT_GET");
+        let get = execute_command(&engine, "RENDER_PRESENT_GET");
         assert_eq!(get.response_line, present.response_line);
 
-        let dump = execute_command(&mut engine, "RENDER_DUMP_PPM");
+        let dump = execute_command(&engine, "RENDER_DUMP_PPM");
         assert!(dump.response_line.starts_with("OK "));
         let dump_path = dump.response_line.trim_start_matches("OK ").trim();
         assert!(std::path::Path::new(dump_path).exists());
@@ -664,10 +544,10 @@ mod tests {
 
     #[test]
     fn render_present_without_frame_is_out_of_range() {
-        let mut engine = RuntimeEngine::default();
-        let present = execute_command(&mut engine, "RENDER_PRESENT");
+        let engine = RuntimeEngine::default();
+        let present = execute_command(&engine, "RENDER_PRESENT");
         assert_eq!(present.response_line, "ERR OUT_OF_RANGE");
-        let get = execute_command(&mut engine, "RENDER_PRESENT_GET");
+        let get = execute_command(&engine, "RENDER_PRESENT_GET");
         assert_eq!(get.response_line, "ERR OUT_OF_RANGE");
     }
 }

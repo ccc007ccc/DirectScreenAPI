@@ -25,16 +25,16 @@
 ./scripts/daemon_cmd.sh TOUCH_COUNT
 ./scripts/daemon_cmd.sh RENDER_SUBMIT 12 2 3
 ./scripts/daemon_cmd.sh RENDER_GET
-./scripts/daemon_cmd.sh RENDER_FRAME_SUBMIT_RGBA 1 1 /wAA/w==
 ./scripts/daemon_cmd.sh RENDER_FRAME_GET
 ./scripts/daemon_cmd.sh RENDER_FRAME_WAIT 0 16
-./scripts/daemon_cmd.sh RENDER_FRAME_READ_BASE64 0 1024
 ./scripts/daemon_cmd.sh RENDER_PRESENT
 ./scripts/daemon_cmd.sh RENDER_PRESENT_GET
 ./scripts/daemon_cmd.sh RENDER_DUMP_PPM
 ./scripts/daemon_frame_pull.sh artifacts/frame/latest.rgba
 ./scripts/daemon_cmd.sh RENDER_FRAME_CLEAR
 ```
+
+`daemon_cmd.sh` / `dsapictl` 连接的是 **control socket**（默认 `artifacts/run/dsapi.sock`）。
 
 `RENDER_FRAME_SUBMIT_RGBA_RAW` 需要先读写握手再发送二进制 body，不适合
 `daemon_cmd.sh` 这种逐行文本工具；请使用长连接客户端（如 FrostUI runtime）。
@@ -43,6 +43,8 @@
 
 `RENDER_FRAME_GET_FD` 依赖 Unix Socket ancillary fd（`SCM_RIGHTS`），
 `daemon_cmd.sh` / `dsapictl` 不支持该能力，需由支持 fd 透传的客户端调用（如 Android presenter）。
+
+二进制命令与触控流走 **data socket**（默认 `artifacts/run/dsapi.data.sock`）。
 
 同步 Android 实际显示参数：
 
@@ -73,6 +75,8 @@ DSAPI_SUPERVISE_PRESENTER=1 DSAPI_SUPERVISE_INPUT=1 ./scripts/daemon_start.sh
 ## 可配置环境变量
 
 - `DSAPI_SOCKET_PATH`
+- `DSAPI_CONTROL_SOCKET_PATH`
+- `DSAPI_DATA_SOCKET_PATH`
 - `DSAPI_PID_FILE`
 - `DSAPI_LOG_FILE`
 - `DSAPI_TOUCH_BRIDGE_PID_FILE`
