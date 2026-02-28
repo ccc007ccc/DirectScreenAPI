@@ -2,6 +2,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+use super::display::DisplayStream;
 use super::error::{DsapiError, Result};
 use super::render::RenderSession;
 use super::touch::TouchStream;
@@ -139,14 +140,24 @@ impl DsapiClient {
     }
 
     pub fn create_render_session(&mut self) -> Result<RenderSession> {
-        // 渲染会话默认绑定当前显示分辨率，提交帧时无需重复传宽高。
+        // 渲染会话绑定显示分辨率/旋转/刷新率，并在 submit_frame 内完成适配。
         let display = self.get_display_info()?;
-        RenderSession::connect(self.socket_path.clone(), display.width, display.height)
+        RenderSession::connect(
+            self.socket_path.clone(),
+            display.width,
+            display.height,
+            display.rotation,
+            display.refresh_hz,
+        )
     }
 
     pub fn subscribe_touch(&self, route_name: &str) -> Result<TouchStream> {
         // route_name 作为上层业务标识保留，底层握手走 STREAM_TOUCH_V1。
         TouchStream::connect(self.socket_path.clone(), route_name)
+    }
+
+    pub fn subscribe_display(&self) -> Result<DisplayStream> {
+        DisplayStream::connect(self.socket_path.clone())
     }
 
     pub fn render_present(&mut self) -> Result<()> {

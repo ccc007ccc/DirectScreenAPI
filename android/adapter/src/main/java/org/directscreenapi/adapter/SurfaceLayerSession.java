@@ -28,6 +28,16 @@ final class SurfaceLayerSession {
     }
 
     static SurfaceLayerSession create(int width, int height, int zLayer, String layerName) throws Exception {
+        return create(width, height, zLayer, layerName, true);
+    }
+
+    static SurfaceLayerSession create(
+            int width,
+            int height,
+            int zLayer,
+            String layerName,
+            boolean visible
+    ) throws Exception {
         Class<?> builderClass = Class.forName("android.view.SurfaceControl$Builder");
         Class<?> transactionClass = Class.forName("android.view.SurfaceControl$Transaction");
         Class<?> rectClass = Class.forName("android.graphics.Rect");
@@ -43,7 +53,7 @@ final class SurfaceLayerSession {
         ReflectBridge.invoke(builder, "setBufferSize", Integer.valueOf(width), Integer.valueOf(height));
         ReflectBridge.invoke(builder, "setFormat", Integer.valueOf(1)); // RGBA_8888
         ReflectBridge.invoke(builder, "setOpaque", Boolean.FALSE);
-        ReflectBridge.invoke(builder, "setHidden", Boolean.FALSE);
+        ReflectBridge.invoke(builder, "setHidden", Boolean.valueOf(!visible));
         Object sc = ReflectBridge.invoke(builder, "build");
 
         Object txShow = transactionClass.getDeclaredConstructor().newInstance();
@@ -56,7 +66,9 @@ final class SurfaceLayerSession {
             ReflectBridge.invoke(txShow, "setTrustedOverlay", sc, Boolean.TRUE);
         } catch (Throwable ignored) {
         }
-        ReflectBridge.invoke(txShow, "show", sc);
+        if (visible) {
+            ReflectBridge.invoke(txShow, "show", sc);
+        }
         ReflectBridge.invoke(txShow, "apply");
         ReflectBridge.invoke(txShow, "close");
 
@@ -77,6 +89,13 @@ final class SurfaceLayerSession {
                 lockHardwareCanvas,
                 unlockCanvasAndPost
         );
+    }
+
+    void show() throws Exception {
+        Object tx = transactionClass.getDeclaredConstructor().newInstance();
+        ReflectBridge.invoke(tx, "show", surfaceControl);
+        ReflectBridge.invoke(tx, "apply");
+        ReflectBridge.invoke(tx, "close");
     }
 
     Object lockFrame() throws Exception {

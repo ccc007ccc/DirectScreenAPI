@@ -299,6 +299,25 @@ fn parse_frame_wait_bound_present_request(line: &str) -> Result<Option<(u64, u32
     Ok(Some((last_seq, timeout_ms)))
 }
 
+fn parse_display_stream_v1_request(line: &str) -> Result<bool, Status> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+
+    let mut tokens = trimmed.split_whitespace();
+    let Some(cmd) = tokens.next() else {
+        return Ok(false);
+    };
+    if !cmd.eq_ignore_ascii_case("STREAM_DISPLAY_V1") {
+        return Ok(false);
+    }
+    if tokens.next().is_some() {
+        return Err(Status::InvalidArgument);
+    }
+    Ok(true)
+}
+
 fn write_status_error(stream: &mut UnixStream, status: Status) {
     let _ = stream.write_all(format!("ERR {}\n", status_name(status)).as_bytes());
     let _ = stream.flush();
@@ -307,6 +326,38 @@ fn write_status_error(stream: &mut UnixStream, status: Status) {
 fn write_internal_error(stream: &mut UnixStream, msg: &str) {
     let _ = stream.write_all(format!("ERR INTERNAL_ERROR {}\n", msg).as_bytes());
     let _ = stream.flush();
+}
+
+fn write_line_allow_disconnect(stream: &mut UnixStream, line: &str) -> std::io::Result<bool> {
+    match stream.write_all(line.as_bytes()) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    }
+
+    match stream.flush() {
+        Ok(()) => Ok(true),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn handle_raw_frame_submit(
@@ -622,6 +673,60 @@ fn handle_touch_stream_v1(
     Ok(())
 }
 
+fn handle_display_stream_v1(
+    stream: &mut UnixStream,
+    engine: &Arc<RuntimeEngine>,
+    shutdown: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    stream.write_all(b"OK STREAM_DISPLAY_V1\n")?;
+    stream.flush()?;
+
+    let mut last_seq = engine.display_signal_seq();
+    let initial = engine.display_state();
+    let initial_line = format!(
+        "EVENT {} {} {} {} {} {}\n",
+        last_seq,
+        initial.width,
+        initial.height,
+        initial.refresh_hz,
+        initial.density_dpi,
+        initial.rotation
+    );
+    if !write_line_allow_disconnect(stream, &initial_line)? {
+        return Ok(());
+    }
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let waited = engine
+            .wait_for_display_after(last_seq, 1000)
+            .map_err(|_| std::io::Error::other("display_wait_failed"))?;
+        let Some((seq, display)) = waited else {
+            continue;
+        };
+
+        let line = format!(
+            "EVENT {} {} {} {} {} {}\n",
+            seq,
+            display.width,
+            display.height,
+            display.refresh_hz,
+            display.density_dpi,
+            display.rotation
+        );
+        if !write_line_allow_disconnect(stream, &line)? {
+            break;
+        }
+
+        last_seq = seq;
+    }
+
+    Ok(())
+}
+
 fn handle_client(mut stream: UnixStream, engine: Arc<RuntimeEngine>, shutdown: Arc<AtomicBool>) {
     let reader_stream = match stream.try_clone() {
         Ok(v) => v,
@@ -749,6 +854,20 @@ fn handle_client(mut stream: UnixStream, engine: Arc<RuntimeEngine>, shutdown: A
                         break;
                     }
                     continue;
+                }
+
+                let display_stream = match parse_display_stream_v1_request(&line) {
+                    Ok(v) => v,
+                    Err(status) => {
+                        write_status_error(&mut stream, status);
+                        continue;
+                    }
+                };
+                if display_stream {
+                    if let Err(e) = handle_display_stream_v1(&mut stream, &engine, &shutdown) {
+                        write_internal_error(&mut stream, &format!("display_stream_failed:{}", e));
+                    }
+                    break;
                 }
 
                 if line.trim().eq_ignore_ascii_case("STREAM_TOUCH_V1") {
@@ -1074,6 +1193,18 @@ mod tests {
     fn parse_frame_wait_bound_present_request_rejects_extra_tokens() {
         let out = parse_frame_wait_bound_present_request("RENDER_FRAME_WAIT_BOUND_PRESENT 7 16 x")
             .expect_err("reject");
+        assert_eq!(out, Status::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_display_stream_v1_request_accepts_header() {
+        let out = parse_display_stream_v1_request("STREAM_DISPLAY_V1").expect("parse stream");
+        assert!(out);
+    }
+
+    #[test]
+    fn parse_display_stream_v1_request_rejects_extra_tokens() {
+        let out = parse_display_stream_v1_request("STREAM_DISPLAY_V1 x").expect_err("reject");
         assert_eq!(out, Status::InvalidArgument);
     }
 

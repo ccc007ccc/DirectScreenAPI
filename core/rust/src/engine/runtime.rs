@@ -100,6 +100,8 @@ pub struct RuntimeEngine {
     route: RwLock<RouteState>,
     touch: Mutex<TouchState>,
     render: RwLock<RenderState>,
+    display_signal_seq: Mutex<u64>,
+    display_signal_cv: Condvar,
     frame_signal_seq: Mutex<u64>,
     frame_signal_cv: Condvar,
     render_output_dir: PathBuf,
@@ -118,6 +120,8 @@ impl RuntimeEngine {
             route: RwLock::new(RouteState::default()),
             touch: Mutex::new(TouchState::default()),
             render: RwLock::new(RenderState::default()),
+            display_signal_seq: Mutex::new(0),
+            display_signal_cv: Condvar::new(),
             frame_signal_seq: Mutex::new(0),
             frame_signal_cv: Condvar::new(),
             render_output_dir: render_output_dir.into(),
@@ -127,7 +131,15 @@ impl RuntimeEngine {
     pub fn set_display_state(&self, display: DisplayState) -> Result<(), Status> {
         display.validate()?;
         let mut guard = self.display.write().map_err(|_| Status::InternalError)?;
+        let changed = *guard != display;
         *guard = display;
+        drop(guard);
+
+        if changed {
+            // 显示尺寸/旋转变更后，旧帧尺寸可能与新显示不匹配，先清掉避免过渡帧拉伸。
+            self.clear_render_frame();
+            self.notify_display_changed();
+        }
         Ok(())
     }
 
@@ -136,6 +148,40 @@ impl RuntimeEngine {
             Ok(v) => *v,
             Err(_) => DisplayState::default(),
         }
+    }
+
+    pub fn display_signal_seq(&self) -> u64 {
+        match self.display_signal_seq.lock() {
+            Ok(v) => *v,
+            Err(_) => 0,
+        }
+    }
+
+    pub fn wait_for_display_after(
+        &self,
+        last_seq: u64,
+        timeout_ms: u32,
+    ) -> Result<Option<(u64, DisplayState)>, Status> {
+        let mut seq = self
+            .display_signal_seq
+            .lock()
+            .map_err(|_| Status::InternalError)?;
+        if *seq <= last_seq {
+            let timeout = Duration::from_millis(timeout_ms as u64);
+            let (next, _) = self
+                .display_signal_cv
+                .wait_timeout_while(seq, timeout, |v| *v <= last_seq)
+                .map_err(|_| Status::InternalError)?;
+            seq = next;
+        }
+
+        if *seq <= last_seq {
+            return Ok(None);
+        }
+
+        let next_seq = *seq;
+        drop(seq);
+        Ok(Some((next_seq, self.display_state())))
     }
 
     pub fn set_default_decision(&self, decision: Decision) {
@@ -453,6 +499,13 @@ impl RuntimeEngine {
             self.frame_signal_cv.notify_all();
         }
     }
+
+    fn notify_display_changed(&self) {
+        if let Ok(mut seq) = self.display_signal_seq.lock() {
+            *seq = seq.saturating_add(1);
+            self.display_signal_cv.notify_all();
+        }
+    }
 }
 
 fn write_ppm_rgba(path: &Path, width: u32, height: u32, rgba8: &[u8]) -> std::io::Result<()> {
@@ -758,5 +811,63 @@ mod tests {
             .expect("wait with frame")
             .expect("new frame expected");
         assert_eq!(waited.frame_seq, frame.frame_seq);
+    }
+
+    #[test]
+    fn wait_for_display_times_out_without_change() {
+        let engine = RuntimeEngine::default();
+        assert_eq!(
+            engine
+                .wait_for_display_after(0, 1)
+                .expect("wait for display"),
+            None
+        );
+    }
+
+    #[test]
+    fn wait_for_display_wakes_on_change() {
+        let engine = RuntimeEngine::default();
+        let initial_seq = engine.display_signal_seq();
+
+        engine
+            .set_display_state(DisplayState {
+                width: 1200,
+                height: 2400,
+                refresh_hz: 120.0,
+                density_dpi: 420,
+                rotation: 1,
+            })
+            .expect("set display");
+
+        let (seq, display) = engine
+            .wait_for_display_after(initial_seq, 10)
+            .expect("wait for display")
+            .expect("display change expected");
+        assert!(seq > initial_seq);
+        assert_eq!(display.width, 1200);
+        assert_eq!(display.height, 2400);
+        assert_eq!(display.rotation, 1);
+    }
+
+    #[test]
+    fn display_change_clears_cached_render_frame() {
+        let engine = RuntimeEngine::default();
+        let pixels = vec![255u8; 16];
+        engine
+            .submit_render_frame_rgba(2, 2, pixels)
+            .expect("submit frame");
+        assert!(engine.render_frame_info().is_some());
+
+        engine
+            .set_display_state(DisplayState {
+                width: 1200,
+                height: 2400,
+                refresh_hz: 120.0,
+                density_dpi: 420,
+                rotation: 1,
+            })
+            .expect("set display");
+
+        assert_eq!(engine.render_frame_info(), None);
     }
 }
