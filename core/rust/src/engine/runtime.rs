@@ -1,11 +1,14 @@
 use crate::api::{
     Decision, DisplayState, RectRegion, RenderFrameChunk, RenderFrameInfo, RenderStats,
-    RouteResult, Status, TouchEvent,
+    RouteResult, Status, TouchEvent, RENDER_MAX_CHUNK_BYTES, RENDER_MAX_FRAME_BYTES,
+    TOUCH_MAX_POINTERS,
 };
-use crate::domain::RuntimeState;
+use std::collections::HashMap;
 use std::fs::{create_dir_all, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderPresentInfo {
@@ -17,12 +20,88 @@ pub struct RenderPresentInfo {
     pub checksum_fnv1a32: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ActiveTouch {
+    x: f32,
+    y: f32,
+    routed: RouteResult,
+}
+
+#[derive(Debug, Clone)]
+struct StoredRenderFrame {
+    info: RenderFrameInfo,
+    pixels_rgba8: Arc<[u8]>,
+}
+
 #[derive(Debug)]
-pub struct RuntimeEngine {
-    state: RuntimeState,
+struct RouteState {
+    default_decision: Decision,
+    regions: Vec<RectRegion>,
+}
+
+impl Default for RouteState {
+    fn default() -> Self {
+        Self {
+            default_decision: Decision::Pass,
+            regions: Vec::new(),
+        }
+    }
+}
+
+impl RouteState {
+    fn route_point(&self, x: f32, y: f32) -> RouteResult {
+        for region in self.regions.iter().rev() {
+            if region.contains(x, y) {
+                return RouteResult {
+                    decision: region.decision,
+                    region_id: region.region_id,
+                };
+            }
+        }
+
+        RouteResult {
+            decision: self.default_decision,
+            region_id: -1,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TouchState {
+    active_touches: HashMap<i32, ActiveTouch>,
+}
+
+#[derive(Debug)]
+struct RenderState {
+    render: RenderStats,
+    render_frame_seq: u64,
+    last_render_frame: Option<StoredRenderFrame>,
     present_seq: u64,
     dump_seq: u64,
     last_present: Option<RenderPresentInfo>,
+}
+
+impl Default for RenderState {
+    fn default() -> Self {
+        Self {
+            render: RenderStats::default(),
+            render_frame_seq: 0,
+            last_render_frame: None,
+            present_seq: 0,
+            dump_seq: 0,
+            last_present: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RuntimeEngine {
+    display: RwLock<DisplayState>,
+    route: RwLock<RouteState>,
+    touch: Mutex<TouchState>,
+    render: RwLock<RenderState>,
+    frame_signal_seq: Mutex<u64>,
+    frame_signal_cv: Condvar,
     render_output_dir: PathBuf,
 }
 
@@ -35,96 +114,252 @@ impl Default for RuntimeEngine {
 impl RuntimeEngine {
     pub fn new_with_render_output_dir(render_output_dir: impl Into<PathBuf>) -> Self {
         Self {
-            state: RuntimeState::default(),
-            present_seq: 0,
-            dump_seq: 0,
-            last_present: None,
+            display: RwLock::new(DisplayState::default()),
+            route: RwLock::new(RouteState::default()),
+            touch: Mutex::new(TouchState::default()),
+            render: RwLock::new(RenderState::default()),
+            frame_signal_seq: Mutex::new(0),
+            frame_signal_cv: Condvar::new(),
             render_output_dir: render_output_dir.into(),
         }
     }
 
-    pub fn set_display_state(&mut self, display: DisplayState) -> Result<(), Status> {
-        self.state.set_display(display)
+    pub fn set_display_state(&self, display: DisplayState) -> Result<(), Status> {
+        display.validate()?;
+        let mut guard = self.display.write().map_err(|_| Status::InternalError)?;
+        *guard = display;
+        Ok(())
     }
 
     pub fn display_state(&self) -> DisplayState {
-        self.state.display
+        match self.display.read() {
+            Ok(v) => *v,
+            Err(_) => DisplayState::default(),
+        }
     }
 
-    pub fn set_default_decision(&mut self, decision: Decision) {
-        self.state.default_decision = decision;
+    pub fn set_default_decision(&self, decision: Decision) {
+        if let Ok(mut guard) = self.route.write() {
+            guard.default_decision = decision;
+        }
     }
 
-    pub fn clear_regions(&mut self) {
-        self.state.clear_regions();
+    pub fn clear_regions(&self) {
+        if let Ok(mut guard) = self.route.write() {
+            guard.regions.clear();
+        }
     }
 
-    pub fn add_region_rect(&mut self, region: RectRegion) -> Result<(), Status> {
-        self.state.add_rect_region(region)
+    pub fn add_region_rect(&self, region: RectRegion) -> Result<(), Status> {
+        region.validate()?;
+        let mut guard = self.route.write().map_err(|_| Status::InternalError)?;
+        guard.regions.push(region);
+        Ok(())
     }
 
     pub fn route_point(&self, x: f32, y: f32) -> RouteResult {
-        self.state.route_point(x, y)
+        match self.route.read() {
+            Ok(guard) => guard.route_point(x, y),
+            Err(_) => RouteResult::passthrough(),
+        }
     }
 
-    pub fn touch_down(&mut self, event: TouchEvent) -> Result<RouteResult, Status> {
-        self.state.touch_down(event)
+    pub fn touch_down(&self, event: TouchEvent) -> Result<RouteResult, Status> {
+        event.validate()?;
+
+        let routed = {
+            let route = self.route.read().map_err(|_| Status::InternalError)?;
+            route.route_point(event.x, event.y)
+        };
+
+        let mut touch = self.touch.lock().map_err(|_| Status::InternalError)?;
+        if touch.active_touches.contains_key(&event.pointer_id) {
+            return Err(Status::InvalidArgument);
+        }
+        if touch.active_touches.len() >= TOUCH_MAX_POINTERS {
+            return Err(Status::OutOfRange);
+        }
+
+        touch.active_touches.insert(
+            event.pointer_id,
+            ActiveTouch {
+                x: event.x,
+                y: event.y,
+                routed,
+            },
+        );
+        Ok(routed)
     }
 
-    pub fn touch_move(&mut self, event: TouchEvent) -> Result<RouteResult, Status> {
-        self.state.touch_move(event)
+    pub fn touch_move(&self, event: TouchEvent) -> Result<RouteResult, Status> {
+        event.validate()?;
+        let mut touch = self.touch.lock().map_err(|_| Status::InternalError)?;
+        let entry = touch
+            .active_touches
+            .get_mut(&event.pointer_id)
+            .ok_or(Status::OutOfRange)?;
+        entry.x = event.x;
+        entry.y = event.y;
+        Ok(entry.routed)
     }
 
-    pub fn touch_up(&mut self, event: TouchEvent) -> Result<RouteResult, Status> {
-        self.state.touch_up(event)
+    pub fn touch_up(&self, event: TouchEvent) -> Result<RouteResult, Status> {
+        event.validate()?;
+        let mut touch = self.touch.lock().map_err(|_| Status::InternalError)?;
+        let entry = touch
+            .active_touches
+            .remove(&event.pointer_id)
+            .ok_or(Status::OutOfRange)?;
+        Ok(entry.routed)
     }
 
-    pub fn touch_cancel(&mut self, pointer_id: i32) -> Result<RouteResult, Status> {
-        self.state.touch_cancel(pointer_id)
+    pub fn touch_cancel(&self, pointer_id: i32) -> Result<RouteResult, Status> {
+        if pointer_id < 0 {
+            return Err(Status::OutOfRange);
+        }
+        let mut touch = self.touch.lock().map_err(|_| Status::InternalError)?;
+        let entry = touch
+            .active_touches
+            .remove(&pointer_id)
+            .ok_or(Status::OutOfRange)?;
+        Ok(entry.routed)
     }
 
-    pub fn clear_touches(&mut self) {
-        self.state.clear_touches();
+    pub fn clear_touches(&self) {
+        if let Ok(mut touch) = self.touch.lock() {
+            touch.active_touches.clear();
+        }
     }
 
     pub fn active_touch_count(&self) -> usize {
-        self.state.active_touch_count()
+        match self.touch.lock() {
+            Ok(touch) => touch.active_touches.len(),
+            Err(_) => 0,
+        }
     }
 
     pub fn submit_render_stats(
-        &mut self,
+        &self,
         draw_calls: u32,
         frost_passes: u32,
         text_calls: u32,
     ) -> RenderStats {
-        self.state
-            .submit_render_stats(draw_calls, frost_passes, text_calls)
+        match self.render.write() {
+            Ok(mut render) => {
+                render.render.frame_seq = render.render.frame_seq.saturating_add(1);
+                render.render.draw_calls = draw_calls;
+                render.render.frost_passes = frost_passes;
+                render.render.text_calls = text_calls;
+                render.render
+            }
+            Err(_) => RenderStats::default(),
+        }
     }
 
     pub fn render_stats(&self) -> RenderStats {
-        self.state.render_stats()
+        match self.render.read() {
+            Ok(render) => render.render,
+            Err(_) => RenderStats::default(),
+        }
     }
 
     pub fn submit_render_frame_rgba(
-        &mut self,
+        &self,
         width: u32,
         height: u32,
         pixels_rgba8: Vec<u8>,
     ) -> Result<RenderFrameInfo, Status> {
-        self.state
-            .submit_render_frame_rgba(width, height, pixels_rgba8)
+        if width == 0 || height == 0 {
+            return Err(Status::InvalidArgument);
+        }
+
+        let expected_len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|v| v.checked_mul(4usize))
+            .ok_or(Status::OutOfRange)?;
+        if expected_len > RENDER_MAX_FRAME_BYTES {
+            return Err(Status::OutOfRange);
+        }
+        if pixels_rgba8.len() != expected_len {
+            return Err(Status::InvalidArgument);
+        }
+
+        let checksum = fnv1a32(&pixels_rgba8);
+        let pixels_rgba8: Arc<[u8]> = pixels_rgba8.into();
+
+        let info = {
+            let mut render = self.render.write().map_err(|_| Status::InternalError)?;
+            render.render_frame_seq = render.render_frame_seq.saturating_add(1);
+            let info = RenderFrameInfo {
+                frame_seq: render.render_frame_seq,
+                width,
+                height,
+                byte_len: expected_len as u32,
+                checksum_fnv1a32: checksum,
+            };
+            render.last_render_frame = Some(StoredRenderFrame { info, pixels_rgba8 });
+            info
+        };
+
+        self.notify_new_frame(info.frame_seq);
+        Ok(info)
+    }
+
+    pub fn wait_for_frame_after(
+        &self,
+        last_frame_seq: u64,
+        timeout_ms: u32,
+    ) -> Result<Option<RenderFrameInfo>, Status> {
+        if let Some(info) = self.render_frame_info() {
+            if info.frame_seq > last_frame_seq {
+                return Ok(Some(info));
+            }
+        }
+
+        let timeout = Duration::from_millis(timeout_ms as u64);
+        let mut seq = self
+            .frame_signal_seq
+            .lock()
+            .map_err(|_| Status::InternalError)?;
+        if *seq <= last_frame_seq {
+            let (next, _) = self
+                .frame_signal_cv
+                .wait_timeout_while(seq, timeout, |v| *v <= last_frame_seq)
+                .map_err(|_| Status::InternalError)?;
+            seq = next;
+        }
+        drop(seq);
+
+        let frame = self.render_frame_info();
+        Ok(frame.filter(|v| v.frame_seq > last_frame_seq))
     }
 
     pub fn render_frame_info(&self) -> Option<RenderFrameInfo> {
-        self.state.render_frame_info()
+        self.render
+            .read()
+            .ok()
+            .and_then(|r| r.last_render_frame.as_ref().map(|v| v.info))
     }
 
-    pub fn clear_render_frame(&mut self) {
-        self.state.clear_render_frame();
+    pub fn clear_render_frame(&self) {
+        if let Ok(mut render) = self.render.write() {
+            render.last_render_frame = None;
+        }
     }
 
     pub fn render_frame_byte_len(&self) -> Option<usize> {
-        self.state.render_frame_byte_len()
+        self.render
+            .read()
+            .ok()
+            .and_then(|r| r.last_render_frame.as_ref().map(|f| f.pixels_rgba8.len()))
+    }
+
+    pub fn render_frame_snapshot(&self) -> Option<(RenderFrameInfo, Arc<[u8]>)> {
+        self.render.read().ok().and_then(|r| {
+            r.last_render_frame
+                .as_ref()
+                .map(|f| (f.info, f.pixels_rgba8.clone()))
+        })
     }
 
     pub fn render_frame_read_chunk(
@@ -132,45 +367,91 @@ impl RuntimeEngine {
         offset: usize,
         max_bytes: usize,
     ) -> Result<RenderFrameChunk, Status> {
-        self.state.render_frame_read_chunk(offset, max_bytes)
+        if max_bytes == 0 || max_bytes > RENDER_MAX_CHUNK_BYTES {
+            return Err(Status::OutOfRange);
+        }
+
+        let render = self.render.read().map_err(|_| Status::InternalError)?;
+        let frame = render
+            .last_render_frame
+            .as_ref()
+            .ok_or(Status::OutOfRange)?;
+        let total = frame.pixels_rgba8.len();
+        if offset >= total {
+            return Err(Status::OutOfRange);
+        }
+        let end = offset.saturating_add(max_bytes).min(total);
+        let bytes = frame.pixels_rgba8[offset..end].to_vec();
+
+        Ok(RenderFrameChunk {
+            frame_seq: frame.info.frame_seq,
+            total_bytes: frame.info.byte_len,
+            offset: offset as u32,
+            chunk_bytes: bytes,
+        })
     }
 
-    pub fn render_present(&mut self) -> Result<RenderPresentInfo, Status> {
-        let frame_info = self.state.render_frame_info().ok_or(Status::OutOfRange)?;
-        self.present_seq = self.present_seq.saturating_add(1);
+    pub fn render_present(&self) -> Result<RenderPresentInfo, Status> {
+        let mut render = self.render.write().map_err(|_| Status::InternalError)?;
+        let frame_info = render
+            .last_render_frame
+            .as_ref()
+            .map(|f| f.info)
+            .ok_or(Status::OutOfRange)?;
+        render.present_seq = render.present_seq.saturating_add(1);
 
         let info = RenderPresentInfo {
-            present_seq: self.present_seq,
+            present_seq: render.present_seq,
             frame_seq: frame_info.frame_seq,
             width: frame_info.width,
             height: frame_info.height,
             byte_len: frame_info.byte_len,
             checksum_fnv1a32: frame_info.checksum_fnv1a32,
         };
-        self.last_present = Some(info.clone());
+        render.last_present = Some(info.clone());
         Ok(info)
     }
 
     pub fn render_present_get(&self) -> Option<RenderPresentInfo> {
-        self.last_present.clone()
+        self.render.read().ok().and_then(|r| r.last_present.clone())
     }
 
-    pub fn render_dump_ppm(&mut self) -> Result<String, Status> {
-        let (frame_info, pixels) = self
-            .state
-            .render_frame_snapshot()
-            .ok_or(Status::OutOfRange)?;
-        self.dump_seq = self.dump_seq.saturating_add(1);
+    pub fn render_dump_ppm(&self) -> Result<String, Status> {
+        let (frame_info, pixels, dump_seq) = {
+            let mut render = self.render.write().map_err(|_| Status::InternalError)?;
+            let (frame_info, pixels) = {
+                let frame = render
+                    .last_render_frame
+                    .as_ref()
+                    .ok_or(Status::OutOfRange)?;
+                (frame.info, frame.pixels_rgba8.clone())
+            };
+            render.dump_seq = render.dump_seq.saturating_add(1);
+            (frame_info, pixels, render.dump_seq)
+        };
+
         create_dir_all(&self.render_output_dir).map_err(|_| Status::InternalError)?;
 
         let file_name = format!(
             "frame_dump_{:08}_frame_{:08}.ppm",
-            self.dump_seq, frame_info.frame_seq
+            dump_seq, frame_info.frame_seq
         );
         let path = self.render_output_dir.join(file_name);
-        write_ppm_rgba(path.as_path(), frame_info.width, frame_info.height, &pixels)
-            .map_err(|_| Status::InternalError)?;
+        write_ppm_rgba(
+            path.as_path(),
+            frame_info.width,
+            frame_info.height,
+            pixels.as_ref(),
+        )
+        .map_err(|_| Status::InternalError)?;
         Ok(path.display().to_string())
+    }
+
+    fn notify_new_frame(&self, frame_seq: u64) {
+        if let Ok(mut seq) = self.frame_signal_seq.lock() {
+            *seq = frame_seq;
+            self.frame_signal_cv.notify_all();
+        }
     }
 }
 
@@ -200,13 +481,22 @@ fn write_ppm_rgba(path: &Path, width: u32, height: u32, rgba8: &[u8]) -> std::io
     Ok(())
 }
 
+fn fnv1a32(data: &[u8]) -> u32 {
+    let mut hash = 0x811c9dc5u32;
+    for b in data {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(0x01000193u32);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn route_prefers_last_added_region() {
-        let mut engine = RuntimeEngine::default();
+        let engine = RuntimeEngine::default();
         engine
             .add_region_rect(RectRegion {
                 region_id: 1,
@@ -235,7 +525,7 @@ mod tests {
 
     #[test]
     fn touch_stream_locks_decision_until_up() {
-        let mut engine = RuntimeEngine::default();
+        let engine = RuntimeEngine::default();
         engine
             .add_region_rect(RectRegion {
                 region_id: 9,
@@ -293,7 +583,7 @@ mod tests {
 
     #[test]
     fn touch_move_unknown_pointer_returns_error() {
-        let mut engine = RuntimeEngine::default();
+        let engine = RuntimeEngine::default();
         let res = engine.touch_move(TouchEvent {
             pointer_id: 3,
             x: 1.0,
@@ -304,7 +594,7 @@ mod tests {
 
     #[test]
     fn render_submit_increments_frame_seq_and_updates_stats() {
-        let mut engine = RuntimeEngine::default();
+        let engine = RuntimeEngine::default();
 
         let first = engine.submit_render_stats(7, 1, 2);
         assert_eq!(first.frame_seq, 1);
@@ -324,7 +614,7 @@ mod tests {
 
     #[test]
     fn render_frame_submit_get_and_clear() {
-        let mut engine = RuntimeEngine::default();
+        let engine = RuntimeEngine::default();
         let pixels = vec![
             255u8, 0u8, 0u8, 255u8, 0u8, 255u8, 0u8, 255u8, 0u8, 0u8, 255u8, 255u8, 255u8, 255u8,
             255u8, 255u8,
@@ -354,14 +644,14 @@ mod tests {
 
     #[test]
     fn render_frame_rejects_invalid_length() {
-        let mut engine = RuntimeEngine::default();
+        let engine = RuntimeEngine::default();
         let out = engine.submit_render_frame_rgba(2, 2, vec![1u8; 15]);
         assert_eq!(out, Err(Status::InvalidArgument));
     }
 
     #[test]
     fn render_present_updates_metadata_without_disk_io() {
-        let mut engine = RuntimeEngine::new_with_render_output_dir("artifacts/test_render_present");
+        let engine = RuntimeEngine::new_with_render_output_dir("artifacts/test_render_present");
         let pixels = vec![
             255u8, 0u8, 0u8, 255u8, 0u8, 255u8, 0u8, 255u8, 0u8, 0u8, 255u8, 255u8, 255u8, 255u8,
             255u8, 255u8,
@@ -384,14 +674,14 @@ mod tests {
 
     #[test]
     fn render_present_without_frame_returns_out_of_range() {
-        let mut engine = RuntimeEngine::default();
+        let engine = RuntimeEngine::default();
         let out = engine.render_present();
         assert_eq!(out, Err(Status::OutOfRange));
     }
 
     #[test]
     fn render_dump_ppm_writes_file() {
-        let mut engine = RuntimeEngine::new_with_render_output_dir("artifacts/test_render_dump");
+        let engine = RuntimeEngine::new_with_render_output_dir("artifacts/test_render_dump");
         let pixels = vec![
             255u8, 0u8, 0u8, 255u8, 0u8, 255u8, 0u8, 255u8, 0u8, 0u8, 255u8, 255u8, 255u8, 255u8,
             255u8, 255u8,
@@ -405,7 +695,7 @@ mod tests {
 
     #[test]
     fn render_frame_read_chunk_reads_partial_bytes() {
-        let mut engine = RuntimeEngine::default();
+        let engine = RuntimeEngine::default();
         let pixels = (0u8..16u8).collect::<Vec<u8>>();
         let frame = engine
             .submit_render_frame_rgba(2, 2, pixels.clone())
@@ -434,7 +724,7 @@ mod tests {
 
     #[test]
     fn render_frame_read_chunk_rejects_invalid_range() {
-        let mut engine = RuntimeEngine::default();
+        let engine = RuntimeEngine::default();
         let pixels = vec![1u8; 16];
         engine
             .submit_render_frame_rgba(2, 2, pixels)
@@ -447,5 +737,26 @@ mod tests {
             engine.render_frame_read_chunk(0, 0),
             Err(Status::OutOfRange)
         );
+    }
+
+    #[test]
+    fn wait_for_frame_wakes_on_new_frame() {
+        let engine = RuntimeEngine::default();
+        assert_eq!(
+            engine
+                .wait_for_frame_after(0, 1)
+                .expect("wait without frame"),
+            None
+        );
+
+        let pixels = vec![255u8; 16];
+        let frame = engine
+            .submit_render_frame_rgba(2, 2, pixels)
+            .expect("submit frame");
+        let waited = engine
+            .wait_for_frame_after(0, 10)
+            .expect("wait with frame")
+            .expect("new frame expected");
+        assert_eq!(waited.frame_seq, frame.frame_seq);
     }
 }

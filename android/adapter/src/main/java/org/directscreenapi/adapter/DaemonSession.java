@@ -2,11 +2,15 @@ package org.directscreenapi.adapter;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.FileDescriptor;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 
 final class DaemonSession {
@@ -23,6 +27,49 @@ final class DaemonSession {
             this.height = height;
             this.byteLen = byteLen;
             this.rgba8 = rgba8;
+        }
+    }
+
+    static final class MappedFrame {
+        final long frameSeq;
+        final int width;
+        final int height;
+        final int byteLen;
+        final MappedByteBuffer rgba8;
+        private final FileChannel channel;
+        private final FileInputStream stream;
+
+        MappedFrame(
+                long frameSeq,
+                int width,
+                int height,
+                int byteLen,
+                MappedByteBuffer rgba8,
+                FileChannel channel,
+                FileInputStream stream
+        ) {
+            this.frameSeq = frameSeq;
+            this.width = width;
+            this.height = height;
+            this.byteLen = byteLen;
+            this.rgba8 = rgba8;
+            this.channel = channel;
+            this.stream = stream;
+        }
+
+        void closeQuietly() {
+            if (channel != null) {
+                try {
+                    channel.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (stream != null) {
+                try {
+                    stream.close();
+                } catch (Throwable ignored) {
+                }
+            }
         }
     }
 
@@ -111,6 +158,70 @@ final class DaemonSession {
             }
         }
         throw last != null ? last : new IOException("daemon_frame_raw_failed");
+    }
+
+    synchronized MappedFrame frameGetMapped() throws Exception {
+        Exception last = null;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                ensureRawConnected();
+                writeAsciiLine(rawOutput, "RENDER_FRAME_GET_FD");
+                String line = readAsciiLine(rawInput);
+                if (line == null) {
+                    throw new IOException("daemon_eof");
+                }
+                String trimmed = line.trim();
+                if (trimmed.startsWith("ERR ")) {
+                    if ("ERR OUT_OF_RANGE".equals(trimmed)) {
+                        return null;
+                    }
+                    throw new IOException("daemon_frame_fd_err=" + trimmed);
+                }
+                if (!trimmed.startsWith("OK ")) {
+                    throw new IOException("daemon_frame_fd_bad_line");
+                }
+                String[] tokens = trimmed.split("\\s+");
+                if (tokens.length < 5) {
+                    throw new IOException("daemon_frame_fd_tokens_invalid");
+                }
+
+                long frameSeq = parseLong(tokens[1], -1L);
+                int width = parseInt(tokens[2], -1);
+                int height = parseInt(tokens[3], -1);
+                int byteLen = parseInt(tokens[4], -1);
+                if (frameSeq < 0 || width <= 0 || height <= 0 || byteLen <= 0) {
+                    throw new IOException("daemon_frame_fd_header_invalid");
+                }
+
+                FileDescriptor fd = pollSingleAncillaryFd(rawSocket);
+                FileInputStream stream = new FileInputStream(fd);
+                FileChannel channel = stream.getChannel();
+                try {
+                    MappedByteBuffer mapped = channel.map(FileChannel.MapMode.READ_ONLY, 0L, byteLen);
+                    return new MappedFrame(frameSeq, width, height, byteLen, mapped, channel, stream);
+                } catch (Throwable t) {
+                    try {
+                        channel.close();
+                    } catch (Throwable ignored) {
+                    }
+                    try {
+                        stream.close();
+                    } catch (Throwable ignored) {
+                    }
+                    throw t;
+                }
+            } catch (Exception e) {
+                last = e;
+                closeRawQuietly();
+            }
+        }
+        throw last != null ? last : new IOException("daemon_frame_fd_failed");
+    }
+
+    synchronized String frameWait(long lastFrameSeq, int timeoutMs) throws Exception {
+        long safeSeq = Math.max(0L, lastFrameSeq);
+        int safeTimeout = Math.max(1, timeoutMs);
+        return command("RENDER_FRAME_WAIT " + safeSeq + " " + safeTimeout);
     }
 
     synchronized void closeQuietly() {
@@ -275,5 +386,17 @@ final class DaemonSession {
             }
         }
         return constants[0];
+    }
+
+    private static FileDescriptor pollSingleAncillaryFd(Object socket) throws Exception {
+        Object out = ReflectBridge.invoke(socket, "getAncillaryFileDescriptors");
+        if (!(out instanceof FileDescriptor[])) {
+            throw new IOException("daemon_frame_fd_missing_ancillary");
+        }
+        FileDescriptor[] fds = (FileDescriptor[]) out;
+        if (fds.length < 1 || fds[0] == null) {
+            throw new IOException("daemon_frame_fd_empty_ancillary");
+        }
+        return fds[0];
     }
 }

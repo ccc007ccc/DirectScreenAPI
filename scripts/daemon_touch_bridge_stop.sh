@@ -17,6 +17,7 @@ if [ -f "$PID_FILE" ]; then
   rm -f "$PID_FILE"
 fi
 
+pkill -f "target/release/dsapiinput --socket $SOCKET_PATH" >/dev/null 2>&1 || true
 pkill -f "target/release/dsapistream --socket $SOCKET_PATH --quiet" >/dev/null 2>&1 || true
 
 if [ -x ./target/release/dsapictl ] && [ -S "$SOCKET_PATH" ]; then

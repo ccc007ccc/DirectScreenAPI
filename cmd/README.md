@@ -7,3 +7,4 @@
 - `core/rust/src/bin/dsapi.rs`
 - `core/rust/src/bin/dsapid.rs`
 - `core/rust/src/bin/dsapictl.rs`
+- `core/rust/src/bin/dsapiinput.rs`

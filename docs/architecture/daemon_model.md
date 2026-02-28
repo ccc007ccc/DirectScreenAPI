@@ -10,6 +10,9 @@
 - 单行命令请求
 - 单行响应结果
 - 二进制帧提交扩展（`RENDER_FRAME_SUBMIT_RGBA_RAW` 先握手再传定长 body）
+- 共享内存取帧扩展（`RENDER_FRAME_GET_FD`：头行 + `SCM_RIGHTS` 传输帧 fd）
+- 事件驱动帧等待（`RENDER_FRAME_WAIT`）
+- 二进制触摸流扩展（`STREAM_TOUCH_V1` 握手后发送定长二进制包）
 - 并发连接处理（触摸桥接与控制命令可并行）
 
 ## 协议命令（v0.1+）
@@ -33,18 +36,22 @@
 - `RENDER_FRAME_SUBMIT_RGBA_RAW <width> <height> <byte_len>`（收到 `OK READY` 后发送 `byte_len` 原始 RGBA8）
 - `RENDER_FRAME_SUBMIT_RGBA <width> <height> <base64_rgba8>`
 - `RENDER_FRAME_GET_RAW`（`OK <frame_seq> <w> <h> <byte_len>` 后紧跟 `byte_len` 原始 RGBA8）
+- `RENDER_FRAME_GET_FD`（`OK <frame_seq> <w> <h> <byte_len>` + `SCM_RIGHTS` 帧 fd）
 - `RENDER_FRAME_GET`
+- `RENDER_FRAME_WAIT <last_frame_seq> <timeout_ms>`
 - `RENDER_FRAME_READ_BASE64 <offset> <max_bytes>`
 - `RENDER_FRAME_CLEAR`
 - `RENDER_PRESENT`
 - `RENDER_PRESENT_GET`
 - `RENDER_DUMP_PPM`
+- `STREAM_TOUCH_V1`（`OK STREAM_TOUCH_V1` 后进入二进制触摸流）
 - `SHUTDOWN`
 
 ## 响应格式
 
 - 成功：`OK ...`
 - 失败：`ERR <STATUS_NAME>`
+- `RENDER_FRAME_WAIT` 超时：`OK TIMEOUT`
 
 ## 生命周期管理
 

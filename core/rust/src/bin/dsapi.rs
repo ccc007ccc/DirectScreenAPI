@@ -76,7 +76,7 @@ fn main() {
                 rotation: parse_u32(&args[6]).unwrap_or(0),
             };
 
-            let mut engine = RuntimeEngine::default();
+            let engine = RuntimeEngine::default();
             match engine.set_display_state(display) {
                 Ok(()) => println!("status=0"),
                 Err(e) => println!("status={}", e as i32),
@@ -90,7 +90,7 @@ fn main() {
 
             let x = parse_f32(&args[2]).unwrap_or(0.0);
             let y = parse_f32(&args[3]).unwrap_or(0.0);
-            let mut engine = RuntimeEngine::default();
+            let engine = RuntimeEngine::default();
             engine.set_default_decision(Decision::Pass);
 
             for token in args.iter().skip(4) {

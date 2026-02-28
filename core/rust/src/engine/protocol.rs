@@ -37,6 +37,10 @@ fn parse_u32(token: &str) -> Result<u32, Status> {
     token.parse::<u32>().map_err(|_| Status::InvalidArgument)
 }
 
+fn parse_u64(token: &str) -> Result<u64, Status> {
+    token.parse::<u64>().map_err(|_| Status::InvalidArgument)
+}
+
 fn parse_usize(token: &str) -> Result<usize, Status> {
     let v = parse_u32(token)?;
     usize::try_from(v).map_err(|_| Status::OutOfRange)
@@ -59,7 +63,7 @@ fn parse_touch_event(
     })
 }
 
-pub fn execute_command(engine: &mut RuntimeEngine, line: &str) -> CommandOutcome {
+pub fn execute_command(engine: &RuntimeEngine, line: &str) -> CommandOutcome {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return CommandOutcome {
@@ -318,6 +322,29 @@ pub fn execute_command(engine: &mut RuntimeEngine, line: &str) -> CommandOutcome
                 }
             }
         }
+        "RENDER_FRAME_WAIT" => {
+            if tokens.len() != 3 {
+                Err(Status::InvalidArgument)
+            } else {
+                match (parse_u64(tokens[1]), parse_u32(tokens[2])) {
+                    (Ok(last_seq), Ok(timeout_ms)) => {
+                        match engine.wait_for_frame_after(last_seq, timeout_ms) {
+                            Ok(Some(frame)) => Ok(format!(
+                                "OK {} {} {} RGBA8888 {} {}",
+                                frame.frame_seq,
+                                frame.width,
+                                frame.height,
+                                frame.byte_len,
+                                frame.checksum_fnv1a32
+                            )),
+                            Ok(None) => Ok("OK TIMEOUT".to_string()),
+                            Err(e) => Err(e),
+                        }
+                    }
+                    _ => Err(Status::InvalidArgument),
+                }
+            }
+        }
         "RENDER_FRAME_READ_BASE64" => {
             if tokens.len() != 3 {
                 Err(Status::InvalidArgument)
@@ -569,6 +596,35 @@ mod tests {
 
         let bad = execute_command(&mut engine, "RENDER_FRAME_READ_BASE64 4 1");
         assert_eq!(bad.response_line, "ERR OUT_OF_RANGE");
+    }
+
+    #[test]
+    fn render_frame_wait_command_times_out_without_new_frame() {
+        let mut engine = RuntimeEngine::default();
+        let wait = execute_command(&mut engine, "RENDER_FRAME_WAIT 0 1");
+        assert_eq!(wait.response_line, "OK TIMEOUT");
+    }
+
+    #[test]
+    fn render_frame_wait_command_returns_frame_when_available() {
+        let mut engine = RuntimeEngine::default();
+        let payload = BASE64_STD.encode([1u8, 2u8, 3u8, 4u8]);
+        let submit = execute_command(
+            &mut engine,
+            &format!("RENDER_FRAME_SUBMIT_RGBA 1 1 {}", payload),
+        );
+        assert!(submit.response_line.starts_with("OK "));
+
+        let wait = execute_command(&mut engine, "RENDER_FRAME_WAIT 0 10");
+        let tokens: Vec<&str> = wait.response_line.split_whitespace().collect();
+        assert_eq!(tokens.len(), 7);
+        assert_eq!(tokens[0], "OK");
+        assert_eq!(tokens[2], "1");
+        assert_eq!(tokens[3], "1");
+        assert_eq!(tokens[4], "RGBA8888");
+        assert_eq!(tokens[5], "4");
+        assert!(tokens[1].parse::<u64>().is_ok());
+        assert!(tokens[6].parse::<u32>().is_ok());
     }
 
     #[test]

@@ -1,14 +1,17 @@
+use std::ffi::CString;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, IoSlice, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use directscreen_core::api::{Status, RENDER_MAX_FRAME_BYTES};
+use directscreen_core::api::{RouteResult, Status, TouchEvent, RENDER_MAX_FRAME_BYTES};
 use directscreen_core::engine::{execute_command, RuntimeEngine};
+use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 
 struct SocketGuard {
     path: PathBuf,
@@ -143,6 +146,25 @@ fn parse_frame_get_raw_request(line: &str) -> Result<bool, Status> {
     Ok(true)
 }
 
+fn parse_frame_get_fd_request(line: &str) -> Result<bool, Status> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+
+    let mut tokens = trimmed.split_whitespace();
+    let Some(cmd) = tokens.next() else {
+        return Ok(false);
+    };
+    if !cmd.eq_ignore_ascii_case("RENDER_FRAME_GET_FD") {
+        return Ok(false);
+    }
+    if tokens.next().is_some() {
+        return Err(Status::InvalidArgument);
+    }
+    Ok(true)
+}
+
 fn write_status_error(stream: &mut UnixStream, status: Status) {
     let _ = stream.write_all(format!("ERR {}\n", status_name(status)).as_bytes());
     let _ = stream.flush();
@@ -156,7 +178,7 @@ fn write_internal_error(stream: &mut UnixStream, msg: &str) {
 fn handle_raw_frame_submit(
     stream: &mut UnixStream,
     reader: &mut BufReader<UnixStream>,
-    engine: &Arc<Mutex<RuntimeEngine>>,
+    engine: &Arc<RuntimeEngine>,
     req: RawFrameSubmitRequest,
 ) -> std::io::Result<()> {
     stream.write_all(b"OK READY\n")?;
@@ -165,23 +187,12 @@ fn handle_raw_frame_submit(
     let mut pixels_rgba8 = vec![0u8; req.byte_len];
     reader.read_exact(&mut pixels_rgba8)?;
 
-    let response = match engine.lock() {
-        Ok(mut guard) => {
-            match guard.submit_render_frame_rgba(req.width, req.height, pixels_rgba8) {
-                Ok(frame) => format!(
-                    "OK {} {} {} RGBA8888 {} {}",
-                    frame.frame_seq,
-                    frame.width,
-                    frame.height,
-                    frame.byte_len,
-                    frame.checksum_fnv1a32
-                ),
-                Err(status) => format!("ERR {}", status_name(status)),
-            }
-        }
-        Err(_) => {
-            return Err(std::io::Error::other("lock_poisoned"));
-        }
+    let response = match engine.submit_render_frame_rgba(req.width, req.height, pixels_rgba8) {
+        Ok(frame) => format!(
+            "OK {} {} {} RGBA8888 {} {}",
+            frame.frame_seq, frame.width, frame.height, frame.byte_len, frame.checksum_fnv1a32
+        ),
+        Err(status) => format!("ERR {}", status_name(status)),
     };
 
     stream.write_all(response.as_bytes())?;
@@ -192,16 +203,16 @@ fn handle_raw_frame_submit(
 
 fn handle_frame_get_raw(
     stream: &mut UnixStream,
-    engine: &Arc<Mutex<RuntimeEngine>>,
+    engine: &Arc<RuntimeEngine>,
 ) -> std::io::Result<()> {
     const RAW_CHUNK_BYTES: usize = 1024 * 1024;
 
-    let guard = engine
-        .lock()
-        .map_err(|_| std::io::Error::other("lock_poisoned"))?;
-    let Some(frame) = guard.render_frame_info() else {
-        write_status_error(stream, Status::OutOfRange);
-        return Ok(());
+    let (frame, pixels_rgba8) = {
+        let Some(snapshot) = engine.render_frame_snapshot() else {
+            write_status_error(stream, Status::OutOfRange);
+            return Ok(());
+        };
+        snapshot
     };
 
     let header = format!(
@@ -211,28 +222,168 @@ fn handle_frame_get_raw(
     stream.write_all(header.as_bytes())?;
 
     let total = frame.byte_len as usize;
+    if total != pixels_rgba8.len() {
+        return Err(std::io::Error::other("frame_snapshot_len_mismatch"));
+    }
+
     let mut offset = 0usize;
     while offset < total {
-        let ask = (total - offset).min(RAW_CHUNK_BYTES);
-        let chunk = guard
-            .render_frame_read_chunk(offset, ask)
-            .map_err(|_| std::io::Error::other("frame_chunk_read_failed"))?;
-        if chunk.chunk_bytes.is_empty() {
+        let end = offset.saturating_add(RAW_CHUNK_BYTES).min(total);
+        let chunk = &pixels_rgba8[offset..end];
+        if chunk.is_empty() {
             return Err(std::io::Error::other("frame_chunk_empty"));
         }
-        stream.write_all(&chunk.chunk_bytes)?;
-        offset += chunk.chunk_bytes.len();
+        stream.write_all(chunk)?;
+        offset = end;
     }
 
     stream.flush()?;
     Ok(())
 }
 
-fn handle_client(
-    mut stream: UnixStream,
-    engine: Arc<Mutex<RuntimeEngine>>,
-    shutdown: Arc<AtomicBool>,
-) {
+fn close_fd(fd: i32) {
+    if fd >= 0 {
+        let _ = unsafe { libc::close(fd) };
+    }
+}
+
+fn create_memfd_with_data(name: &str, data: &[u8]) -> std::io::Result<i32> {
+    let c_name = CString::new(name).map_err(|_| std::io::Error::other("memfd_name_invalid"))?;
+    let fd = unsafe { libc::memfd_create(c_name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if unsafe { libc::ftruncate(fd, data.len() as libc::off_t) } < 0 {
+        let err = std::io::Error::last_os_error();
+        close_fd(fd);
+        return Err(err);
+    }
+
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let ptr = unsafe { data.as_ptr().add(offset) } as *const libc::c_void;
+        let remain = data.len() - offset;
+        let n = unsafe { libc::write(fd, ptr, remain) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            close_fd(fd);
+            return Err(err);
+        }
+        if n == 0 {
+            close_fd(fd);
+            return Err(std::io::Error::other("memfd_write_zero"));
+        }
+        offset += n as usize;
+    }
+
+    if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
+        let err = std::io::Error::last_os_error();
+        close_fd(fd);
+        return Err(err);
+    }
+    Ok(fd)
+}
+
+fn send_line_with_fd(stream: &UnixStream, line: &str, fd: i32) -> std::io::Result<()> {
+    let payload = line.as_bytes();
+    let iov = [IoSlice::new(payload)];
+    let fds = [fd];
+    let cmsgs = [ControlMessage::ScmRights(&fds)];
+    let sent = sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsgs, MsgFlags::empty(), None)
+        .map_err(std::io::Error::other)?;
+    if sent != payload.len() {
+        return Err(std::io::Error::other("sendmsg_short_write"));
+    }
+    Ok(())
+}
+
+fn handle_frame_get_fd(
+    stream: &mut UnixStream,
+    engine: &Arc<RuntimeEngine>,
+) -> std::io::Result<()> {
+    let (frame, pixels_rgba8) = {
+        let Some(snapshot) = engine.render_frame_snapshot() else {
+            write_status_error(stream, Status::OutOfRange);
+            return Ok(());
+        };
+        snapshot
+    };
+
+    let total = frame.byte_len as usize;
+    if total != pixels_rgba8.len() {
+        return Err(std::io::Error::other("frame_snapshot_len_mismatch"));
+    }
+
+    let fd = create_memfd_with_data("dsapi_frame", pixels_rgba8.as_ref())?;
+    let header = format!(
+        "OK {} {} {} {}\n",
+        frame.frame_seq, frame.width, frame.height, frame.byte_len
+    );
+    let res = send_line_with_fd(stream, &header, fd);
+    close_fd(fd);
+    res
+}
+
+const TOUCH_PACKET_BYTES: usize = 16;
+const TOUCH_PACKET_DOWN: u8 = 1;
+const TOUCH_PACKET_MOVE: u8 = 2;
+const TOUCH_PACKET_UP: u8 = 3;
+const TOUCH_PACKET_CANCEL: u8 = 4;
+const TOUCH_PACKET_CLEAR: u8 = 5;
+
+fn parse_i32_le(bytes: &[u8]) -> i32 {
+    i32::from_le_bytes(bytes.try_into().expect("len=4"))
+}
+
+fn parse_f32_le(bytes: &[u8]) -> f32 {
+    f32::from_le_bytes(bytes.try_into().expect("len=4"))
+}
+
+fn apply_touch_packet(engine: &RuntimeEngine, packet: &[u8; TOUCH_PACKET_BYTES]) {
+    let kind = packet[0];
+    let pointer_id = parse_i32_le(&packet[4..8]);
+    let x = parse_f32_le(&packet[8..12]);
+    let y = parse_f32_le(&packet[12..16]);
+
+    let _ = match kind {
+        TOUCH_PACKET_DOWN => engine.touch_down(TouchEvent { pointer_id, x, y }),
+        TOUCH_PACKET_MOVE => engine.touch_move(TouchEvent { pointer_id, x, y }),
+        TOUCH_PACKET_UP => engine.touch_up(TouchEvent { pointer_id, x, y }),
+        TOUCH_PACKET_CANCEL => engine.touch_cancel(pointer_id),
+        TOUCH_PACKET_CLEAR => {
+            engine.clear_touches();
+            Ok(RouteResult::passthrough())
+        }
+        _ => Err(Status::InvalidArgument),
+    };
+}
+
+fn handle_touch_stream_v1(
+    stream: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    engine: &Arc<RuntimeEngine>,
+    shutdown: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    stream.write_all(b"OK STREAM_TOUCH_V1\n")?;
+    stream.flush()?;
+
+    let mut packet = [0u8; TOUCH_PACKET_BYTES];
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        match reader.read_exact(&mut packet) {
+            Ok(()) => apply_touch_packet(engine, &packet),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn handle_client(mut stream: UnixStream, engine: Arc<RuntimeEngine>, shutdown: Arc<AtomicBool>) {
     let reader_stream = match stream.try_clone() {
         Ok(v) => v,
         Err(e) => {
@@ -266,6 +417,21 @@ fn handle_client(
                     continue;
                 }
 
+                let fd_get = match parse_frame_get_fd_request(&line) {
+                    Ok(v) => v,
+                    Err(status) => {
+                        write_status_error(&mut stream, status);
+                        continue;
+                    }
+                };
+                if fd_get {
+                    if let Err(e) = handle_frame_get_fd(&mut stream, &engine) {
+                        write_internal_error(&mut stream, &format!("fd_get_failed:{}", e));
+                        break;
+                    }
+                    continue;
+                }
+
                 let raw_submit = match parse_raw_frame_submit_request(&line) {
                     Ok(v) => v,
                     Err(status) => {
@@ -283,15 +449,16 @@ fn handle_client(
                     continue;
                 }
 
-                let outcome = {
-                    match engine.lock() {
-                        Ok(mut guard) => execute_command(&mut guard, &line),
-                        Err(_) => {
-                            let _ = stream.write_all(b"ERR INTERNAL_ERROR lock_poisoned\n");
-                            break;
-                        }
+                if line.trim().eq_ignore_ascii_case("STREAM_TOUCH_V1") {
+                    if let Err(e) =
+                        handle_touch_stream_v1(&mut stream, &mut reader, &engine, &shutdown)
+                    {
+                        write_internal_error(&mut stream, &format!("touch_stream_failed:{}", e));
                     }
-                };
+                    break;
+                }
+
+                let outcome = execute_command(&engine, &line);
 
                 let response = format!("{}\n", outcome.response_line);
                 let _ = stream.write_all(response.as_bytes());
@@ -345,9 +512,9 @@ fn main() {
 
     println!("daemon_status=started socket={}", socket_path.display());
 
-    let engine = Arc::new(Mutex::new(RuntimeEngine::new_with_render_output_dir(
+    let engine = Arc::new(RuntimeEngine::new_with_render_output_dir(
         render_output_dir.clone(),
-    )));
+    ));
     let shutdown = Arc::new(AtomicBool::new(false));
 
     println!("daemon_render_output_dir={}", render_output_dir);
@@ -377,6 +544,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn touch_packet(kind: u8, pointer_id: i32, x: f32, y: f32) -> [u8; TOUCH_PACKET_BYTES] {
+        let mut out = [0u8; TOUCH_PACKET_BYTES];
+        out[0] = kind;
+        out[4..8].copy_from_slice(&pointer_id.to_le_bytes());
+        out[8..12].copy_from_slice(&x.to_le_bytes());
+        out[12..16].copy_from_slice(&y.to_le_bytes());
+        out
+    }
 
     #[test]
     fn parse_raw_frame_submit_request_accepts_valid_header() {
@@ -411,5 +587,40 @@ mod tests {
     fn parse_frame_get_raw_request_rejects_extra_tokens() {
         let out = parse_frame_get_raw_request("RENDER_FRAME_GET_RAW extra").expect_err("reject");
         assert_eq!(out, Status::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_frame_get_fd_request_accepts_header() {
+        let out = parse_frame_get_fd_request("RENDER_FRAME_GET_FD").expect("parse fd get");
+        assert!(out);
+    }
+
+    #[test]
+    fn parse_frame_get_fd_request_rejects_extra_tokens() {
+        let out = parse_frame_get_fd_request("RENDER_FRAME_GET_FD extra").expect_err("reject");
+        assert_eq!(out, Status::InvalidArgument);
+    }
+
+    #[test]
+    fn touch_stream_binary_packets_drive_touch_state() {
+        let engine = RuntimeEngine::default();
+        apply_touch_packet(&engine, &touch_packet(TOUCH_PACKET_DOWN, 7, 11.0, 22.0));
+        assert_eq!(engine.active_touch_count(), 1);
+
+        apply_touch_packet(&engine, &touch_packet(TOUCH_PACKET_MOVE, 7, 12.0, 23.0));
+        assert_eq!(engine.active_touch_count(), 1);
+
+        apply_touch_packet(&engine, &touch_packet(TOUCH_PACKET_UP, 7, 12.0, 23.0));
+        assert_eq!(engine.active_touch_count(), 0);
+    }
+
+    #[test]
+    fn touch_stream_clear_packet_resets_active_touches() {
+        let engine = RuntimeEngine::default();
+        apply_touch_packet(&engine, &touch_packet(TOUCH_PACKET_DOWN, 3, 1.0, 1.0));
+        assert_eq!(engine.active_touch_count(), 1);
+
+        apply_touch_packet(&engine, &touch_packet(TOUCH_PACKET_CLEAR, 0, 0.0, 0.0));
+        assert_eq!(engine.active_touch_count(), 0);
     }
 }

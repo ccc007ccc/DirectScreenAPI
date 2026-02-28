@@ -1,6 +1,5 @@
 use std::ffi::c_char;
 use std::ptr;
-use std::sync::Mutex;
 
 use crate::api::{
     Decision, DisplayState, RectRegion, RenderFrameInfo, RenderStats, RouteResult, Status,
@@ -11,7 +10,7 @@ use crate::DIRECTSCREEN_CORE_VERSION;
 
 #[repr(C)]
 pub struct DsapiContext {
-    engine: Mutex<RuntimeEngine>,
+    engine: RuntimeEngine,
 }
 
 #[repr(C)]
@@ -145,16 +144,13 @@ fn touch_event_from(pointer_id: i32, x: f32, y: f32) -> TouchEvent {
     TouchEvent { pointer_id, x, y }
 }
 
-fn with_engine_mut(ctx: *mut DsapiContext, f: impl FnOnce(&mut RuntimeEngine) -> Status) -> Status {
+fn with_engine_mut(ctx: *mut DsapiContext, f: impl FnOnce(&RuntimeEngine) -> Status) -> Status {
     if ctx.is_null() {
         return Status::NullPointer;
     }
 
     let ctx_ref = unsafe { &*ctx };
-    match ctx_ref.engine.lock() {
-        Ok(mut guard) => f(&mut guard),
-        Err(_) => Status::InternalError,
-    }
+    f(&ctx_ref.engine)
 }
 
 fn with_engine_ref(ctx: *mut DsapiContext, f: impl FnOnce(&RuntimeEngine) -> Status) -> Status {
@@ -163,10 +159,7 @@ fn with_engine_ref(ctx: *mut DsapiContext, f: impl FnOnce(&RuntimeEngine) -> Sta
     }
 
     let ctx_ref = unsafe { &*ctx };
-    match ctx_ref.engine.lock() {
-        Ok(guard) => f(&guard),
-        Err(_) => Status::InternalError,
-    }
+    f(&ctx_ref.engine)
 }
 
 #[no_mangle]
@@ -178,7 +171,7 @@ pub extern "C" fn dsapi_version() -> *const c_char {
 #[no_mangle]
 pub extern "C" fn dsapi_context_create() -> *mut DsapiContext {
     Box::into_raw(Box::new(DsapiContext {
-        engine: Mutex::new(RuntimeEngine::default()),
+        engine: RuntimeEngine::default(),
     }))
 }
 

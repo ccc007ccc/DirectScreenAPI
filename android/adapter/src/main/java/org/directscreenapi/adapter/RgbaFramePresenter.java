@@ -98,45 +98,38 @@ final class RgbaFramePresenter {
 
             FrameInfo info;
             try {
-                info = readFrameInfo();
+                info = waitNextFrame(lastFrameSeq, pollMs);
             } catch (Throwable t) {
-                logConnectWarn("frame_info_failed", t);
-                sleepQuietly(pollMs);
+                logConnectWarn("frame_wait_failed", t);
                 continue;
             }
 
             if (info == null || info.frameSeq == lastFrameSeq) {
-                sleepQuietly(pollMs);
                 continue;
             }
 
-            DaemonSession.RawFrame rawFrame;
+            DaemonSession.MappedFrame mappedFrame;
             try {
-                rawFrame = daemon.frameGetRaw();
+                mappedFrame = daemon.frameGetMapped();
             } catch (Throwable t) {
-                log(
-                        "presenter_warn=frame_read_failed seq="
-                                + info.frameSeq
-                                + " err="
-                                + t.getClass().getSimpleName()
-                                + " msg="
-                                + String.valueOf(t.getMessage())
-                );
-                sleepQuietly(pollMs);
-                continue;
+                throw new IllegalStateException("presenter_frame_fd_required", t);
             }
-            if (rawFrame == null || rawFrame.frameSeq == lastFrameSeq) {
-                sleepQuietly(pollMs);
+            if (mappedFrame == null || mappedFrame.frameSeq == lastFrameSeq) {
+                if (mappedFrame != null) {
+                    mappedFrame.closeQuietly();
+                }
                 continue;
             }
 
             try {
-                drawFrame(rawFrame.width, rawFrame.height, rawFrame.rgba8);
+                drawFrame(mappedFrame.width, mappedFrame.height, mappedFrame.rgba8);
                 daemon.command("RENDER_PRESENT");
-                lastFrameSeq = rawFrame.frameSeq;
-                markFramePresented(rawFrame.byteLen);
+                lastFrameSeq = mappedFrame.frameSeq;
+                markFramePresented(mappedFrame.byteLen);
             } catch (Throwable t) {
-                log("presenter_warn=draw_failed seq=" + rawFrame.frameSeq + " err=" + t.getClass().getSimpleName());
+                log("presenter_warn=draw_failed seq=" + mappedFrame.frameSeq + " err=" + t.getClass().getSimpleName());
+            } finally {
+                mappedFrame.closeQuietly();
             }
         }
 
@@ -187,8 +180,15 @@ final class RgbaFramePresenter {
         }
     }
 
-    private FrameInfo readFrameInfo() throws Exception {
-        String line = daemon.command("RENDER_FRAME_GET");
+    private FrameInfo waitNextFrame(long lastSeq, int timeoutMs) throws Exception {
+        String line = daemon.frameWait(lastSeq, timeoutMs);
+        if ("OK TIMEOUT".equals(line)) {
+            return null;
+        }
+        return parseFrameInfo(line);
+    }
+
+    private FrameInfo parseFrameInfo(String line) throws Exception {
         if (!line.startsWith("OK ")) {
             return null;
         }
@@ -206,10 +206,10 @@ final class RgbaFramePresenter {
         return new FrameInfo(frameSeq, width, height, byteLen);
     }
 
-    private void drawFrame(int frameWidth, int frameHeight, byte[] rgba) throws Exception {
+    private void drawFrame(int frameWidth, int frameHeight, ByteBuffer rgba) throws Exception {
         ensureBitmap(frameWidth, frameHeight);
-        ByteBuffer buffer = ByteBuffer.wrap(rgba);
-        ReflectBridge.invoke(bitmap, "copyPixelsFromBuffer", buffer);
+        rgba.position(0);
+        ReflectBridge.invoke(bitmap, "copyPixelsFromBuffer", rgba);
 
         Object canvas = surfaceSession.lockFrame();
         try {
@@ -255,14 +255,6 @@ final class RgbaFramePresenter {
             return Long.parseLong(s);
         } catch (Throwable ignored) {
             return fallback;
-        }
-    }
-
-    private static void sleepQuietly(int ms) {
-        try {
-            Thread.sleep(Math.max(1, ms));
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
         }
     }
 

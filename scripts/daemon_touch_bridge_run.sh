@@ -8,7 +8,6 @@ SOCKET_PATH="${DSAPI_SOCKET_PATH:-artifacts/run/dsapi.sock}"
 GETEVENT_BIN="${DSAPI_GETEVENT_BIN:-/system/bin/getevent}"
 RUN_AS_ROOT="${DSAPI_TOUCH_RUN_AS_ROOT:-1}"
 TOUCH_DEVICE="${DSAPI_TOUCH_DEVICE:-}"
-AWK_SCRIPT="scripts/touch_event_to_dsapi.awk"
 MONITOR_INTERVAL_SEC="${DSAPI_TOUCH_MONITOR_INTERVAL_SEC:-1}"
 AUTO_SYNC_DISPLAY="${DSAPI_TOUCH_AUTO_SYNC_DISPLAY:-1}"
 SYNC_DISPLAY_EVERY_SEC="${DSAPI_TOUCH_SYNC_DISPLAY_EVERY_SEC:-1}"
@@ -118,14 +117,12 @@ start_pipeline() {
   h="$2"
   rot="$3"
 
+  cmd="./target/release/dsapiinput --socket '$SOCKET_PATH' --device '$TOUCH_DEVICE' --max-x '$max_x' --max-y '$max_y' --width '$w' --height '$h' --rotation '$rot' --quiet"
+
   if [ "$RUN_AS_ROOT" = "1" ]; then
-    su -c "$GETEVENT_BIN -lt '$TOUCH_DEVICE'" \
-      | gawk -v max_x="$max_x" -v max_y="$max_y" -v width="$w" -v height="$h" -v rotation="$rot" -f "$AWK_SCRIPT" \
-      | ./target/release/dsapistream --socket "$SOCKET_PATH" --quiet &
+    su -c "$cmd" &
   else
-    "$GETEVENT_BIN" -lt "$TOUCH_DEVICE" \
-      | gawk -v max_x="$max_x" -v max_y="$max_y" -v width="$w" -v height="$h" -v rotation="$rot" -f "$AWK_SCRIPT" \
-      | ./target/release/dsapistream --socket "$SOCKET_PATH" --quiet &
+    sh -c "$cmd" &
   fi
   PIPE_PID="$!"
 }
@@ -139,7 +136,7 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-if [ ! -x ./target/release/dsapistream ] || [ ! -x ./target/release/dsapictl ]; then
+if [ ! -x ./target/release/dsapiinput ] || [ ! -x ./target/release/dsapictl ]; then
   ./scripts/build_core.sh >/dev/null
 fi
 

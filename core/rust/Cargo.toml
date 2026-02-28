@@ -25,5 +25,11 @@ path = "src/bin/dsapictl.rs"
 name = "dsapistream"
 path = "src/bin/dsapistream.rs"
 
+[[bin]]
+name = "dsapiinput"
+path = "src/bin/dsapiinput.rs"
+
 [dependencies]
 base64 = "0.22"
+libc = "0.2"
+nix = { version = "0.29", features = ["socket", "uio"] }
