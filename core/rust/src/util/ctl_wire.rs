@@ -11,6 +11,10 @@ pub enum BinaryCtlCommand {
     Ping,
     Version,
     DisplayGet,
+    DisplayWait {
+        last_seq: u64,
+        timeout_ms: u32,
+    },
     DisplaySet {
         width: u32,
         height: u32,
@@ -54,6 +58,12 @@ fn parse_i32(token: &str) -> Result<i32, String> {
         .map_err(|_| format!("invalid_i32:{}", token))
 }
 
+fn parse_u64(token: &str) -> Result<u64, String> {
+    token
+        .parse::<u64>()
+        .map_err(|_| format!("invalid_u64:{}", token))
+}
+
 fn parse_f32(token: &str) -> Result<f32, String> {
     token
         .parse::<f32>()
@@ -83,6 +93,15 @@ pub fn parse_command_tokens(tokens: &[&str]) -> Result<BinaryCtlCommand, String>
             return Err("display_get_args_invalid".to_string());
         }
         return Ok(BinaryCtlCommand::DisplayGet);
+    }
+    if cmd.eq_ignore_ascii_case("DISPLAY_WAIT") {
+        if tokens.len() != 3 {
+            return Err("display_wait_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::DisplayWait {
+            last_seq: parse_u64(tokens[1])?,
+            timeout_ms: parse_u32(tokens[2])?,
+        });
     }
     if cmd.eq_ignore_ascii_case("DISPLAY_SET") {
         if tokens.len() != 6 {
@@ -167,6 +186,23 @@ pub fn parse_command_line(line: &str) -> Result<BinaryCtlCommand, String> {
             return Err("display_get_args_invalid".to_string());
         }
         return Ok(BinaryCtlCommand::DisplayGet);
+    }
+    if cmd.eq_ignore_ascii_case("DISPLAY_WAIT") {
+        let last_seq = tokens
+            .next()
+            .ok_or_else(|| "display_wait_args_invalid".to_string())
+            .and_then(parse_u64)?;
+        let timeout_ms = tokens
+            .next()
+            .ok_or_else(|| "display_wait_args_invalid".to_string())
+            .and_then(parse_u32)?;
+        if tokens.next().is_some() {
+            return Err("display_wait_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::DisplayWait {
+            last_seq,
+            timeout_ms,
+        });
     }
     if cmd.eq_ignore_ascii_case("DISPLAY_SET") {
         let width = tokens
@@ -273,6 +309,7 @@ fn opcode_of(cmd: &BinaryCtlCommand) -> BinaryOpcode {
         BinaryCtlCommand::Ping => BinaryOpcode::Ping,
         BinaryCtlCommand::Version => BinaryOpcode::Version,
         BinaryCtlCommand::DisplayGet => BinaryOpcode::DisplayGet,
+        BinaryCtlCommand::DisplayWait { .. } => BinaryOpcode::DisplayWait,
         BinaryCtlCommand::DisplaySet { .. } => BinaryOpcode::DisplaySet,
         BinaryCtlCommand::TouchClear => BinaryOpcode::TouchClear,
         BinaryCtlCommand::TouchCount => BinaryOpcode::TouchCount,
@@ -292,6 +329,15 @@ fn payload_of(cmd: &BinaryCtlCommand) -> Vec<u8> {
         | BinaryCtlCommand::TouchCount
         | BinaryCtlCommand::RenderGet
         | BinaryCtlCommand::Shutdown => Vec::new(),
+        BinaryCtlCommand::DisplayWait {
+            last_seq,
+            timeout_ms,
+        } => {
+            let mut out = Vec::with_capacity(12);
+            out.extend_from_slice(&last_seq.to_le_bytes());
+            out.extend_from_slice(&timeout_ms.to_le_bytes());
+            out
+        }
         BinaryCtlCommand::DisplaySet {
             width,
             height,
@@ -462,6 +508,22 @@ pub fn format_response(cmd: &BinaryCtlCommand, resp: &BinaryCtlResponse) -> Stri
                 "OK {} {} {:.2} {} {}",
                 resp.values[0], resp.values[1], refresh, resp.values[3], resp.values[4]
             )
+        }
+        BinaryCtlCommand::DisplayWait { .. } => {
+            if resp.values[6] == 0 {
+                "OK TIMEOUT".to_string()
+            } else {
+                let refresh = f32::from_bits(resp.values[3] as u32);
+                format!(
+                    "OK {} {} {} {:.2} {} {}",
+                    resp.values[0],
+                    resp.values[1],
+                    resp.values[2],
+                    refresh,
+                    resp.values[4],
+                    resp.values[5]
+                )
+            }
         }
         BinaryCtlCommand::DisplaySet { .. } => "OK".to_string(),
         BinaryCtlCommand::TouchClear => "OK".to_string(),

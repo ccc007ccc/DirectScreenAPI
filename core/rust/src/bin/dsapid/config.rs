@@ -16,6 +16,7 @@ pub(super) struct DaemonConfig {
     pub(super) socket_rw_timeout_ms: u64,
     pub(super) command_max_bytes: usize,
     pub(super) allowed_uids: HashSet<u32>,
+    pub(super) auth_permissive: bool,
 }
 
 fn parse_u64_arg(token: &str) -> Result<u64, String> {
@@ -64,17 +65,18 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
-                .map(|v| v.get().min(4))
-                .unwrap_or(2)
+                .map(|v| v.get().min(8).max(4))
+                .unwrap_or(4)
         });
     let mut socket_rw_timeout_ms = std::env::var("DSAPI_SOCKET_RW_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(5000);
+        .unwrap_or(30000);
     let mut command_max_bytes = std::env::var("DSAPI_COMMAND_MAX_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4096usize);
+    let auth_permissive = parse_auth_permissive_from_env();
 
     let mut i = 1usize;
     while i < args.len() {
@@ -201,6 +203,7 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
         socket_rw_timeout_ms,
         command_max_bytes,
         allowed_uids,
+        auth_permissive,
     })
 }
 
@@ -211,6 +214,18 @@ fn parse_allowed_uids_from_env() -> Result<HashSet<u32>, String> {
         _ => {
             let mut out = HashSet::new();
             out.insert(default_uid);
+            #[cfg(target_os = "android")]
+            {
+                // Android 常见部署路径里，daemon 与客户端经常跨 uid
+                // (Termux 用户 <-> root)。默认放通 root 与 tsu/su 来源 uid，
+                // 避免因为脚本/会话切换导致渲染与输入链路被鉴权拦截。
+                out.insert(0);
+                for key in ["TSU_UID", "SUDO_UID", "KSU_UID", "MAGISKSU_UID"] {
+                    if let Some(uid) = parse_uid_from_env(key) {
+                        out.insert(uid);
+                    }
+                }
+            }
             return Ok(out);
         }
     };
@@ -231,6 +246,47 @@ fn parse_allowed_uids_from_env() -> Result<HashSet<u32>, String> {
         return Err("allowed_uids_empty".to_string());
     }
     Ok(out)
+}
+
+fn parse_uid_from_env(key: &str) -> Option<u32> {
+    let raw = std::env::var(key).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<u32>().ok()
+}
+
+fn parse_auth_permissive_from_env() -> bool {
+    if let Ok(raw) = std::env::var("DSAPI_AUTH_PERMISSIVE") {
+        let v = raw.trim();
+        if v.eq_ignore_ascii_case("1")
+            || v.eq_ignore_ascii_case("true")
+            || v.eq_ignore_ascii_case("yes")
+            || v.eq_ignore_ascii_case("on")
+        {
+            return true;
+        }
+        if v.eq_ignore_ascii_case("0")
+            || v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("no")
+            || v.eq_ignore_ascii_case("off")
+        {
+            return false;
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        // Android 本地调试阶段默认放开 peer uid 鉴权，避免 root/tsu/termux
+        // 多 uid 组合导致控制面或数据面被拒绝，影响联调效率。
+        true
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        false
+    }
 }
 
 pub(super) fn ensure_parent(path: &Path) -> std::io::Result<()> {

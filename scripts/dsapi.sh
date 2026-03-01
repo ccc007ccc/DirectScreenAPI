@@ -9,11 +9,12 @@ usage() {
 usage:
   ./scripts/dsapi.sh daemon start|stop|status|cmd <COMMAND ...>
   ./scripts/dsapi.sh presenter start|stop|status|run
+  ./scripts/dsapi.sh screen start|stop|status|run|bench [samples]
   ./scripts/dsapi.sh touch start|stop|status|run
   ./scripts/dsapi.sh android probe [display-kv|display-line]
   ./scripts/dsapi.sh android sync-display
   ./scripts/dsapi.sh frame pull <out_rgba_path>
-  ./scripts/dsapi.sh build core|android|c-example
+  ./scripts/dsapi.sh build core|android|c-example|framepull
   ./scripts/dsapi.sh check|fix
 USAGE
 }
@@ -89,6 +90,17 @@ pid_cmdline_contains() {
   tr '\0' ' ' < "/proc/$pid/cmdline" | grep -F -- "$needle" >/dev/null 2>&1
 }
 
+pid_is_running() {
+  pid="$1"
+  if [ -z "$pid" ]; then
+    return 1
+  fi
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    return 0
+  fi
+  [ -d "/proc/$pid" ]
+}
+
 ensure_release_ctl() {
   if [ ! -x "$(release_bin dsapictl)" ]; then
     ./scripts/build_core.sh >/dev/null
@@ -99,6 +111,7 @@ ensure_release_ctl() {
 # 子命令实现拆分，降低主脚本复杂度。
 . ./scripts/dsapi_daemon.sh
 . ./scripts/dsapi_presenter.sh
+. ./scripts/dsapi_screen.sh
 . ./scripts/dsapi_touch.sh
 . ./scripts/dsapi_android.sh
 . ./scripts/dsapi_frame.sh
@@ -117,6 +130,10 @@ build_impl() {
     c-example)
       shift
       ./scripts/build_c_example.sh "$@"
+      ;;
+    framepull)
+      shift
+      ./scripts/build_framepull.sh "$@"
       ;;
     *)
       echo "dsapi_error=build_subcommand_invalid subcommand=${sub:-<empty>}"
@@ -150,6 +167,22 @@ run_presenter() {
     run) shift; presenter_run_impl "$@" ;;
     *)
       echo "dsapi_error=presenter_subcommand_invalid subcommand=${sub:-<empty>}"
+      usage
+      return 1
+      ;;
+  esac
+}
+
+run_screen() {
+  sub="${1:-}"
+  case "$sub" in
+    start) shift; screen_start_impl "$@" ;;
+    stop) shift; screen_stop_impl "$@" ;;
+    status) shift; screen_status_impl "$@" ;;
+    run) shift; screen_run_impl "$@" ;;
+    bench) shift; screen_bench_impl "$@" ;;
+    *)
+      echo "dsapi_error=screen_subcommand_invalid subcommand=${sub:-<empty>}"
       usage
       return 1
       ;;
@@ -207,6 +240,7 @@ shift
 case "$cmd" in
   daemon) run_daemon "$@" ;;
   presenter) run_presenter "$@" ;;
+  screen) run_screen "$@" ;;
   touch) run_touch "$@" ;;
   android) run_android "$@" ;;
   frame) run_frame "$@" ;;

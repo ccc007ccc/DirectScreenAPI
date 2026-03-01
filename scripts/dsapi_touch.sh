@@ -1,17 +1,17 @@
 touch_stop_impl() {
-  CONTROL_SOCKET_PATH="$(control_socket_path)"
-  DATA_SOCKET_PATH="$(data_socket_path)"
-  PID_FILE="${DSAPI_TOUCH_BRIDGE_PID_FILE:-artifacts/run/dsapi_touch_bridge.pid}"
-  SUPERVISE_INPUT="${DSAPI_SUPERVISE_INPUT:-0}"
-  DSAPICTL_BIN="$(release_bin dsapictl)"
+  TOUCH_CONTROL_SOCKET_PATH="$(control_socket_path)"
+  TOUCH_DATA_SOCKET_PATH="$(data_socket_path)"
+  TOUCH_PID_FILE="${DSAPI_TOUCH_BRIDGE_PID_FILE:-artifacts/run/dsapi_touch_bridge.pid}"
+  TOUCH_SUPERVISE_INPUT="${DSAPI_SUPERVISE_INPUT:-0}"
+  TOUCH_CTL_BIN="$(release_bin dsapictl)"
 
-  if [ "$SUPERVISE_INPUT" = "1" ]; then
+  if [ "$TOUCH_SUPERVISE_INPUT" = "1" ]; then
     echo "touch_bridge_status=managed_by_daemon supervise=1 action=use_daemon_stop"
     return 0
   fi
 
-  if [ -f "$PID_FILE" ]; then
-    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [ -f "$TOUCH_PID_FILE" ]; then
+    pid="$(cat "$TOUCH_PID_FILE" 2>/dev/null || true)"
     if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
       if pid_cmdline_contains "$pid" "dsapi.sh touch run"; then
         kill -- "-$pid" >/dev/null 2>&1 || kill "$pid" >/dev/null 2>&1 || true
@@ -21,11 +21,11 @@ touch_stop_impl() {
         echo "touch_bridge_warn=pid_cmdline_mismatch pid=$pid expected='dsapi.sh touch run'"
       fi
     fi
-    rm -f "$PID_FILE"
+    rm -f "$TOUCH_PID_FILE"
   fi
 
-  if [ -x "$DSAPICTL_BIN" ] && [ -S "$CONTROL_SOCKET_PATH" ]; then
-    "$DSAPICTL_BIN" --socket "$CONTROL_SOCKET_PATH" TOUCH_CLEAR >/dev/null 2>&1 || true
+  if [ -x "$TOUCH_CTL_BIN" ] && [ -S "$TOUCH_CONTROL_SOCKET_PATH" ]; then
+    "$TOUCH_CTL_BIN" --socket "$TOUCH_CONTROL_SOCKET_PATH" TOUCH_CLEAR >/dev/null 2>&1 || true
   fi
 
   echo "touch_bridge_status=stopped"
@@ -244,26 +244,26 @@ touch_run_impl() {
 }
 
 touch_start_impl() {
-  PID_FILE="${DSAPI_TOUCH_BRIDGE_PID_FILE:-artifacts/run/dsapi_touch_bridge.pid}"
-  LOG_FILE="${DSAPI_TOUCH_BRIDGE_LOG_FILE:-artifacts/run/dsapi_touch_bridge.log}"
-  SUPERVISE_INPUT="${DSAPI_SUPERVISE_INPUT:-0}"
+  TOUCH_PID_FILE="${DSAPI_TOUCH_BRIDGE_PID_FILE:-artifacts/run/dsapi_touch_bridge.pid}"
+  TOUCH_LOG_FILE="${DSAPI_TOUCH_BRIDGE_LOG_FILE:-artifacts/run/dsapi_touch_bridge.log}"
+  TOUCH_SUPERVISE_INPUT="${DSAPI_SUPERVISE_INPUT:-0}"
 
-  mkdir -p "$(dirname "$PID_FILE")"
-  mkdir -p "$(dirname "$LOG_FILE")"
+  mkdir -p "$(dirname "$TOUCH_PID_FILE")"
+  mkdir -p "$(dirname "$TOUCH_LOG_FILE")"
 
-  if [ "$SUPERVISE_INPUT" = "1" ]; then
+  if [ "$TOUCH_SUPERVISE_INPUT" = "1" ]; then
     daemon_start_impl >/dev/null
     echo "touch_bridge_status=managed_by_daemon supervise=1"
     return 0
   fi
 
-  if [ -f "$PID_FILE" ]; then
-    old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [ -f "$TOUCH_PID_FILE" ]; then
+    old_pid="$(cat "$TOUCH_PID_FILE" 2>/dev/null || true)"
     if [ -n "$old_pid" ] && kill -0 "$old_pid" >/dev/null 2>&1; then
       echo "touch_bridge_status=already_running pid=$old_pid"
       return 0
     fi
-    rm -f "$PID_FILE"
+    rm -f "$TOUCH_PID_FILE"
   fi
 
   if ! daemon_status_impl >/dev/null 2>&1; then
@@ -272,13 +272,13 @@ touch_start_impl() {
 
   ./scripts/build_core.sh >/dev/null
 
-  nohup setsid ./scripts/dsapi.sh touch run >>"$LOG_FILE" 2>&1 < /dev/null &
+  nohup setsid ./scripts/dsapi.sh touch run >>"$TOUCH_LOG_FILE" 2>&1 < /dev/null &
   pid="$!"
-  echo "$pid" > "$PID_FILE"
+  echo "$pid" > "$TOUCH_PID_FILE"
 
   sleep 0.3
   if kill -0 "$pid" >/dev/null 2>&1; then
-    echo "touch_bridge_status=started pid=$pid log=$LOG_FILE"
+    echo "touch_bridge_status=started pid=$pid log=$TOUCH_LOG_FILE"
     return 0
   fi
 
@@ -287,10 +287,10 @@ touch_start_impl() {
 }
 
 touch_status_impl() {
-  PID_FILE="${DSAPI_TOUCH_BRIDGE_PID_FILE:-artifacts/run/dsapi_touch_bridge.pid}"
-  SUPERVISE_INPUT="${DSAPI_SUPERVISE_INPUT:-0}"
+  TOUCH_PID_FILE="${DSAPI_TOUCH_BRIDGE_PID_FILE:-artifacts/run/dsapi_touch_bridge.pid}"
+  TOUCH_SUPERVISE_INPUT="${DSAPI_SUPERVISE_INPUT:-0}"
 
-  if [ "$SUPERVISE_INPUT" = "1" ]; then
+  if [ "$TOUCH_SUPERVISE_INPUT" = "1" ]; then
     if daemon_status_impl >/dev/null 2>&1; then
       echo "touch_bridge_status=managed_by_daemon supervise=1"
       return 0
@@ -299,8 +299,8 @@ touch_status_impl() {
     return 2
   fi
 
-  if [ -f "$PID_FILE" ]; then
-    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [ -f "$TOUCH_PID_FILE" ]; then
+    pid="$(cat "$TOUCH_PID_FILE" 2>/dev/null || true)"
     if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
       echo "touch_bridge_status=running pid=$pid"
       return 0

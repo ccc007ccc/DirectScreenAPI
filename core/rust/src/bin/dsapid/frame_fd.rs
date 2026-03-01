@@ -10,6 +10,7 @@ use directscreen_core::api::{RenderFrameInfo, Status, RENDER_MAX_FRAME_BYTES};
 use directscreen_core::engine::RuntimeEngine;
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 
+use super::dsapid_parse::ShmFrameSubmitRequest;
 use super::write_status_error;
 
 const INITIAL_BOUND_FD_CAPACITY: usize = 512 * 1024;
@@ -146,7 +147,15 @@ fn send_line_with_fd(stream: &UnixStream, line: &str, fd: i32) -> std::io::Resul
 }
 
 fn create_bound_frame_shm(engine: &Arc<RuntimeEngine>) -> std::io::Result<BoundFrameFd> {
-    let frame_capacity = engine.render_frame_byte_len().unwrap_or(0);
+    let display_capacity = {
+        let d = engine.display_state();
+        (d.width as usize)
+            .checked_mul(d.height as usize)
+            .and_then(|v| v.checked_mul(4))
+            .unwrap_or(0)
+    };
+    let last_frame_capacity = engine.render_frame_byte_len().unwrap_or(0);
+    let frame_capacity = display_capacity.max(last_frame_capacity);
     let capacity = frame_capacity.clamp(INITIAL_BOUND_FD_CAPACITY, RENDER_MAX_FRAME_BYTES);
     let data_offset = align_up(size_of::<SharedFrameMeta>(), SHM_META_ALIGN);
     let total_len = data_offset
@@ -287,6 +296,45 @@ pub(super) fn handle_frame_wait_shm_present(
         frame.byte_len,
         frame.checksum_fnv1a32,
         meta.offset
+    );
+    stream.write_all(line.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
+pub(super) fn handle_frame_submit_shm(
+    stream: &mut UnixStream,
+    engine: &Arc<RuntimeEngine>,
+    bound_fd: &mut BoundFrameFd,
+    req: ShmFrameSubmitRequest,
+) -> std::io::Result<()> {
+    if req.byte_len > bound_fd.capacity {
+        write_status_error(stream, Status::OutOfRange);
+        return Ok(());
+    }
+    let end = req
+        .offset
+        .checked_add(req.byte_len)
+        .ok_or_else(|| std::io::Error::other("submit_shm_offset_overflow"))?;
+
+    let mapped = bound_fd.region.as_mut_slice();
+    if end > mapped.len() {
+        write_status_error(stream, Status::OutOfRange);
+        return Ok(());
+    }
+
+    let pixels = mapped[req.offset..end].to_vec();
+    let frame = match engine.submit_render_frame_rgba(req.width, req.height, pixels) {
+        Ok(v) => v,
+        Err(status) => {
+            write_status_error(stream, status);
+            return Ok(());
+        }
+    };
+
+    let line = format!(
+        "OK {} {} {} RGBA8888 {} {}\n",
+        frame.frame_seq, frame.width, frame.height, frame.byte_len, frame.checksum_fnv1a32
     );
     stream.write_all(line.as_bytes())?;
     stream.flush()?;

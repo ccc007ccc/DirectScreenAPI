@@ -9,6 +9,7 @@
 ## API
 
 - `api/c_abi.md`
+- `api/screen_stream.md`
 
 ## 指南
 

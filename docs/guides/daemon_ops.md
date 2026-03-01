@@ -45,6 +45,15 @@
 ./scripts/dsapi.sh touch status
 ```
 
+启动 root 全屏采集流（写入 daemon 当前帧）：
+
+```sh
+./scripts/dsapi.sh android sync-display
+DSAPI_ANDROID_OUT_DIR=artifacts/android_user DSAPI_SCREEN_RUN_AS_ROOT=1 ./scripts/dsapi.sh screen start
+./scripts/dsapi.sh screen status
+./scripts/dsapi.sh frame pull artifacts/frame/screen_latest.rgba
+```
+
 Supervisor 启动（推荐统一进程编排）：
 
 ```sh
@@ -79,5 +88,13 @@ DSAPI_SUPERVISE_PRESENTER=1 DSAPI_SUPERVISE_INPUT=1 ./scripts/dsapi.sh daemon st
 - `DSAPI_SUPERVISE_INPUT_CMD`
 - `DSAPI_SUPERVISE_RESTART_MS`
 - `DSAPI_MAX_CONNECTIONS`
+- `DSAPI_SCREEN_RUN_AS_ROOT`
+- `DSAPI_SCREEN_TARGET_FPS`
+- `DSAPI_SCREEN_LOG_FILE`
+- `DSAPI_SCREEN_PID_FILE`
+- `DSAPI_FRAME_PULL_TIMEOUT_MS`
+- `DSAPI_FRAME_WAIT_TIMEOUT_MS`
+- `DSAPI_FRAME_PULL_RETRIES`
+- `DSAPI_FRAME_PULL_RETRY_DELAY_MS`
 
 可用于多实例隔离运行与路径定制。

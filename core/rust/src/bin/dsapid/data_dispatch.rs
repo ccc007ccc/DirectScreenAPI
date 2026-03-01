@@ -5,8 +5,13 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use super::dsapid_frame_fd::{handle_frame_bind_shm, handle_frame_wait_shm_present, BoundFrameFd};
-use super::dsapid_parse::{parse_frame_bind_shm_request, parse_frame_wait_shm_present_request};
+use super::dsapid_frame_fd::{
+    handle_frame_bind_shm, handle_frame_submit_shm, handle_frame_wait_shm_present, BoundFrameFd,
+};
+use super::dsapid_parse::{
+    parse_frame_bind_shm_request, parse_frame_submit_shm_request,
+    parse_frame_wait_shm_present_request,
+};
 use super::{handle_touch_stream_v1, read_command_line, write_internal_error, write_status_error};
 
 pub(super) fn handle_data_client(
@@ -72,6 +77,25 @@ pub(super) fn handle_data_client(
                             &mut stream,
                             &format!("wait_shm_present_failed:{}", e),
                         );
+                        break;
+                    }
+                    continue;
+                }
+
+                let submit_shm = match parse_frame_submit_shm_request(&line) {
+                    Ok(v) => v,
+                    Err(status) => {
+                        write_status_error(&mut stream, status);
+                        continue;
+                    }
+                };
+                if let Some(req) = submit_shm {
+                    let Some(bound) = bound_frame_fd.as_mut() else {
+                        write_status_error(&mut stream, Status::InvalidArgument);
+                        continue;
+                    };
+                    if let Err(e) = handle_frame_submit_shm(&mut stream, &engine, bound, req) {
+                        write_internal_error(&mut stream, &format!("submit_shm_failed:{}", e));
                         break;
                     }
                     continue;

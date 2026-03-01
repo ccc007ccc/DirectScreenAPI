@@ -30,6 +30,7 @@ pub enum BinaryOpcode {
     TouchMove = 8,
     RenderSubmit = 9,
     RenderGet = 10,
+    DisplayWait = 11,
 }
 
 impl BinaryOpcode {
@@ -45,6 +46,7 @@ impl BinaryOpcode {
             8 => Some(Self::TouchMove),
             9 => Some(Self::RenderSubmit),
             10 => Some(Self::RenderGet),
+            11 => Some(Self::DisplayWait),
             _ => None,
         }
     }
@@ -67,6 +69,12 @@ pub struct BinaryDisplaySetPayload {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct BinaryDisplayWaitPayload {
+    pub last_seq: u64,
+    pub timeout_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct BinaryRenderSubmitPayload {
     pub draw_calls: u32,
     pub frost_passes: u32,
@@ -86,6 +94,10 @@ pub enum BinaryCommand {
     },
     DisplayGet {
         seq: u64,
+    },
+    DisplayWait {
+        seq: u64,
+        payload: BinaryDisplayWaitPayload,
     },
     DisplaySet {
         seq: u64,
@@ -217,6 +229,18 @@ pub fn parse_binary_command(frame: &[u8]) -> Result<BinaryCommand, Status> {
             }
             Ok(BinaryCommand::DisplayGet { seq: header.seq })
         }
+        BinaryOpcode::DisplayWait => {
+            if payload.len() != 12 {
+                return Err(Status::InvalidArgument);
+            }
+            Ok(BinaryCommand::DisplayWait {
+                seq: header.seq,
+                payload: BinaryDisplayWaitPayload {
+                    last_seq: read_u64_le(payload, 0)?,
+                    timeout_ms: read_u32_le(payload, 8)?,
+                },
+            })
+        }
         BinaryOpcode::DisplaySet => {
             if payload.len() != 20 {
                 return Err(Status::InvalidArgument);
@@ -340,6 +364,29 @@ pub fn execute_binary_command(engine: &RuntimeEngine, frame: &[u8]) -> BinaryRes
             resp.values[2] = d.refresh_hz.to_bits() as u64;
             resp.values[3] = d.density_dpi as u64;
             resp.values[4] = d.rotation as u64;
+            resp
+        }
+        BinaryCommand::DisplayWait { seq, payload } => {
+            let mut resp =
+                BinaryResponse::with_status(seq, BinaryOpcode::DisplayWait as u16, Status::Ok);
+            match engine.wait_for_display_after(payload.last_seq, payload.timeout_ms) {
+                Ok(Some((next_seq, d))) => {
+                    resp.values[0] = next_seq;
+                    resp.values[1] = d.width as u64;
+                    resp.values[2] = d.height as u64;
+                    resp.values[3] = d.refresh_hz.to_bits() as u64;
+                    resp.values[4] = d.density_dpi as u64;
+                    resp.values[5] = d.rotation as u64;
+                    resp.values[6] = 1;
+                }
+                Ok(None) => {
+                    resp.values[0] = payload.last_seq;
+                    resp.values[6] = 0;
+                }
+                Err(status) => {
+                    resp.status = status;
+                }
+            }
             resp
         }
         BinaryCommand::DisplaySet { seq, payload } => {

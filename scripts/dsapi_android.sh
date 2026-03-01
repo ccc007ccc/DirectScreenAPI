@@ -1,6 +1,13 @@
 android_probe_impl() {
   probe_cmd="${1:-display-kv}"
   OUT_DIR="${DSAPI_ANDROID_OUT_DIR:-artifacts/android}"
+  if [ -z "${DSAPI_ANDROID_OUT_DIR:-}" ]; then
+    if { [ -d "$OUT_DIR" ] && [ ! -w "$OUT_DIR" ]; } \
+      || { [ -d "$OUT_DIR/classes" ] && [ ! -w "$OUT_DIR/classes" ]; }; then
+      OUT_DIR="artifacts/android_user"
+      echo "android_probe_warn=android_out_dir_not_writable fallback_out_dir=$OUT_DIR"
+    fi
+  fi
   DEX_JAR="$OUT_DIR/directscreen-adapter-dex.jar"
   MAIN_CLASS="org.directscreenapi.adapter.AndroidAdapterMain"
   RUN_AS_ROOT="${DSAPI_RUN_AS_ROOT:-1}"
@@ -14,14 +21,23 @@ android_probe_impl() {
     *) DEX_JAR_ABS="$ROOT_DIR/$DEX_JAR" ;;
   esac
 
-  APP_PROCESS_BIN="${DSAPI_APP_PROCESS_BIN:-app_process}"
-  if ! command -v "$APP_PROCESS_BIN" >/dev/null 2>&1; then
+  APP_PROCESS_BIN="${DSAPI_APP_PROCESS_BIN:-}"
+  if [ -z "$APP_PROCESS_BIN" ]; then
     if [ -x /system/bin/app_process ]; then
       APP_PROCESS_BIN="/system/bin/app_process"
+    elif [ -x /system/bin/app_process64 ]; then
+      APP_PROCESS_BIN="/system/bin/app_process64"
+    elif [ -x /system/bin/app_process32 ]; then
+      APP_PROCESS_BIN="/system/bin/app_process32"
+    elif command -v app_process >/dev/null 2>&1; then
+      APP_PROCESS_BIN="$(command -v app_process)"
     else
       echo "android_probe_error=app_process_not_found"
       return 2
     fi
+  elif ! command -v "$APP_PROCESS_BIN" >/dev/null 2>&1 && [ ! -x "$APP_PROCESS_BIN" ]; then
+    echo "android_probe_error=app_process_not_found path=$APP_PROCESS_BIN"
+    return 2
   fi
 
   if [ "$RUN_AS_ROOT" = "1" ]; then

@@ -1,0 +1,14 @@
+[package]
+name = "dsapi-framepull"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Lightweight one-shot frame pull helper for DirectScreenAPI"
+
+[[bin]]
+name = "dsapiframepull"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+nix = { version = "0.29", features = ["socket", "uio"] }

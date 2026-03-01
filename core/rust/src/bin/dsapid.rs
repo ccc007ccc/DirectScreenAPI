@@ -233,6 +233,14 @@ fn handle_touch_stream_v1(
         match reader.read_exact(&mut packet) {
             Ok(()) => apply_touch_packet(engine, &packet),
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
             Err(e) => return Err(e),
         }
     }
@@ -352,6 +360,7 @@ fn try_acquire_connection(active_connections: &Arc<AtomicUsize>, max_connections
 
 struct DispatchContext {
     allowed_uids: Arc<std::collections::HashSet<u32>>,
+    auth_permissive: bool,
     active_connections: Arc<AtomicUsize>,
     max_connections: usize,
     dispatch_workers: usize,
@@ -379,7 +388,10 @@ impl DispatchPool {
         let mut handles = Vec::with_capacity(worker_count);
 
         for idx in 0..worker_count {
-            let (tx, rx) = mpsc::sync_channel::<WorkerJob>(ctx.max_connections.max(1));
+            // Rendezvous channel: only idle workers can accept a new job.
+            // This avoids queueing a short-lived request behind a long-lived
+            // stream on the same worker.
+            let (tx, rx) = mpsc::sync_channel::<WorkerJob>(0);
             let engine_ref = Arc::clone(&ctx.engine);
             let shutdown_ref = Arc::clone(&ctx.shutdown);
             let active_connections_ref = Arc::clone(&ctx.active_connections);
@@ -428,14 +440,25 @@ impl DispatchPool {
     }
 
     fn submit(&self, job: WorkerJob) -> Result<(), WorkerJob> {
-        if self.senders.is_empty() {
+        let worker_count = self.senders.len();
+        if worker_count == 0 {
             return Err(job);
         }
-        let idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.senders.len();
-        match self.senders[idx].try_send(job) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => Err(job),
+
+        let start_idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % worker_count;
+        let mut pending = Some(job);
+        for offset in 0..worker_count {
+            let idx = (start_idx + offset) % worker_count;
+            let candidate = pending.take().expect("pending_job_present");
+            match self.senders[idx].try_send(candidate) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => {
+                    pending = Some(job);
+                }
+            }
         }
+
+        Err(pending.expect("pending_job_present"))
     }
 
     fn stop(self) {
@@ -476,7 +499,7 @@ fn dispatch_accepted_client(
     dispatch_pool: &DispatchPool,
 ) {
     match socket_peer_uid(&stream) {
-        Ok(uid) if ctx.allowed_uids.contains(&uid) => {
+        Ok(uid) if ctx.auth_permissive || ctx.allowed_uids.contains(&uid) => {
             if !try_acquire_connection(&ctx.active_connections, ctx.max_connections) {
                 write_busy(&mut stream);
                 eprintln!(
@@ -545,7 +568,7 @@ fn dispatch_accepted_client(
             let _ = stream.write_all(b"ERR FORBIDDEN\n");
             let _ = stream.flush();
             eprintln!(
-                "daemon_warn=forbidden_peer socket_kind={} uid={}",
+                "daemon_warn=forbidden_peer socket_kind={} uid={} auth_permissive=0",
                 socket_kind, uid
             );
         }
@@ -695,6 +718,14 @@ fn main() {
         data_socket_path.display()
     );
     println!("daemon_auth_allowed_uids={}", allowed_uids_csv);
+    println!(
+        "daemon_auth_mode={}",
+        if cfg.auth_permissive {
+            "permissive"
+        } else {
+            "uid_whitelist"
+        }
+    );
 
     let engine = Arc::new(RuntimeEngine::new_with_render_output_dir(
         cfg.render_output_dir.clone(),
@@ -703,6 +734,7 @@ fn main() {
     let active_connections = Arc::new(AtomicUsize::new(0));
     let dispatch_ctx = DispatchContext {
         allowed_uids: Arc::clone(&allowed_uids),
+        auth_permissive: cfg.auth_permissive,
         active_connections: Arc::clone(&active_connections),
         max_connections: cfg.max_connections,
         dispatch_workers: cfg.dispatch_workers,

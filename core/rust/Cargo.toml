@@ -30,8 +30,8 @@ name = "dsapiinput"
 path = "src/bin/dsapiinput.rs"
 
 [[bin]]
-name = "test_touch_ui"
-path = "src/bin/test_touch_ui.rs"
+name = "dsapi_touch_demo"
+path = "src/bin/dsapi_touch_demo.rs"
 
 [dependencies]
 evdev = "0.12"

@@ -34,6 +34,7 @@ public final class AndroidAdapterMain {
         System.out.println("  AndroidAdapterMain display-kv");
         System.out.println("  AndroidAdapterMain display-line");
         System.out.println("  AndroidAdapterMain present-loop [control_socket_path] [data_socket_path] [poll_ms] [z_layer] [layer_name]");
+        System.out.println("  AndroidAdapterMain screen-stream [control_socket_path] [data_socket_path] [target_fps]");
     }
 
     private static void printDisplayKv(DisplayAdapter.DisplaySnapshot s) {
@@ -98,6 +99,30 @@ public final class AndroidAdapterMain {
             } catch (Throwable t) {
                 System.out.println("presenter_status=failed");
                 System.out.println("presenter_error=" + t.getClass().getName() + ":" + t.getMessage());
+                t.printStackTrace(System.out);
+                System.exit(2);
+            }
+        }
+        if ("screen-stream".equals(cmd)) {
+            String controlSocketPath = args.length > 1 ? args[1] : "artifacts/run/dsapi.sock";
+            String dataSocketPath = deriveDataSocketPath(controlSocketPath);
+            int baseIdx = 2;
+            if (args.length > 2 && !looksLikeInt(args[2])) {
+                dataSocketPath = args[2];
+                baseIdx = 3;
+            }
+            int targetFps = args.length > baseIdx ? parseInt(args[baseIdx], 60) : 60;
+            try {
+                ScreenCaptureStreamer streamer = new ScreenCaptureStreamer(
+                        controlSocketPath,
+                        dataSocketPath,
+                        targetFps
+                );
+                streamer.runLoop();
+                return;
+            } catch (Throwable t) {
+                System.out.println("screen_stream_status=failed");
+                System.out.println("screen_stream_error=" + t.getClass().getName() + ":" + t.getMessage());
                 t.printStackTrace(System.out);
                 System.exit(2);
             }

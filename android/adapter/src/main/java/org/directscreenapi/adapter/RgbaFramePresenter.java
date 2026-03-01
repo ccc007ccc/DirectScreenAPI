@@ -8,7 +8,8 @@ import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class RgbaFramePresenter {
-    private static final int DISPLAY_SYNC_FALLBACK_INTERVAL_MS = 5000;
+    private static final int DEFAULT_DISPLAY_SYNC_FALLBACK_INTERVAL_MS = 250;
+    private static final String DISPLAY_SYNC_FALLBACK_PROPERTY = "dsapi.display_sync_fallback_ms";
 
     private static final class DisplayListenerInvocationHandler implements InvocationHandler {
         private final AtomicBoolean dirtyFlag;
@@ -42,6 +43,7 @@ final class RgbaFramePresenter {
     private final DaemonSession daemon;
     private final AndroidDisplayAdapter displayAdapter;
     private final int pollMs;
+    private final int displaySyncFallbackIntervalMs;
     private final int zLayer;
     private final String layerName;
     private final AtomicBoolean shutdownOnce = new AtomicBoolean(false);
@@ -49,7 +51,6 @@ final class RgbaFramePresenter {
     private volatile boolean running = true;
     private long lastFrameSeq = -1L;
     private long lastDisplaySyncMs = 0L;
-    private long lastConnectWarnMs = 0L;
     private long perfWindowStartMs = 0L;
     private int perfFrames = 0;
     private long perfBytes = 0L;
@@ -87,6 +88,7 @@ final class RgbaFramePresenter {
         this.daemon = new DaemonSession(controlSocketPath, dataSocketPath);
         this.displayAdapter = new AndroidDisplayAdapter();
         this.pollMs = Math.max(1, pollMs);
+        this.displaySyncFallbackIntervalMs = resolveDisplaySyncFallbackIntervalMs();
         this.zLayer = zLayer;
         this.layerName = layerName;
 
@@ -111,80 +113,66 @@ final class RgbaFramePresenter {
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "dsapi-presenter-shutdown"));
         try {
             syncDisplayAndEnsureSurface();
-        } catch (Throwable t) {
-            log("presenter_warn=display_sync_failed err=" + t.getClass().getSimpleName());
-        }
-        log("presenter_status=started poll_ms=" + pollMs + " z_layer=" + zLayer + " layer=" + layerName);
+            log("presenter_status=started poll_ms=" + pollMs + " z_layer=" + zLayer + " layer=" + layerName);
 
-        while (running && !Thread.currentThread().isInterrupted()) {
-            long now = System.currentTimeMillis();
-            boolean shouldSync = displayDirty.getAndSet(false);
-            if (!shouldSync && (now - lastDisplaySyncMs >= DISPLAY_SYNC_FALLBACK_INTERVAL_MS)) {
-                shouldSync = true;
-            }
-            if (shouldSync) {
-                try {
-                    syncDisplayAndEnsureSurface();
-                } catch (Throwable t) {
-                    logConnectWarn("display_sync_failed", t);
+            while (running && !Thread.currentThread().isInterrupted()) {
+                long now = System.currentTimeMillis();
+                boolean shouldSync = displayDirty.getAndSet(false);
+                if (!shouldSync && (now - lastDisplaySyncMs >= displaySyncFallbackIntervalMs)) {
+                    shouldSync = true;
                 }
-                lastDisplaySyncMs = now;
-            }
+                if (shouldSync) {
+                    syncDisplayAndEnsureSurface();
+                    lastDisplaySyncMs = now;
+                }
 
-            DaemonSession.MappedFrame mappedFrame;
-            try {
-                mappedFrame = daemon.frameWaitBoundPresent(lastFrameSeq, pollMs);
-            } catch (Throwable t) {
-                logConnectWarn("frame_wait_bound_present_failed", t);
-                continue;
-            }
-            if (mappedFrame == null || mappedFrame.frameSeq == lastFrameSeq) {
-                if (mappedFrame != null) {
+                DaemonSession.MappedFrame mappedFrame = daemon.frameWaitBoundPresent(lastFrameSeq, pollMs);
+                if (mappedFrame == null || mappedFrame.frameSeq == lastFrameSeq) {
+                    if (mappedFrame != null) {
+                        mappedFrame.closeQuietly();
+                    }
+                    continue;
+                }
+
+                try {
+                    maybeSwitchSurfaceForFrame(mappedFrame.width, mappedFrame.height);
+                    if (mappedFrame.width == surfaceWidth && mappedFrame.height == surfaceHeight) {
+                        drawFrame(mappedFrame.width, mappedFrame.height, mappedFrame.rgba8);
+                        lastFrameSeq = mappedFrame.frameSeq;
+                        markFramePresented(mappedFrame.byteLen);
+                        continue;
+                    }
+
+                    if (pendingSurfaceSession != null
+                            && mappedFrame.width == pendingSurfaceWidth
+                            && mappedFrame.height == pendingSurfaceHeight) {
+                        drawFrameToTarget(
+                                pendingSurfaceSession,
+                                pendingDestRect,
+                                mappedFrame.rgba8,
+                                mappedFrame.width,
+                                mappedFrame.height
+                        );
+                        activatePendingSurface();
+                        lastFrameSeq = mappedFrame.frameSeq;
+                        markFramePresented(mappedFrame.byteLen);
+                        continue;
+                    }
+
+                    // 仅丢弃既不匹配当前 surface、也不匹配待切换尺寸的异常帧。
+                    log("presenter_warn=drop_mismatched_frame frame="
+                            + mappedFrame.width + "x" + mappedFrame.height
+                            + " surface=" + surfaceWidth + "x" + surfaceHeight
+                            + " pending=" + pendingSurfaceWidth + "x" + pendingSurfaceHeight
+                            + " seq=" + mappedFrame.frameSeq);
+                    lastFrameSeq = mappedFrame.frameSeq;
+                } finally {
                     mappedFrame.closeQuietly();
                 }
-                continue;
             }
-
-            try {
-                maybeSwitchSurfaceForFrame(mappedFrame.width, mappedFrame.height);
-                if (mappedFrame.width == surfaceWidth && mappedFrame.height == surfaceHeight) {
-                    drawFrame(mappedFrame.width, mappedFrame.height, mappedFrame.rgba8);
-                    lastFrameSeq = mappedFrame.frameSeq;
-                    markFramePresented(mappedFrame.byteLen);
-                    continue;
-                }
-
-                if (pendingSurfaceSession != null
-                        && mappedFrame.width == pendingSurfaceWidth
-                        && mappedFrame.height == pendingSurfaceHeight) {
-                    drawFrameToTarget(
-                            pendingSurfaceSession,
-                            pendingDestRect,
-                            mappedFrame.rgba8,
-                            mappedFrame.width,
-                            mappedFrame.height
-                    );
-                    activatePendingSurface();
-                    lastFrameSeq = mappedFrame.frameSeq;
-                    markFramePresented(mappedFrame.byteLen);
-                    continue;
-                }
-
-                // 仅丢弃既不匹配当前 surface、也不匹配待切换尺寸的异常帧。
-                log("presenter_warn=drop_mismatched_frame frame="
-                        + mappedFrame.width + "x" + mappedFrame.height
-                        + " surface=" + surfaceWidth + "x" + surfaceHeight
-                        + " pending=" + pendingSurfaceWidth + "x" + pendingSurfaceHeight
-                        + " seq=" + mappedFrame.frameSeq);
-                lastFrameSeq = mappedFrame.frameSeq;
-            } catch (Throwable t) {
-                log("presenter_warn=draw_failed seq=" + mappedFrame.frameSeq + " err=" + t.getClass().getSimpleName());
-            } finally {
-                mappedFrame.closeQuietly();
-            }
+        } finally {
+            shutdown();
         }
-
-        shutdown();
     }
 
     private void shutdown() {
@@ -359,15 +347,7 @@ final class RgbaFramePresenter {
         Object ht = null;
         boolean registered = false;
         try {
-            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
-            Method currentApplication = activityThreadClass.getMethod("currentApplication");
-            Object app = currentApplication.invoke(null);
-            if (app == null) {
-                log("presenter_warn=display_listener_no_application fallback=poll");
-                return;
-            }
-
-            dm = ReflectBridge.invoke(app, "getSystemService", "display");
+            dm = resolveDisplayManager();
             if (dm == null) {
                 log("presenter_warn=display_listener_no_display_manager fallback=poll");
                 return;
@@ -394,13 +374,13 @@ final class RgbaFramePresenter {
                     .getDeclaredConstructor(looperClass)
                     .newInstance(looper);
 
-            ReflectBridge.invoke(dm, "registerDisplayListener", listener, h);
+            registerDisplayListenerCompat(dm, listener, h);
             registered = true;
 
             displayManager = dm;
             displayListener = listener;
             displayListenerThread = ht;
-            log("presenter_status=display_listener_enabled");
+            log("presenter_status=display_listener_enabled backend=" + dm.getClass().getName());
         } catch (Throwable t) {
             if (registered && dm != null && listener != null) {
                 try {
@@ -420,6 +400,134 @@ final class RgbaFramePresenter {
             }
             log("presenter_warn=display_listener_init_failed err=" + t.getClass().getSimpleName() + " fallback=poll");
         }
+    }
+
+    private static int resolveDisplaySyncFallbackIntervalMs() {
+        int value = DEFAULT_DISPLAY_SYNC_FALLBACK_INTERVAL_MS;
+        try {
+            String raw = System.getProperty(DISPLAY_SYNC_FALLBACK_PROPERTY);
+            if (raw == null || raw.trim().isEmpty()) {
+                raw = System.getenv("DSAPI_DISPLAY_SYNC_FALLBACK_MS");
+            }
+            if (raw != null) {
+                value = Integer.parseInt(raw.trim());
+            }
+        } catch (Throwable ignored) {
+            value = DEFAULT_DISPLAY_SYNC_FALLBACK_INTERVAL_MS;
+        }
+        if (value < 50) {
+            return 50;
+        }
+        if (value > 5000) {
+            return 5000;
+        }
+        return value;
+    }
+
+    private Object resolveDisplayManager() {
+        try {
+            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
+            Method currentApplication = activityThreadClass.getMethod("currentApplication");
+            Object app = currentApplication.invoke(null);
+            if (app != null) {
+                Object dm = ReflectBridge.invoke(app, "getSystemService", "display");
+                if (dm != null) {
+                    return dm;
+                }
+            } else {
+                log("presenter_warn=display_listener_no_application try_global");
+            }
+        } catch (Throwable t) {
+            log("presenter_warn=display_manager_from_app_failed err=" + t.getClass().getSimpleName());
+        }
+
+        try {
+            Class<?> globalClass = Class.forName("android.hardware.display.DisplayManagerGlobal");
+            Object global = ReflectBridge.invokeStatic(globalClass, "getInstance");
+            if (global != null) {
+                log("presenter_status=display_listener_using_global");
+                return global;
+            }
+        } catch (Throwable t) {
+            log("presenter_warn=display_manager_global_failed err=" + t.getClass().getSimpleName());
+        }
+        return null;
+    }
+
+    private static boolean isArgAssignable(Class<?> paramType, Object arg) {
+        if (arg == null) {
+            return !paramType.isPrimitive();
+        }
+        Class<?> argType = arg.getClass();
+        if (paramType.isAssignableFrom(argType)) {
+            return true;
+        }
+        if (!paramType.isPrimitive()) {
+            return false;
+        }
+        if (paramType == int.class && argType == Integer.class) return true;
+        if (paramType == long.class && argType == Long.class) return true;
+        if (paramType == boolean.class && argType == Boolean.class) return true;
+        return false;
+    }
+
+    private static Object defaultExtraArg(Class<?> type) {
+        if (type == int.class || type == Integer.class) {
+            return Integer.valueOf(Integer.MAX_VALUE);
+        }
+        if (type == long.class || type == Long.class) {
+            return Long.valueOf(Long.MAX_VALUE);
+        }
+        if (type == String.class) {
+            return "directscreenapi";
+        }
+        if (type == boolean.class || type == Boolean.class) {
+            return Boolean.FALSE;
+        }
+        if (!type.isPrimitive()) {
+            return null;
+        }
+        return null;
+    }
+
+    private static void registerDisplayListenerCompat(Object dm, Object listener, Object handler) throws Exception {
+        Method[] methods = dm.getClass().getMethods();
+        for (Method m : methods) {
+            if (!"registerDisplayListener".equals(m.getName())) {
+                continue;
+            }
+            Class<?>[] params = m.getParameterTypes();
+            if (params.length < 2 || params.length > 4) {
+                continue;
+            }
+            if (!isArgAssignable(params[0], listener) || !isArgAssignable(params[1], handler)) {
+                continue;
+            }
+
+            Object[] args = new Object[params.length];
+            args[0] = listener;
+            args[1] = handler;
+            boolean ok = true;
+            for (int i = 2; i < params.length; i++) {
+                Object extra = defaultExtraArg(params[i]);
+                if (extra == null && params[i].isPrimitive()) {
+                    ok = false;
+                    break;
+                }
+                args[i] = extra;
+            }
+            if (!ok) {
+                continue;
+            }
+
+            try {
+                m.invoke(dm, args);
+                return;
+            } catch (Throwable ignored) {
+            }
+        }
+
+        ReflectBridge.invoke(dm, "registerDisplayListener", listener, handler);
     }
 
     private void ensureBitmap(int width, int height) throws Exception {
@@ -470,15 +578,6 @@ final class RgbaFramePresenter {
         perfWindowStartMs = now;
         perfFrames = 0;
         perfBytes = 0L;
-    }
-
-    private void logConnectWarn(String action, Throwable t) {
-        long now = System.currentTimeMillis();
-        if (now - lastConnectWarnMs < 1000L) {
-            return;
-        }
-        lastConnectWarnMs = now;
-        log("presenter_warn=" + action + " err=" + t.getClass().getSimpleName());
     }
 
     private static void log(String msg) {

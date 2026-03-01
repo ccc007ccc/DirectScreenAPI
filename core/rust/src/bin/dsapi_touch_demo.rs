@@ -1,0 +1,1471 @@
+use std::fs;
+use std::io::{self, IoSliceMut, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use directscreen_core::api::Status;
+use directscreen_core::client::{
+    spawn_touch_router, TouchMessage, TouchPhase, TouchRouterConfig, TouchRouterHandle,
+};
+use directscreen_core::util::{
+    ctl_wire, default_control_socket_path, derive_data_socket_path_text,
+};
+use evdev::{AbsoluteAxisType, Device};
+use font8x8::{UnicodeFonts, BASIC_FONTS};
+use nix::cmsg_space;
+use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
+
+const WINDOW_ARG_MIN_W: f32 = 120.0;
+const WINDOW_ARG_MIN_H: f32 = 90.0;
+const BASE_TITLE_HEIGHT_DP: f32 = 44.0;
+const BASE_RESIZE_HIT_DP: f32 = 42.0;
+const BASE_WINDOW_MIN_W_DP: f32 = 240.0;
+const BASE_WINDOW_MIN_H_DP: f32 = 170.0;
+const BASE_CLOSE_W_DP: f32 = 40.0;
+const BASE_CLOSE_H_DP: f32 = 32.0;
+const BASE_CLOSE_MARGIN_DP: f32 = 8.0;
+const BASE_CLOSE_TOP_DP: f32 = 6.0;
+
+#[derive(Debug, Clone, Copy)]
+struct DisplayInfo {
+    width: u32,
+    height: u32,
+    refresh_hz: f32,
+    density_dpi: u32,
+    rotation: u32,
+}
+
+#[derive(Debug)]
+struct BinaryControlClient {
+    stream: UnixStream,
+    seq: u64,
+}
+
+impl BinaryControlClient {
+    fn connect(socket_path: &str) -> io::Result<Self> {
+        let stream = UnixStream::connect(socket_path)?;
+        let timeout =
+            directscreen_core::util::timeout_from_env("DSAPI_CLIENT_TIMEOUT_MS", 5000, 100);
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+        Ok(Self { stream, seq: 1 })
+    }
+
+    fn request(
+        &mut self,
+        cmd: &ctl_wire::BinaryCtlCommand,
+    ) -> io::Result<ctl_wire::BinaryCtlResponse> {
+        ctl_wire::write_request(&mut self.stream, self.seq, cmd)?;
+        self.seq = self.seq.saturating_add(1);
+
+        let Some(resp) = ctl_wire::read_response(&mut self.stream)? else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "control_socket_closed",
+            ));
+        };
+        if resp.status != Status::Ok {
+            return Err(io::Error::other(format!(
+                "control_command_failed status={}",
+                resp.status.as_str()
+            )));
+        }
+        Ok(resp)
+    }
+
+    fn display_get(&mut self) -> io::Result<DisplayInfo> {
+        let resp = self.request(&ctl_wire::BinaryCtlCommand::DisplayGet)?;
+        Ok(DisplayInfo {
+            width: resp.values[0] as u32,
+            height: resp.values[1] as u32,
+            refresh_hz: f32::from_bits(resp.values[2] as u32),
+            density_dpi: resp.values[3] as u32,
+            rotation: resp.values[4] as u32,
+        })
+    }
+
+    fn display_wait_after(
+        &mut self,
+        last_seq: u64,
+        timeout_ms: u32,
+    ) -> io::Result<Option<(u64, DisplayInfo)>> {
+        let resp = self.request(&ctl_wire::BinaryCtlCommand::DisplayWait {
+            last_seq,
+            timeout_ms,
+        })?;
+        if resp.values[6] == 0 {
+            return Ok(None);
+        }
+        Ok(Some((
+            resp.values[0],
+            DisplayInfo {
+                width: resp.values[1] as u32,
+                height: resp.values[2] as u32,
+                refresh_hz: f32::from_bits(resp.values[3] as u32),
+                density_dpi: resp.values[4] as u32,
+                rotation: resp.values[5] as u32,
+            },
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct BoundMapping {
+    ptr: *mut u8,
+    len: usize,
+    capacity: usize,
+    data_offset: usize,
+}
+
+impl BoundMapping {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for BoundMapping {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.len > 0 {
+            let _ = unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
+            self.ptr = std::ptr::null_mut();
+            self.len = 0;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ShmSubmitClient {
+    data_socket_path: String,
+    stream: UnixStream,
+    mapping: BoundMapping,
+}
+
+impl ShmSubmitClient {
+    fn connect(data_socket_path: &str) -> io::Result<Self> {
+        let stream = UnixStream::connect(data_socket_path)?;
+        let timeout =
+            directscreen_core::util::timeout_from_env("DSAPI_CLIENT_TIMEOUT_MS", 5000, 100);
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+        let mapping = bind_mapping(&stream)?;
+        Ok(Self {
+            data_socket_path: data_socket_path.to_string(),
+            stream,
+            mapping,
+        })
+    }
+
+    fn submit_frame(&mut self, width: u32, height: u32, rgba: &[u8]) -> io::Result<()> {
+        let expected_len = frame_byte_len(width, height)?;
+        if expected_len != rgba.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "rgba_length_mismatch expected={} actual={}",
+                    expected_len,
+                    rgba.len()
+                ),
+            ));
+        }
+
+        if rgba.len() > self.mapping.capacity {
+            // 旧连接可能绑定了历史尺寸的 SHM，重连后重新绑定一次。
+            self.reconnect()?;
+        }
+        if rgba.len() > self.mapping.capacity {
+            return Err(io::Error::other(format!(
+                "bound_shm_capacity_too_small capacity={} frame_len={} reconnect=1",
+                self.mapping.capacity,
+                rgba.len()
+            )));
+        }
+
+        let begin = self.mapping.data_offset;
+        let end = begin
+            .checked_add(rgba.len())
+            .ok_or_else(|| io::Error::other("submit_offset_overflow"))?;
+        if end > self.mapping.len {
+            return Err(io::Error::other("submit_out_of_bound_mapping"));
+        }
+
+        self.mapping.as_mut_slice()[begin..end].copy_from_slice(rgba);
+
+        let cmd = format!(
+            "RENDER_FRAME_SUBMIT_SHM {} {} {} {}\n",
+            width,
+            height,
+            rgba.len(),
+            self.mapping.data_offset
+        );
+        self.stream.write_all(cmd.as_bytes())?;
+        self.stream.flush()?;
+        let line = read_line(&mut self.stream, 4096)?;
+        if !line.starts_with("OK") {
+            return Err(io::Error::other(format!("submit_failed response={}", line)));
+        }
+        Ok(())
+    }
+
+    fn reconnect(&mut self) -> io::Result<()> {
+        let new_stream = UnixStream::connect(&self.data_socket_path)?;
+        let timeout =
+            directscreen_core::util::timeout_from_env("DSAPI_CLIENT_TIMEOUT_MS", 5000, 100);
+        new_stream.set_read_timeout(timeout)?;
+        new_stream.set_write_timeout(timeout)?;
+        let mapping = bind_mapping(&new_stream)?;
+        self.stream = new_stream;
+        self.mapping = mapping;
+        Ok(())
+    }
+}
+
+fn bind_mapping(stream: &UnixStream) -> io::Result<BoundMapping> {
+    let mut stream = stream.try_clone()?;
+    stream.write_all(b"RENDER_FRAME_BIND_SHM\n")?;
+    stream.flush()?;
+
+    let (line, fd_opt) = recv_line_with_optional_fd(&stream, true)?;
+    let mut parts = line.split_whitespace();
+    let p0 = parts.next();
+    let p1 = parts.next();
+    let p2 = parts.next();
+    let p3 = parts.next();
+    if p0 != Some("OK")
+        || p1 != Some("SHM_BOUND")
+        || p2.is_none()
+        || p3.is_none()
+        || parts.next().is_some()
+    {
+        return Err(io::Error::other(format!(
+            "invalid_bind_response line={}",
+            line
+        )));
+    }
+
+    let capacity = p2
+        .and_then(|v| v.parse::<usize>().ok())
+        .ok_or_else(|| io::Error::other("invalid_bind_capacity"))?;
+    let data_offset = p3
+        .and_then(|v| v.parse::<usize>().ok())
+        .ok_or_else(|| io::Error::other("invalid_bind_offset"))?;
+    if capacity == 0 {
+        return Err(io::Error::other("bind_capacity_zero"));
+    }
+
+    let map_len = data_offset
+        .checked_add(capacity)
+        .ok_or_else(|| io::Error::other("bind_map_len_overflow"))?;
+    let fd = fd_opt.ok_or_else(|| io::Error::other("bind_missing_fd"))?;
+
+    let mapped = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    let _ = unsafe { libc::close(fd) };
+    if mapped == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(BoundMapping {
+        ptr: mapped as *mut u8,
+        len: map_len,
+        capacity,
+        data_offset,
+    })
+}
+
+fn recv_line_with_optional_fd(
+    stream: &UnixStream,
+    require_fd: bool,
+) -> io::Result<(String, Option<RawFd>)> {
+    let mut line: Vec<u8> = Vec::with_capacity(256);
+    let mut received_fd: Option<RawFd> = None;
+
+    loop {
+        let mut buf = [0u8; 1024];
+        let mut iov = [IoSliceMut::new(&mut buf)];
+        let mut cmsg = cmsg_space!([RawFd; 4]);
+        let bytes_read = {
+            let msg = recvmsg::<()>(
+                stream.as_raw_fd(),
+                &mut iov,
+                Some(&mut cmsg),
+                MsgFlags::empty(),
+            )
+            .map_err(io::Error::other)?;
+            if msg.bytes == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "data_socket_closed",
+                ));
+            }
+
+            let cmsgs = msg.cmsgs().map_err(io::Error::other)?;
+            for c in cmsgs {
+                if let ControlMessageOwned::ScmRights(fds) = c {
+                    for fd in fds {
+                        if received_fd.is_none() {
+                            received_fd = Some(fd);
+                        } else {
+                            let _ = unsafe { libc::close(fd) };
+                        }
+                    }
+                }
+            }
+            msg.bytes
+        };
+
+        for b in &buf[..bytes_read] {
+            if *b == b'\n' {
+                let text = String::from_utf8_lossy(&line).trim_end().to_string();
+                if require_fd && received_fd.is_none() {
+                    return Err(io::Error::other("required_fd_missing"));
+                }
+                return Ok((text, received_fd));
+            }
+            if *b != b'\r' {
+                line.push(*b);
+            }
+            if line.len() > 4096 {
+                return Err(io::Error::other("response_line_too_long"));
+            }
+        }
+    }
+}
+
+fn read_line(stream: &mut UnixStream, max_len: usize) -> io::Result<String> {
+    let mut out: Vec<u8> = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte)?;
+        if n == 0 {
+            if out.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "socket_closed",
+                ));
+            }
+            break;
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if byte[0] != b'\r' {
+            out.push(byte[0]);
+        }
+        if out.len() > max_len {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "line_too_long"));
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+fn frame_byte_len(width: u32, height: u32) -> io::Result<usize> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame_size_overflow"))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UiMetrics {
+    title_height: f32,
+    resize_hit: f32,
+    min_window_w: f32,
+    min_window_h: f32,
+    close_w: f32,
+    close_h: f32,
+    close_margin: f32,
+    close_top: f32,
+    title_text_scale: i32,
+    body_text_scale: i32,
+    body_line_step: i32,
+}
+
+fn ui_metrics(display: DisplayInfo) -> UiMetrics {
+    let density = if display.density_dpi > 0 {
+        display.density_dpi as f32 / 160.0
+    } else {
+        1.0
+    };
+    let control_scale = (1.0 + (density - 1.0) * 0.18).clamp(1.0, 1.45);
+    let min_scale = (1.0 + (density - 1.0) * 0.08).clamp(1.0, 1.20);
+    let body_text_scale = if density >= 2.6 { 2 } else { 1 };
+    let title_text_scale = body_text_scale;
+    let body_line_step = (9 * body_text_scale + 5).max(14);
+    let min_title_h = (10 * title_text_scale + 10) as f32;
+
+    UiMetrics {
+        title_height: (BASE_TITLE_HEIGHT_DP * control_scale).max(min_title_h),
+        resize_hit: BASE_RESIZE_HIT_DP * control_scale,
+        min_window_w: BASE_WINDOW_MIN_W_DP * min_scale,
+        min_window_h: BASE_WINDOW_MIN_H_DP * min_scale,
+        close_w: BASE_CLOSE_W_DP * control_scale,
+        close_h: BASE_CLOSE_H_DP * control_scale,
+        close_margin: BASE_CLOSE_MARGIN_DP * control_scale,
+        close_top: BASE_CLOSE_TOP_DP * control_scale,
+        title_text_scale,
+        body_text_scale,
+        body_line_step,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Args {
+    control_socket: String,
+    data_socket: String,
+    device_path: Option<String>,
+    route_name: String,
+    fps: f32,
+    run_seconds: Option<f32>,
+    no_touch_router: bool,
+    quiet: bool,
+    window_x: Option<f32>,
+    window_y: Option<f32>,
+    window_w: f32,
+    window_h: f32,
+}
+
+fn usage() {
+    eprintln!("usage:");
+    eprintln!("  dsapi_touch_demo [options]");
+    eprintln!("options:");
+    eprintln!("  --control-socket <path>   daemon control socket");
+    eprintln!("  --data-socket <path>      daemon data socket");
+    eprintln!("  --device <event_path>     touch input device path");
+    eprintln!("  --route-name <name>       touch route name (default: demo-window)");
+    eprintln!("  --fps <n>                 render fps cap (default: 60)");
+    eprintln!("  --run-seconds <n>         auto stop after n seconds");
+    eprintln!("  --window-x <n>            initial window x");
+    eprintln!("  --window-y <n>            initial window y");
+    eprintln!("  --window-w <n>            initial window width (default: 520)");
+    eprintln!("  --window-h <n>            initial window height (default: 360)");
+    eprintln!("  --no-touch-router         render only, do not capture touch");
+    eprintln!("  --quiet                   suppress runtime logs");
+    eprintln!("  -h, --help                show this help");
+}
+
+fn parse_f32(name: &str, raw: &str) -> Result<f32, String> {
+    raw.parse::<f32>()
+        .map_err(|_| format!("invalid_{}_value:{}", name, raw))
+}
+
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn parse_args(args: &[String]) -> Result<Args, String> {
+    let mut control_socket = env_non_empty("DSAPI_CONTROL_SOCKET_PATH")
+        .or_else(|| env_non_empty("DSAPI_SOCKET_PATH"))
+        .unwrap_or_else(default_control_socket_path);
+    let mut data_socket: Option<String> = env_non_empty("DSAPI_DATA_SOCKET_PATH");
+    let mut device_path: Option<String> = None;
+    let mut route_name = "demo-window".to_string();
+    let mut fps = 60.0f32;
+    let mut run_seconds: Option<f32> = None;
+    let mut no_touch_router = false;
+    let mut quiet = false;
+    let mut window_x: Option<f32> = None;
+    let mut window_y: Option<f32> = None;
+    let mut window_w = 520.0f32;
+    let mut window_h = 360.0f32;
+
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--control-socket" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_control_socket".to_string());
+                }
+                control_socket = args[i + 1].clone();
+                i += 2;
+            }
+            "--data-socket" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_data_socket".to_string());
+                }
+                data_socket = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--device" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_device_path".to_string());
+                }
+                device_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--route-name" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_route_name".to_string());
+                }
+                route_name = args[i + 1].clone();
+                i += 2;
+            }
+            "--fps" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_fps".to_string());
+                }
+                fps = parse_f32("fps", &args[i + 1])?;
+                i += 2;
+            }
+            "--run-seconds" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_run_seconds".to_string());
+                }
+                run_seconds = Some(parse_f32("run_seconds", &args[i + 1])?);
+                i += 2;
+            }
+            "--window-x" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_window_x".to_string());
+                }
+                window_x = Some(parse_f32("window_x", &args[i + 1])?);
+                i += 2;
+            }
+            "--window-y" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_window_y".to_string());
+                }
+                window_y = Some(parse_f32("window_y", &args[i + 1])?);
+                i += 2;
+            }
+            "--window-w" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_window_w".to_string());
+                }
+                window_w = parse_f32("window_w", &args[i + 1])?;
+                i += 2;
+            }
+            "--window-h" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_window_h".to_string());
+                }
+                window_h = parse_f32("window_h", &args[i + 1])?;
+                i += 2;
+            }
+            "--no-touch-router" => {
+                no_touch_router = true;
+                i += 1;
+            }
+            "--quiet" => {
+                quiet = true;
+                i += 1;
+            }
+            "-h" | "--help" => {
+                return Err("help".to_string());
+            }
+            other => {
+                return Err(format!("unknown_arg:{}", other));
+            }
+        }
+    }
+
+    if route_name.trim().is_empty() {
+        return Err("route_name_empty".to_string());
+    }
+    if !fps.is_finite() || fps <= 1.0 {
+        return Err("fps_must_be_gt_1".to_string());
+    }
+    if let Some(v) = run_seconds {
+        if !v.is_finite() || v <= 0.0 {
+            return Err("run_seconds_must_be_gt_0".to_string());
+        }
+    }
+    if !window_w.is_finite()
+        || !window_h.is_finite()
+        || window_w < WINDOW_ARG_MIN_W
+        || window_h < WINDOW_ARG_MIN_H
+    {
+        return Err("window_size_invalid".to_string());
+    }
+
+    Ok(Args {
+        data_socket: data_socket.unwrap_or_else(|| derive_data_socket_path_text(&control_socket)),
+        control_socket,
+        device_path,
+        route_name,
+        fps,
+        run_seconds,
+        no_touch_router,
+        quiet,
+        window_x,
+        window_y,
+        window_w,
+        window_h,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WindowState {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    visible: bool,
+}
+
+impl WindowState {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        self.visible && x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+
+    fn clamp_to_display(&mut self, display: DisplayInfo, metrics: UiMetrics) {
+        let max_w = display.width as f32;
+        let max_h = display.height as f32;
+        self.w = self
+            .w
+            .clamp(metrics.min_window_w, max_w.max(metrics.min_window_w));
+        self.h = self
+            .h
+            .clamp(metrics.min_window_h, max_h.max(metrics.min_window_h));
+        self.x = self.x.clamp(0.0, (max_w - self.w).max(0.0));
+        self.y = self.y.clamp(0.0, (max_h - self.h).max(0.0));
+    }
+
+    fn title_hit(&self, x: f32, y: f32, metrics: UiMetrics) -> bool {
+        self.contains(x, y) && y < self.y + metrics.title_height
+    }
+
+    fn resize_hit(&self, x: f32, y: f32, metrics: UiMetrics) -> bool {
+        self.contains(x, y)
+            && x >= self.x + self.w - metrics.resize_hit
+            && y >= self.y + self.h - metrics.resize_hit
+    }
+
+    fn close_hit(&self, x: f32, y: f32, metrics: UiMetrics) -> bool {
+        if !self.visible {
+            return false;
+        }
+        let left = self.x + self.w - metrics.close_w - metrics.close_margin;
+        let top = self.y + metrics.close_top;
+        x >= left && x <= left + metrics.close_w && y >= top && y <= top + metrics.close_h
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RouteSnapshot {
+    window: WindowState,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Interaction {
+    Idle,
+    Drag {
+        pointer_id: i32,
+        start_x: f32,
+        start_y: f32,
+        origin_x: f32,
+        origin_y: f32,
+    },
+    Resize {
+        pointer_id: i32,
+        start_x: f32,
+        start_y: f32,
+        origin_w: f32,
+        origin_h: f32,
+    },
+}
+
+impl Interaction {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Drag { .. } => "drag",
+            Self::Resize { .. } => "resize",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DemoState {
+    window: WindowState,
+    interaction: Interaction,
+    running: bool,
+    ui_event_count: u64,
+    last_latency_ms: f32,
+}
+
+impl DemoState {
+    fn new(window: WindowState) -> Self {
+        Self {
+            window,
+            interaction: Interaction::Idle,
+            running: true,
+            ui_event_count: 0,
+            last_latency_ms: 0.0,
+        }
+    }
+
+    fn apply_touch(&mut self, msg: TouchMessage, display: DisplayInfo) {
+        let metrics = ui_metrics(display);
+        self.last_latency_ms = msg.latency_ms;
+        match msg.phase {
+            TouchPhase::Clear => {
+                self.interaction = Interaction::Idle;
+            }
+            TouchPhase::Down => {
+                self.ui_event_count = self.ui_event_count.saturating_add(1);
+                if self.window.close_hit(msg.x, msg.y, metrics) {
+                    self.running = false;
+                    return;
+                }
+
+                if self.window.resize_hit(msg.x, msg.y, metrics) {
+                    self.interaction = Interaction::Resize {
+                        pointer_id: msg.pointer_id,
+                        start_x: msg.x,
+                        start_y: msg.y,
+                        origin_w: self.window.w,
+                        origin_h: self.window.h,
+                    };
+                    return;
+                }
+
+                if self.window.title_hit(msg.x, msg.y, metrics) {
+                    self.interaction = Interaction::Drag {
+                        pointer_id: msg.pointer_id,
+                        start_x: msg.x,
+                        start_y: msg.y,
+                        origin_x: self.window.x,
+                        origin_y: self.window.y,
+                    };
+                }
+            }
+            TouchPhase::Move => {
+                self.ui_event_count = self.ui_event_count.saturating_add(1);
+                match self.interaction {
+                    Interaction::Drag {
+                        pointer_id,
+                        start_x,
+                        start_y,
+                        origin_x,
+                        origin_y,
+                    } if pointer_id == msg.pointer_id => {
+                        self.window.x = origin_x + (msg.x - start_x);
+                        self.window.y = origin_y + (msg.y - start_y);
+                        self.window.clamp_to_display(display, metrics);
+                    }
+                    Interaction::Resize {
+                        pointer_id,
+                        start_x,
+                        start_y,
+                        origin_w,
+                        origin_h,
+                    } if pointer_id == msg.pointer_id => {
+                        self.window.w = origin_w + (msg.x - start_x);
+                        self.window.h = origin_h + (msg.y - start_y);
+                        self.window.clamp_to_display(display, metrics);
+                    }
+                    _ => {}
+                }
+            }
+            TouchPhase::Up => {
+                self.ui_event_count = self.ui_event_count.saturating_add(1);
+                match self.interaction {
+                    Interaction::Drag { pointer_id, .. }
+                    | Interaction::Resize { pointer_id, .. }
+                        if pointer_id == msg.pointer_id =>
+                    {
+                        self.interaction = Interaction::Idle;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+struct FpsCounter {
+    start_at: Instant,
+    frames: u32,
+    value: f32,
+}
+
+impl FpsCounter {
+    fn new() -> Self {
+        Self {
+            start_at: Instant::now(),
+            frames: 0,
+            value: 0.0,
+        }
+    }
+
+    fn on_frame(&mut self) -> f32 {
+        self.frames = self.frames.saturating_add(1);
+        let elapsed = self.start_at.elapsed().as_secs_f32();
+        if elapsed >= 0.5 {
+            self.value = self.frames as f32 / elapsed.max(0.001);
+            self.frames = 0;
+            self.start_at = Instant::now();
+        }
+        self.value
+    }
+}
+
+fn spawn_display_watch(
+    control_socket: String,
+    quiet: bool,
+    tx: mpsc::Sender<DisplayInfo>,
+    running: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut client = match BinaryControlClient::connect(&control_socket) {
+            Ok(v) => v,
+            Err(e) => {
+                if !quiet {
+                    eprintln!(
+                        "touch_demo_warn=display_wait_connect_failed socket={} err={}",
+                        control_socket, e
+                    );
+                }
+                return;
+            }
+        };
+
+        let mut last_seq = 0u64;
+        while running.load(Ordering::SeqCst) {
+            match client.display_wait_after(last_seq, 800) {
+                Ok(Some((next_seq, info))) => {
+                    last_seq = next_seq.max(last_seq);
+                    if tx.send(info).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    if !quiet {
+                        eprintln!("touch_demo_warn=display_wait_failed err={}", e);
+                    }
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let cfg = match parse_args(&args) {
+        Ok(v) => v,
+        Err(e) if e == "help" => {
+            usage();
+            std::process::exit(0);
+        }
+        Err(e) => {
+            usage();
+            eprintln!("touch_demo_error=parse_args_failed reason={}", e);
+            std::process::exit(2);
+        }
+    };
+
+    if !cfg.quiet {
+        eprintln!(
+            "touch_demo_status=boot control_socket={} data_socket={} route={}",
+            cfg.control_socket, cfg.data_socket, cfg.route_name
+        );
+    }
+
+    let mut control = match BinaryControlClient::connect(&cfg.control_socket) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "touch_demo_error=control_connect_failed socket={} err={}",
+                cfg.control_socket, e
+            );
+            std::process::exit(3);
+        }
+    };
+    let mut display = match control.display_get() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("touch_demo_error=display_get_failed err={}", e);
+            std::process::exit(4);
+        }
+    };
+    if display.width == 0 || display.height == 0 {
+        eprintln!(
+            "touch_demo_error=display_invalid width={} height={}",
+            display.width, display.height
+        );
+        std::process::exit(4);
+    }
+
+    let init_x = cfg
+        .window_x
+        .unwrap_or_else(|| ((display.width as f32 - cfg.window_w) * 0.5).max(0.0));
+    let init_y = cfg
+        .window_y
+        .unwrap_or_else(|| ((display.height as f32 - cfg.window_h) * 0.35).max(0.0));
+    let mut state = DemoState::new(WindowState {
+        x: init_x,
+        y: init_y,
+        w: cfg.window_w,
+        h: cfg.window_h,
+        visible: true,
+    });
+    state.window.clamp_to_display(display, ui_metrics(display));
+
+    let route_state = Arc::new(Mutex::new(RouteSnapshot {
+        window: state.window,
+    }));
+    let route_blocked_down = Arc::new(AtomicU64::new(0));
+    let route_passed_down = Arc::new(AtomicU64::new(0));
+    let (touch_tx, touch_rx) = mpsc::channel::<TouchMessage>();
+    let (display_tx, display_rx) = mpsc::channel::<DisplayInfo>();
+    let display_watch_running = Arc::new(AtomicBool::new(true));
+    let display_watch_handle = spawn_display_watch(
+        cfg.control_socket.clone(),
+        cfg.quiet,
+        display_tx,
+        Arc::clone(&display_watch_running),
+    );
+
+    let mut touch_handle: Option<TouchRouterHandle> = None;
+    if !cfg.no_touch_router {
+        let device_path = match cfg.device_path.clone() {
+            Some(v) => v,
+            None => match detect_touch_device() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("touch_demo_error=touch_device_not_found err={}", e);
+                    if e.kind() == io::ErrorKind::PermissionDenied {
+                        eprintln!(
+                            "touch_demo_hint=permission_denied_reading_/dev/input_use_su_or_root"
+                        );
+                    }
+                    eprintln!(
+                        "touch_demo_hint=use_--device_/dev/input/eventX_or_--no-touch-router"
+                    );
+                    std::process::exit(5);
+                }
+            },
+        };
+
+        let route_blocked_ref = Arc::clone(&route_blocked_down);
+        let route_passed_ref = Arc::clone(&route_passed_down);
+        let router_cfg = TouchRouterConfig {
+            control_socket_path: cfg.control_socket.clone(),
+            data_socket_path: cfg.data_socket.clone(),
+            route_name: cfg.route_name.clone(),
+            device_path: device_path.clone(),
+            screen_width: display.width,
+            screen_height: display.height,
+            rotation: display.rotation as i32,
+            quiet: cfg.quiet,
+        };
+
+        let router = match spawn_touch_router(
+            router_cfg,
+            Arc::clone(&route_state),
+            move |snapshot: RouteSnapshot, x: f32, y: f32| {
+                let blocked = snapshot.window.contains(x, y);
+                if blocked {
+                    route_blocked_ref.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    route_passed_ref.fetch_add(1, Ordering::Relaxed);
+                }
+                blocked
+            },
+            touch_tx,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "touch_demo_error=touch_router_start_failed device={} err={}",
+                    device_path, e
+                );
+                eprintln!("touch_demo_hint=root_permission_and_uinput_access_are_required");
+                std::process::exit(6);
+            }
+        };
+
+        if !cfg.quiet {
+            eprintln!(
+                "touch_demo_status=touch_router_started device={}",
+                device_path
+            );
+        }
+        touch_handle = Some(router);
+    } else if !cfg.quiet {
+        eprintln!("touch_demo_status=touch_router_disabled mode=render_only");
+    }
+
+    let mut submitter = match ShmSubmitClient::connect(&cfg.data_socket) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "touch_demo_error=data_connect_failed socket={} err={}",
+                cfg.data_socket, e
+            );
+            std::process::exit(7);
+        }
+    };
+
+    let mut frame = vec![0u8; frame_byte_len(display.width, display.height).unwrap_or(0)];
+    if frame.is_empty() {
+        eprintln!("touch_demo_error=frame_allocation_failed");
+        std::process::exit(8);
+    }
+
+    if !cfg.quiet {
+        eprintln!(
+            "touch_demo_status=running display={}x{}@{:.2} dpi={} rotation={} target_fps={:.1}",
+            display.width,
+            display.height,
+            display.refresh_hz,
+            display.density_dpi,
+            display.rotation,
+            cfg.fps
+        );
+        eprintln!("touch_demo_hint=drag_title resize_bottom_right tap_close_button");
+    }
+
+    let mut fps_counter = FpsCounter::new();
+    let frame_interval = Duration::from_secs_f64((1.0f32 / cfg.fps.max(1.0)) as f64);
+    let started_at = Instant::now();
+
+    while state.running {
+        if let Some(limit_s) = cfg.run_seconds {
+            if started_at.elapsed().as_secs_f32() >= limit_s {
+                break;
+            }
+        }
+        let frame_started = Instant::now();
+
+        while let Ok(msg) = touch_rx.try_recv() {
+            state.apply_touch(msg, display);
+        }
+        while let Ok(next) = display_rx.try_recv() {
+            if next.width == 0 || next.height == 0 {
+                continue;
+            }
+            if next.width != display.width
+                || next.height != display.height
+                || next.density_dpi != display.density_dpi
+                || next.rotation != display.rotation
+            {
+                display = next;
+                state.window.clamp_to_display(display, ui_metrics(display));
+                if let Ok(new_len) = frame_byte_len(display.width, display.height) {
+                    frame.resize(new_len, 0);
+                }
+                if let Some(handle) = touch_handle.as_ref() {
+                    let _ = handle.update_display_transform(
+                        display.width,
+                        display.height,
+                        display.rotation as i32,
+                    );
+                }
+                if !cfg.quiet {
+                    eprintln!(
+                        "touch_demo_status=display_changed size={}x{} dpi={} rotation={}",
+                        display.width, display.height, display.density_dpi, display.rotation
+                    );
+                }
+            }
+        }
+
+        if let Ok(mut route) = route_state.lock() {
+            route.window = state.window;
+        }
+
+        let fps = fps_counter.on_frame();
+        let blocked = route_blocked_down.load(Ordering::Relaxed);
+        let passed = route_passed_down.load(Ordering::Relaxed);
+        render_scene(&mut frame, display, &state, fps, blocked, passed);
+
+        if let Err(e) = submitter.submit_frame(display.width, display.height, &frame) {
+            eprintln!("touch_demo_error=submit_frame_failed err={}", e);
+            break;
+        }
+
+        let elapsed = frame_started.elapsed();
+        if elapsed < frame_interval {
+            thread::sleep(frame_interval - elapsed);
+        }
+    }
+
+    display_watch_running.store(false, Ordering::SeqCst);
+    let _ = display_watch_handle.join();
+
+    if let Some(mut handle) = touch_handle {
+        handle.shutdown_and_join();
+    }
+
+    if !cfg.quiet {
+        eprintln!("touch_demo_status=stopped");
+    }
+}
+
+fn detect_touch_device() -> io::Result<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for entry in fs::read_dir("/dev/input")? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if name.starts_with("event") {
+            paths.push(entry.path().to_string_lossy().to_string());
+        }
+    }
+    paths.sort();
+    for path in paths {
+        let device = match Device::open(&path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if is_touch_device(&device) {
+            return Ok(path);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no_multi_touch_device_with_abs_mt_axes",
+    ))
+}
+
+fn is_touch_device(device: &Device) -> bool {
+    let Some(abs) = device.supported_absolute_axes() else {
+        return false;
+    };
+    abs.contains(AbsoluteAxisType::ABS_MT_POSITION_X)
+        && abs.contains(AbsoluteAxisType::ABS_MT_POSITION_Y)
+        && abs.contains(AbsoluteAxisType::ABS_MT_SLOT)
+        && abs.contains(AbsoluteAxisType::ABS_MT_TRACKING_ID)
+}
+
+fn render_scene(
+    frame: &mut [u8],
+    display: DisplayInfo,
+    state: &DemoState,
+    fps: f32,
+    blocked_down: u64,
+    passed_down: u64,
+) {
+    frame.fill(0);
+    let metrics = ui_metrics(display);
+
+    let wx = state.window.x.round() as i32;
+    let wy = state.window.y.round() as i32;
+    let ww = state.window.w.round().max(1.0) as i32;
+    let wh = state.window.h.round().max(1.0) as i32;
+    let title_h = metrics.title_height.round().max(1.0) as i32;
+    let close_w = metrics.close_w.round().max(16.0) as i32;
+    let close_h = metrics.close_h.round().max(14.0) as i32;
+    let close_margin = metrics.close_margin.round().max(2.0) as i32;
+    let close_top = metrics.close_top.round().max(2.0) as i32;
+
+    fill_rect(
+        frame,
+        display.width,
+        display.height,
+        wx,
+        wy,
+        ww,
+        wh,
+        [21, 28, 37, 208],
+    );
+    fill_rect(
+        frame,
+        display.width,
+        display.height,
+        wx,
+        wy,
+        ww,
+        title_h,
+        [34, 49, 72, 224],
+    );
+    draw_rect_border(
+        frame,
+        display.width,
+        display.height,
+        wx,
+        wy,
+        ww,
+        wh,
+        [130, 175, 240, 250],
+    );
+
+    let close_x = wx + ww - close_w - close_margin;
+    let close_y = wy + close_top;
+    fill_rect(
+        frame,
+        display.width,
+        display.height,
+        close_x,
+        close_y,
+        close_w,
+        close_h,
+        [205, 64, 64, 246],
+    );
+    let cross_pad_x = ((close_w as f32) * 0.25).round().max(4.0) as i32;
+    let cross_pad_y = ((close_h as f32) * 0.25).round().max(4.0) as i32;
+    draw_line(
+        frame,
+        display.width,
+        display.height,
+        close_x + cross_pad_x,
+        close_y + cross_pad_y,
+        close_x + close_w - cross_pad_x - 1,
+        close_y + close_h - cross_pad_y - 1,
+        [255, 255, 255, 255],
+    );
+    draw_line(
+        frame,
+        display.width,
+        display.height,
+        close_x + close_w - cross_pad_x - 1,
+        close_y + cross_pad_y,
+        close_x + cross_pad_x,
+        close_y + close_h - cross_pad_y - 1,
+        [255, 255, 255, 255],
+    );
+
+    let resize_size = metrics.resize_hit.round().max(16.0) as i32;
+    let rx = wx + ww - resize_size;
+    let ry = wy + wh - resize_size;
+    let step = (resize_size / 4).max(4);
+    let resize_end = resize_size - step;
+    for i in 0..3 {
+        let delta = i * step;
+        draw_line(
+            frame,
+            display.width,
+            display.height,
+            rx + delta,
+            ry + resize_end,
+            rx + resize_end,
+            ry + delta,
+            [158, 198, 255, 255],
+        );
+    }
+
+    let mode = state.interaction.label();
+    let title = "DirectScreenAPI Touch Demo";
+    let title_text_h = 8 * metrics.title_text_scale;
+    let title_y = wy + ((title_h - title_text_h) / 2).max(2);
+    draw_text(
+        frame,
+        display.width,
+        display.height,
+        wx + 12,
+        title_y,
+        title,
+        [238, 245, 255, 255],
+        metrics.title_text_scale,
+    );
+
+    let lines = [
+        format!("FPS: {:>5.1}", fps),
+        format!("Mode: {}", mode),
+        format!(
+            "Window: x={:.0} y={:.0} w={:.0} h={:.0}",
+            state.window.x, state.window.y, state.window.w, state.window.h
+        ),
+        format!("Display: {}x{} dpi={}", display.width, display.height, display.density_dpi),
+        format!("Touch block downs: {}", blocked_down),
+        format!("Touch passthrough downs: {}", passed_down),
+        format!(
+            "UI events: {} latency_ms={:.2}",
+            state.ui_event_count, state.last_latency_ms
+        ),
+        "Drag title, resize corner, tap red button to close.".to_string(),
+    ];
+
+    let mut text_y = wy + title_h + 10;
+    for line in lines.iter() {
+        draw_text(
+            frame,
+            display.width,
+            display.height,
+            wx + 12,
+            text_y,
+            line,
+            [208, 223, 238, 255],
+            metrics.body_text_scale,
+        );
+        text_y += metrics.body_line_step;
+    }
+}
+
+fn fill_rect(
+    frame: &mut [u8],
+    fb_width: u32,
+    fb_height: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    color: [u8; 4],
+) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let start_x = x.max(0);
+    let start_y = y.max(0);
+    let end_x = (x + w).min(fb_width as i32);
+    let end_y = (y + h).min(fb_height as i32);
+    if start_x >= end_x || start_y >= end_y {
+        return;
+    }
+
+    let fb_w = fb_width as usize;
+    for py in start_y..end_y {
+        let row = py as usize * fb_w * 4;
+        for px in start_x..end_x {
+            let idx = row + px as usize * 4;
+            frame[idx] = color[0];
+            frame[idx + 1] = color[1];
+            frame[idx + 2] = color[2];
+            frame[idx + 3] = color[3];
+        }
+    }
+}
+
+fn draw_rect_border(
+    frame: &mut [u8],
+    fb_width: u32,
+    fb_height: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    color: [u8; 4],
+) {
+    draw_line(frame, fb_width, fb_height, x, y, x + w - 1, y, color);
+    draw_line(
+        frame,
+        fb_width,
+        fb_height,
+        x,
+        y + h - 1,
+        x + w - 1,
+        y + h - 1,
+        color,
+    );
+    draw_line(frame, fb_width, fb_height, x, y, x, y + h - 1, color);
+    draw_line(
+        frame,
+        fb_width,
+        fb_height,
+        x + w - 1,
+        y,
+        x + w - 1,
+        y + h - 1,
+        color,
+    );
+}
+
+fn draw_line(
+    frame: &mut [u8],
+    fb_width: u32,
+    fb_height: u32,
+    mut x0: i32,
+    mut y0: i32,
+    x1: i32,
+    y1: i32,
+    color: [u8; 4],
+) {
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    loop {
+        put_pixel(frame, fb_width, fb_height, x0, y0, color);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn put_pixel(frame: &mut [u8], fb_width: u32, fb_height: u32, x: i32, y: i32, color: [u8; 4]) {
+    if x < 0 || y < 0 || x >= fb_width as i32 || y >= fb_height as i32 {
+        return;
+    }
+    let idx = ((y as usize * fb_width as usize) + x as usize) * 4;
+    if idx + 3 >= frame.len() {
+        return;
+    }
+    frame[idx] = color[0];
+    frame[idx + 1] = color[1];
+    frame[idx + 2] = color[2];
+    frame[idx + 3] = color[3];
+}
+
+fn draw_text(
+    frame: &mut [u8],
+    fb_width: u32,
+    fb_height: u32,
+    mut x: i32,
+    y: i32,
+    text: &str,
+    color: [u8; 4],
+    scale: i32,
+) {
+    for ch in text.chars() {
+        if ch == '\n' {
+            continue;
+        }
+        draw_char(frame, fb_width, fb_height, x, y, ch, color, scale);
+        x += 8 * scale + scale;
+    }
+}
+
+fn draw_char(
+    frame: &mut [u8],
+    fb_width: u32,
+    fb_height: u32,
+    x: i32,
+    y: i32,
+    ch: char,
+    color: [u8; 4],
+    scale: i32,
+) {
+    let Some(glyph) = BASIC_FONTS.get(ch) else {
+        return;
+    };
+
+    for (row, bits) in glyph.iter().enumerate() {
+        for col in 0..8 {
+            if (bits >> col) & 1 == 1 {
+                fill_rect(
+                    frame,
+                    fb_width,
+                    fb_height,
+                    x + col * scale,
+                    y + row as i32 * scale,
+                    scale,
+                    scale,
+                    color,
+                );
+            }
+        }
+    }
+}

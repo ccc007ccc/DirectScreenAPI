@@ -15,11 +15,12 @@
 
 - `daemon start|stop|status|cmd <COMMAND ...>`
 - `presenter start|stop|status|run`
+- `screen start|stop|status|run|bench [samples]`
 - `touch start|stop|status|run`
 - `android probe [display-kv|display-line]`
 - `android sync-display`
 - `frame pull <out_rgba_path>`
-- `build core|android|c-example`
+- `build core|android|c-example|framepull`
 - `check`
 - `fix`
 
@@ -50,6 +51,17 @@ Presenter：
 ./scripts/dsapi.sh presenter stop
 ```
 
+Screen stream（root，全屏采集 -> daemon 当前帧）：
+
+```sh
+./scripts/dsapi.sh android sync-display
+DSAPI_ANDROID_OUT_DIR=artifacts/android_user DSAPI_SCREEN_RUN_AS_ROOT=1 ./scripts/dsapi.sh screen start
+./scripts/dsapi.sh screen status
+./scripts/dsapi.sh frame pull artifacts/frame/screen_latest.rgba
+./scripts/dsapi.sh screen bench 10
+./scripts/dsapi.sh screen stop
+```
+
 Touch bridge：
 
 ```sh
@@ -62,6 +74,13 @@ Touch bridge：
 
 ```sh
 ./scripts/dsapi.sh frame pull artifacts/frame/latest.rgba
+```
+
+可选快速取帧 helper（非必须、按需构建）：
+
+```sh
+./scripts/dsapi.sh build framepull
+DSAPI_FRAME_PULL_ENGINE=rust ./scripts/dsapi.sh frame pull artifacts/frame/latest.rgba
 ```
 
 门禁校验与修复：
@@ -88,8 +107,14 @@ Touch bridge：
 - `daemon_frame_pull.sh` -> `dsapi.sh frame pull ...`
 - `daemon_presenter_run.sh` -> `dsapi.sh presenter run`
 - `daemon_touch_bridge_run.sh` -> `dsapi.sh touch run`
+- `daemon_screen_stream_start.sh` -> `dsapi.sh screen start`
+- `daemon_screen_stream_stop.sh` -> `dsapi.sh screen stop`
 
 ## 注意事项
 
 - `dsapi.sh daemon cmd` 通过 `dsapictl` 走控制面二进制协议，不再支持旧文本控制协议。
 - `frame pull` 已切换为 `RENDER_FRAME_BIND_SHM + RENDER_FRAME_WAIT_SHM_PRESENT` 的零拷贝路径。
+- `frame pull` 默认 `DSAPI_FRAME_PULL_ENGINE=auto`：若存在 `target/release/dsapiframepull`
+  则优先使用轻量 Rust helper；否则自动回退 Python 实现。
+- `frame pull` 默认带重试（`DSAPI_FRAME_PULL_RETRIES=4`、`DSAPI_FRAME_PULL_RETRY_DELAY_MS=80`），
+  可通过 `DSAPI_FRAME_WAIT_TIMEOUT_MS` 调整单次等帧超时。

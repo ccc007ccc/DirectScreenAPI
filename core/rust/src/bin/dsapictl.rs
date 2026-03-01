@@ -11,6 +11,7 @@ fn usage() {
     println!("  PING");
     println!("  VERSION");
     println!("  DISPLAY_GET");
+    println!("  DISPLAY_WAIT <last_seq> <timeout_ms>");
     println!("  DISPLAY_SET <w> <h> <hz> <dpi> <rotation>");
     println!("  TOUCH_CLEAR");
     println!("  TOUCH_COUNT");
