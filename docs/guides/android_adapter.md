@@ -18,12 +18,12 @@
 ## 关键脚本
 
 - `scripts/build_android_adapter.sh`：编译 Java 适配层并产出 dex jar
-- `scripts/android_display_probe.sh`：执行显示探测
-- `scripts/daemon_sync_display.sh`：将探测结果同步到 daemon
-- `scripts/daemon_presenter_run.sh`：前台运行上屏 presenter（事件驱动拉帧）
-- `scripts/daemon_presenter_start.sh`：后台启动 presenter
-- `scripts/daemon_presenter_stop.sh`：停止 presenter
-- `scripts/daemon_presenter_status.sh`：查询 presenter 状态
+- `scripts/dsapi.sh android probe`：执行显示探测
+- `scripts/dsapi.sh android sync-display`：将探测结果同步到 daemon
+- `scripts/dsapi.sh presenter run`：前台运行上屏 presenter（事件驱动拉帧）
+- `scripts/dsapi.sh presenter start`：后台启动 presenter
+- `scripts/dsapi.sh presenter stop`：停止 presenter
+- `scripts/dsapi.sh presenter status`：查询 presenter 状态
 
 ## 快速使用
 
@@ -36,22 +36,22 @@
 2. 探测显示参数
 
 ```sh
-./scripts/android_display_probe.sh display-kv
+./scripts/dsapi.sh android probe display-kv
 ```
 
 3. 启动守护进程并同步显示状态
 
 ```sh
-./scripts/daemon_start.sh
-./scripts/daemon_sync_display.sh
-./scripts/daemon_cmd.sh DISPLAY_GET
+./scripts/dsapi.sh daemon start
+./scripts/dsapi.sh android sync-display
+./scripts/dsapi.sh daemon cmd DISPLAY_GET
 ```
 
 4. 启动上屏 presenter 并提交测试帧
 
 ```sh
-./scripts/daemon_presenter_start.sh
-./scripts/daemon_presenter_status.sh
+./scripts/dsapi.sh presenter start
+./scripts/dsapi.sh presenter status
 ```
 
 ## 输出格式约定
@@ -72,7 +72,7 @@
 - `DSAPI_DATA_SOCKET_PATH`：数据面 socket，默认 `<control>.data.sock`
 - `DSAPI_RUN_AS_ROOT`：是否使用 `su -c` 执行 probe，默认 `1`
 - `DSAPI_APP_PROCESS_BIN`：指定 `app_process` 可执行路径，默认 `app_process`
-- `DSAPI_PRESENTER_POLL_MS`：presenter 帧等待超时（`RENDER_FRAME_WAIT_BOUND_PRESENT`），默认 `8`
+- `DSAPI_PRESENTER_POLL_MS`：presenter 帧等待超时（`RENDER_FRAME_WAIT_BOUND_PRESENT`），默认 `2`
 - `DSAPI_PRESENTER_LAYER_Z`：presenter 图层 Z 值，默认 `1000000`
 - `DSAPI_PRESENTER_LAYER_NAME`：presenter 图层名，默认 `DirectScreenAPI`
 
@@ -82,7 +82,7 @@
 - `android_adapter_error=d8_not_found`：缺少 dex 构建工具
 - `android_probe_error=app_process_not_found`：系统未找到 `app_process`
 - `display_sync_error=invalid_probe_output`：probe 输出格式不符合约定
-- `presenter_error=daemon_socket_missing`：daemon 套接字不可用
+- `presenter_error=daemon_control_socket_missing` / `presenter_error=daemon_data_socket_missing`：daemon 套接字不可用
 - `presenter_status=failed`：presenter 初始化失败，查看 `artifacts/run/dsapi_presenter.log`
 
 ## 当前边界

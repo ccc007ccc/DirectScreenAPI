@@ -1,9 +1,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
-fn default_socket_path() -> String {
-    "artifacts/run/dsapi.sock".to_string()
-}
+use directscreen_core::util::{default_control_socket_path, timeout_from_env};
 
 fn usage() {
     println!("usage:");
@@ -30,7 +28,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut socket = default_socket_path();
+    let mut socket = default_control_socket_path();
     let mut cmd_start = 1usize;
     if args.len() >= 4 && args[1] == "--socket" {
         socket = args[2].clone();
@@ -51,6 +49,15 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let timeout = timeout_from_env("DSAPI_CLIENT_TIMEOUT_MS", 5000, 100);
+    if let Err(e) = stream.set_read_timeout(timeout) {
+        eprintln!("ctl_error=set_read_timeout_failed err={}", e);
+        std::process::exit(6);
+    }
+    if let Err(e) = stream.set_write_timeout(timeout) {
+        eprintln!("ctl_error=set_write_timeout_failed err={}", e);
+        std::process::exit(6);
+    }
 
     if let Err(e) = stream.write_all(format!("{}\n", cmd).as_bytes()) {
         eprintln!("ctl_error=write_failed err={}", e);

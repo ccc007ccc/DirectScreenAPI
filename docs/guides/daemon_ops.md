@@ -3,73 +3,73 @@
 ## 启动
 
 ```sh
-./scripts/daemon_start.sh
+./scripts/dsapi.sh daemon start
 ```
 
 ## 查看状态
 
 ```sh
-./scripts/daemon_status.sh
+./scripts/dsapi.sh daemon status
 ```
 
 ## 发送命令
 
 ```sh
-./scripts/daemon_cmd.sh PING
-./scripts/daemon_cmd.sh DISPLAY_GET
-./scripts/daemon_cmd.sh ROUTE_ADD_RECT 9 block 100 100 280 280
-./scripts/daemon_cmd.sh ROUTE_POINT 120 120
-./scripts/daemon_cmd.sh TOUCH_DOWN 1 120 120
-./scripts/daemon_cmd.sh TOUCH_MOVE 1 300 300
-./scripts/daemon_cmd.sh TOUCH_UP 1 300 300
-./scripts/daemon_cmd.sh TOUCH_COUNT
-./scripts/daemon_cmd.sh RENDER_SUBMIT 12 2 3
-./scripts/daemon_cmd.sh RENDER_GET
-./scripts/daemon_cmd.sh RENDER_FRAME_GET
-./scripts/daemon_cmd.sh RENDER_FRAME_WAIT 0 16
-./scripts/daemon_cmd.sh RENDER_PRESENT
-./scripts/daemon_cmd.sh RENDER_PRESENT_GET
-./scripts/daemon_cmd.sh RENDER_DUMP_PPM
-./scripts/daemon_frame_pull.sh artifacts/frame/latest.rgba
-./scripts/daemon_cmd.sh RENDER_FRAME_CLEAR
+./scripts/dsapi.sh daemon cmd PING
+./scripts/dsapi.sh daemon cmd DISPLAY_GET
+./scripts/dsapi.sh daemon cmd ROUTE_ADD_RECT 9 block 100 100 280 280
+./scripts/dsapi.sh daemon cmd ROUTE_POINT 120 120
+./scripts/dsapi.sh daemon cmd TOUCH_DOWN 1 120 120
+./scripts/dsapi.sh daemon cmd TOUCH_MOVE 1 300 300
+./scripts/dsapi.sh daemon cmd TOUCH_UP 1 300 300
+./scripts/dsapi.sh daemon cmd TOUCH_COUNT
+./scripts/dsapi.sh daemon cmd RENDER_SUBMIT 12 2 3
+./scripts/dsapi.sh daemon cmd RENDER_GET
+./scripts/dsapi.sh daemon cmd RENDER_FRAME_GET
+./scripts/dsapi.sh daemon cmd RENDER_FRAME_WAIT 0 16
+./scripts/dsapi.sh daemon cmd RENDER_PRESENT
+./scripts/dsapi.sh daemon cmd RENDER_PRESENT_GET
+./scripts/dsapi.sh daemon cmd RENDER_DUMP_PPM
+./scripts/dsapi.sh frame pull artifacts/frame/latest.rgba
+./scripts/dsapi.sh daemon cmd RENDER_FRAME_CLEAR
 ```
 
-`daemon_cmd.sh` / `dsapictl` 连接的是 **control socket**（默认 `artifacts/run/dsapi.sock`）。
+`dsapi.sh daemon cmd` / `dsapictl` 连接的是 **control socket**（默认 `artifacts/run/dsapi.sock`）。
 
 `RENDER_FRAME_SUBMIT_RGBA_RAW` 需要先读写握手再发送二进制 body，不适合
-`daemon_cmd.sh` 这种逐行文本工具；请使用长连接客户端（如 FrostUI runtime）。
+`dsapi.sh daemon cmd` 这种逐行文本工具；请使用长连接客户端（如 FrostUI runtime）。
 
-`RENDER_FRAME_GET_RAW` 会返回二进制 RGBA body，同样不适合 `daemon_cmd.sh`。
+`RENDER_FRAME_GET_RAW` 会返回二进制 RGBA body，同样不适合 `dsapi.sh daemon cmd`。
 
 `RENDER_FRAME_GET_FD` 依赖 Unix Socket ancillary fd（`SCM_RIGHTS`），
-`daemon_cmd.sh` / `dsapictl` 不支持该能力，需由支持 fd 透传的客户端调用（如 Android presenter）。
+`dsapi.sh daemon cmd` / `dsapictl` 不支持该能力，需由支持 fd 透传的客户端调用（如 Android presenter）。
 
 二进制命令与触控流走 **data socket**（默认 `artifacts/run/dsapi.data.sock`）。
 
 同步 Android 实际显示参数：
 
 ```sh
-./scripts/daemon_sync_display.sh
+./scripts/dsapi.sh android sync-display
 ```
 
 启动触摸桥接：
 
 ```sh
-./scripts/daemon_touch_bridge_start.sh
-./scripts/daemon_touch_bridge_status.sh
+./scripts/dsapi.sh touch start
+./scripts/dsapi.sh touch status
 ```
 
 Supervisor 启动（推荐统一进程编排）：
 
 ```sh
-DSAPI_SUPERVISE_PRESENTER=1 DSAPI_SUPERVISE_INPUT=1 ./scripts/daemon_start.sh
+DSAPI_SUPERVISE_PRESENTER=1 DSAPI_SUPERVISE_INPUT=1 ./scripts/dsapi.sh daemon start
 ```
 
 ## 停止
 
 ```sh
-./scripts/daemon_touch_bridge_stop.sh
-./scripts/daemon_stop.sh
+./scripts/dsapi.sh touch stop
+./scripts/dsapi.sh daemon stop
 ```
 
 ## 可配置环境变量
@@ -92,5 +92,6 @@ DSAPI_SUPERVISE_PRESENTER=1 DSAPI_SUPERVISE_INPUT=1 ./scripts/daemon_start.sh
 - `DSAPI_SUPERVISE_PRESENTER_CMD`
 - `DSAPI_SUPERVISE_INPUT_CMD`
 - `DSAPI_SUPERVISE_RESTART_MS`
+- `DSAPI_MAX_CONNECTIONS`
 
 可用于多实例隔离运行与路径定制。

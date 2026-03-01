@@ -10,26 +10,23 @@
 
 ## 组件
 
-- `scripts/daemon_touch_bridge_start.sh`
-- `scripts/daemon_touch_bridge_status.sh`
-- `scripts/daemon_touch_bridge_stop.sh`
-- `scripts/daemon_touch_bridge_run.sh`
+- `scripts/dsapi.sh`（`touch start|status|stop|run`）
 - `target/release/dsapiinput`
 
 ## 快速使用
 
 ```sh
-./scripts/daemon_start.sh
-./scripts/daemon_sync_display.sh
-./scripts/daemon_touch_bridge_start.sh
-./scripts/daemon_touch_bridge_status.sh
+./scripts/dsapi.sh daemon start
+./scripts/dsapi.sh android sync-display
+./scripts/dsapi.sh touch start
+./scripts/dsapi.sh touch status
 ```
 
 停止：
 
 ```sh
-./scripts/daemon_touch_bridge_stop.sh
-./scripts/daemon_stop.sh
+./scripts/dsapi.sh touch stop
+./scripts/dsapi.sh daemon stop
 ```
 
 ## 默认行为
@@ -43,7 +40,7 @@
 
 - `DSAPI_TOUCH_DEVICE`：手动指定触摸设备，如 `/dev/input/event6`
 - `DSAPI_TOUCH_RUN_AS_ROOT`：是否使用 `su -c`（默认 `1`）
-- `DSAPI_TOUCH_AUTO_SYNC_DISPLAY`：是否自动调用 `daemon_sync_display.sh`（默认 `1`）
+- `DSAPI_TOUCH_AUTO_SYNC_DISPLAY`：是否自动调用 `dsapi.sh android sync-display`（默认 `1`）
 - `DSAPI_TOUCH_SYNC_DISPLAY_EVERY_SEC`：自动同步显示周期，默认 `1`
 - `DSAPI_TOUCH_MONITOR_INTERVAL_SEC`：显示变化监视周期，默认 `1`
 - `DSAPI_TOUCH_BRIDGE_PID_FILE`：桥接 PID 文件路径
@@ -62,7 +59,7 @@
 
 - `touch_bridge_error=touch_device_not_found`
   - 无法自动识别触摸设备，手动设置 `DSAPI_TOUCH_DEVICE`
-- `touch_bridge_error=invalid_display_response`
+- `touch_bridge_warn=display_unavailable`
   - daemon 未启动或 display 状态异常
 - `touch_bridge_status=failed_start`
   - 查看日志文件定位原因

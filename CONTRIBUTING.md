@@ -10,7 +10,8 @@
 ## 本地检查
 
 ```sh
-./scripts/check.sh
+./scripts/dsapi.sh check
+./scripts/dsapi.sh fix
 ```
 
 ## 提交信息建议

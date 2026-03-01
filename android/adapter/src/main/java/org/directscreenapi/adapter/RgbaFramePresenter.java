@@ -20,6 +20,16 @@ final class RgbaFramePresenter {
         @Override
         public Object invoke(Object proxy, Method method, Object[] args) {
             String name = method.getName();
+            if ("equals".equals(name) && method.getParameterTypes().length == 1) {
+                Object other = (args != null && args.length > 0) ? args[0] : null;
+                return Boolean.valueOf(proxy == other);
+            }
+            if ("hashCode".equals(name) && method.getParameterTypes().length == 0) {
+                return Integer.valueOf(System.identityHashCode(proxy));
+            }
+            if ("toString".equals(name) && method.getParameterTypes().length == 0) {
+                return "DisplayListenerProxy";
+            }
             if ("onDisplayAdded".equals(name)
                     || "onDisplayChanged".equals(name)
                     || "onDisplayRemoved".equals(name)) {
@@ -34,6 +44,7 @@ final class RgbaFramePresenter {
     private final int pollMs;
     private final int zLayer;
     private final String layerName;
+    private final AtomicBoolean shutdownOnce = new AtomicBoolean(false);
 
     private volatile boolean running = true;
     private long lastFrameSeq = -1L;
@@ -177,6 +188,9 @@ final class RgbaFramePresenter {
     }
 
     private void shutdown() {
+        if (!shutdownOnce.compareAndSet(false, true)) {
+            return;
+        }
         running = false;
         if (bitmap != null) {
             try {
@@ -340,6 +354,10 @@ final class RgbaFramePresenter {
     }
 
     private void initDisplayListener() {
+        Object dm = null;
+        Object listener = null;
+        Object ht = null;
+        boolean registered = false;
         try {
             Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
             Method currentApplication = activityThreadClass.getMethod("currentApplication");
@@ -349,7 +367,7 @@ final class RgbaFramePresenter {
                 return;
             }
 
-            Object dm = ReflectBridge.invoke(app, "getSystemService", "display");
+            dm = ReflectBridge.invoke(app, "getSystemService", "display");
             if (dm == null) {
                 log("presenter_warn=display_listener_no_display_manager fallback=poll");
                 return;
@@ -357,14 +375,14 @@ final class RgbaFramePresenter {
 
             Class<?> listenerIface = Class.forName("android.hardware.display.DisplayManager$DisplayListener");
             InvocationHandler handler = new DisplayListenerInvocationHandler(displayDirty);
-            Object listener = Proxy.newProxyInstance(
+            listener = Proxy.newProxyInstance(
                     listenerIface.getClassLoader(),
                     new Class<?>[]{listenerIface},
                     handler
             );
 
             Class<?> handlerThreadClass = Class.forName("android.os.HandlerThread");
-            Object ht = handlerThreadClass
+            ht = handlerThreadClass
                     .getDeclaredConstructor(String.class)
                     .newInstance("dsapi-display-listener");
             ReflectBridge.invoke(ht, "start");
@@ -377,12 +395,29 @@ final class RgbaFramePresenter {
                     .newInstance(looper);
 
             ReflectBridge.invoke(dm, "registerDisplayListener", listener, h);
+            registered = true;
 
             displayManager = dm;
             displayListener = listener;
             displayListenerThread = ht;
             log("presenter_status=display_listener_enabled");
         } catch (Throwable t) {
+            if (registered && dm != null && listener != null) {
+                try {
+                    ReflectBridge.invoke(dm, "unregisterDisplayListener", listener);
+                } catch (Throwable ignored) {
+                }
+            }
+            if (ht != null) {
+                try {
+                    ReflectBridge.invoke(ht, "quitSafely");
+                } catch (Throwable ignored) {
+                    try {
+                        ReflectBridge.invoke(ht, "quit");
+                    } catch (Throwable ignored2) {
+                    }
+                }
+            }
             log("presenter_warn=display_listener_init_failed err=" + t.getClass().getSimpleName() + " fallback=poll");
         }
     }

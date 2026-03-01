@@ -44,14 +44,14 @@
 ## 示例
 
 ```sh
-./scripts/daemon_start.sh
-./scripts/daemon_cmd.sh ROUTE_CLEAR
-./scripts/daemon_cmd.sh ROUTE_ADD_RECT 9 block 0 0 300 300
-./scripts/daemon_cmd.sh TOUCH_DOWN 1 100 100
-./scripts/daemon_cmd.sh TOUCH_MOVE 1 600 600
-./scripts/daemon_cmd.sh TOUCH_UP 1 600 600
-./scripts/daemon_cmd.sh TOUCH_COUNT
-./scripts/daemon_stop.sh
+./scripts/dsapi.sh daemon start
+./scripts/dsapi.sh daemon cmd ROUTE_CLEAR
+./scripts/dsapi.sh daemon cmd ROUTE_ADD_RECT 9 block 0 0 300 300
+./scripts/dsapi.sh daemon cmd TOUCH_DOWN 1 100 100
+./scripts/dsapi.sh daemon cmd TOUCH_MOVE 1 600 600
+./scripts/dsapi.sh daemon cmd TOUCH_UP 1 600 600
+./scripts/dsapi.sh daemon cmd TOUCH_COUNT
+./scripts/dsapi.sh daemon stop
 ```
 
 在上面的流程中，`MOVE` 和 `UP` 仍会返回与 `DOWN` 一致的决策结果。

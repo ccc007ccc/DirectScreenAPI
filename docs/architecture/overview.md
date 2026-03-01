@@ -26,4 +26,5 @@ DirectScreenAPI 采用“核心与适配分离”结构：
 
 ## 当前非目标
 
-当前版本不提供 GPU 渲染后端，也不提供 Android 真正渲染接入。
+当前版本不提供 GPU 渲染后端（OpenGL ES / Vulkan）；Android 适配层已提供显示探测与
+SurfaceControl 呈现链路，但仍属于“能力打通阶段”，尚未形成完整图形后端抽象。

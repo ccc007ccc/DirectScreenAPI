@@ -15,6 +15,10 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 
 final class DaemonSession {
+    private static final int DEFAULT_SOCKET_TIMEOUT_MS = 5000;
+    private static final String SOCKET_TIMEOUT_PROPERTY = "dsapi.socket_timeout_ms";
+    private static final String PIXEL_FORMAT_RGBA8888 = "RGBA8888";
+
     static final class MappedFrame {
         final long frameSeq;
         final int width;
@@ -79,11 +83,7 @@ final class DaemonSession {
                 writer.write(cmd);
                 writer.write('\n');
                 writer.flush();
-                String line = reader.readLine();
-                if (line == null) {
-                    throw new IOException("daemon_eof");
-                }
-                return line.trim();
+                return requireOkLine(reader.readLine(), "daemon_command");
             } catch (Exception e) {
                 last = e;
                 closeQuietly();
@@ -101,23 +101,16 @@ final class DaemonSession {
                 long safeSeq = Math.max(0L, lastFrameSeq);
                 int safeTimeout = Math.max(1, timeoutMs);
                 writeAsciiLine(rawOutput, "RENDER_FRAME_WAIT_BOUND_PRESENT " + safeSeq + " " + safeTimeout);
-                String line = readAsciiLine(rawInput);
-                if (line == null) {
-                    throw new IOException("daemon_eof");
-                }
-                String trimmed = line.trim();
-                if ("OK TIMEOUT".equals(trimmed)) {
+                String trimmed = requireOkLine(readAsciiLine(rawInput), "daemon_wait_bound_present");
+                String[] tokens = trimmed.split("\\s+");
+                if (tokens.length == 2 && "TIMEOUT".equals(tokens[1])) {
                     return null;
                 }
-                if (trimmed.startsWith("ERR ")) {
-                    throw new IOException("daemon_wait_bound_present_err=" + trimmed);
-                }
-                if (!trimmed.startsWith("OK ")) {
-                    throw new IOException("daemon_wait_bound_present_bad_line");
-                }
-                String[] tokens = trimmed.split("\\s+");
-                if (tokens.length < 7) {
+                if (tokens.length != 7) {
                     throw new IOException("daemon_wait_bound_present_tokens_invalid");
+                }
+                if (!PIXEL_FORMAT_RGBA8888.equals(tokens[4])) {
+                    throw new IOException("daemon_wait_bound_present_pixel_format_invalid");
                 }
 
                 long frameSeq = parseLong(tokens[1], -1L);
@@ -126,6 +119,10 @@ final class DaemonSession {
                 int byteLen = parseInt(tokens[5], -1);
                 if (frameSeq < 0 || width <= 0 || height <= 0 || byteLen <= 0) {
                     throw new IOException("daemon_wait_bound_present_header_invalid");
+                }
+                long expectedByteLen = (long) width * (long) height * 4L;
+                if (expectedByteLen <= 0L || expectedByteLen > Integer.MAX_VALUE || byteLen != (int) expectedByteLen) {
+                    throw new IOException("daemon_wait_bound_present_len_mismatch");
                 }
                 if (rawFrameMapped == null || rawFrameCapacity <= 0) {
                     throw new IOException("daemon_wait_bound_present_uninitialized");
@@ -194,6 +191,7 @@ final class DaemonSession {
                 .getDeclaredConstructor(String.class, namespaceClass)
                 .newInstance(path, namespaceFilesystem);
         ReflectBridge.invoke(socket, "connect", address);
+        configureSocketTimeout(socket);
 
         OutputStream os = (OutputStream) ReflectBridge.invoke(socket, "getOutputStream");
         InputStream is = (InputStream) ReflectBridge.invoke(socket, "getInputStream");
@@ -264,16 +262,9 @@ final class DaemonSession {
         }
 
         writeAsciiLine(rawOutput, "RENDER_FRAME_BIND_FD");
-        String line = readAsciiLine(rawInput);
-        if (line == null) {
-            throw new IOException("daemon_eof");
-        }
-        String trimmed = line.trim();
-        if (!trimmed.startsWith("OK ")) {
-            throw new IOException("daemon_bind_fd_bad_line");
-        }
+        String trimmed = requireOkLine(readAsciiLine(rawInput), "daemon_bind_fd");
         String[] tokens = trimmed.split("\\s+");
-        if (tokens.length < 3 || !"BOUND".equals(tokens[1])) {
+        if (tokens.length != 3 || !"BOUND".equals(tokens[1])) {
             throw new IOException("daemon_bind_fd_tokens_invalid");
         }
         int capacity = parseInt(tokens[2], -1);
@@ -330,6 +321,36 @@ final class DaemonSession {
             }
         }
         return sb.toString();
+    }
+
+    private static String requireOkLine(String line, String context) throws IOException {
+        if (line == null) {
+            throw new IOException("daemon_eof");
+        }
+        String trimmed = line.trim();
+        if ("OK".equals(trimmed) || trimmed.startsWith("OK ")) {
+            return trimmed;
+        }
+        if ("ERR".equals(trimmed) || trimmed.startsWith("ERR ")) {
+            throw new IOException(context + "_err=" + trimmed);
+        }
+        throw new IOException(context + "_bad_line");
+    }
+
+    private static void configureSocketTimeout(Object socket) {
+        int timeoutMs = resolveSocketTimeoutMs();
+        try {
+            ReflectBridge.invoke(socket, "setSoTimeout", Integer.valueOf(timeoutMs));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static int resolveSocketTimeoutMs() {
+        int timeoutMs = parseInt(System.getProperty(SOCKET_TIMEOUT_PROPERTY), DEFAULT_SOCKET_TIMEOUT_MS);
+        if (timeoutMs <= 0) {
+            return DEFAULT_SOCKET_TIMEOUT_MS;
+        }
+        return timeoutMs;
     }
 
     private static int parseInt(String s, int fallback) {

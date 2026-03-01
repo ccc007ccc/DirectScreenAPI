@@ -8,16 +8,6 @@ pub struct CommandOutcome {
     pub should_shutdown: bool,
 }
 
-fn status_name(status: Status) -> &'static str {
-    match status {
-        Status::Ok => "OK",
-        Status::NullPointer => "NULL_POINTER",
-        Status::InvalidArgument => "INVALID_ARGUMENT",
-        Status::OutOfRange => "OUT_OF_RANGE",
-        Status::InternalError => "INTERNAL_ERROR",
-    }
-}
-
 fn parse_decision(token: &str) -> Result<Decision, Status> {
     match token {
         "pass" | "PASS" => Ok(Decision::Pass),
@@ -371,7 +361,7 @@ pub fn execute_command(engine: &RuntimeEngine, line: &str) -> CommandOutcome {
             should_shutdown: cmd == "SHUTDOWN",
         },
         Err(status) => CommandOutcome {
-            response_line: format!("ERR {}", status_name(status)),
+            response_line: format!("ERR {}", status.as_str()),
             should_shutdown: false,
         },
     }

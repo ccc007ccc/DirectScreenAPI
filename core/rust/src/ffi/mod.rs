@@ -3,10 +3,9 @@ use std::ptr;
 
 use crate::api::{
     Decision, DisplayState, RectRegion, RenderFrameInfo, RenderStats, RouteResult, Status,
-    TouchEvent,
+    TouchEvent, DSAPI_ABI_VERSION, RENDER_MAX_FRAME_BYTES,
 };
 use crate::engine::{RenderPresentInfo, RuntimeEngine};
-use crate::DIRECTSCREEN_CORE_VERSION;
 
 #[repr(C)]
 pub struct DsapiContext {
@@ -69,8 +68,7 @@ pub struct DsapiRenderFrameChunk {
     pub chunk_len: u32,
 }
 
-const VERSION_CSTR: &[u8] = b"0.1.0\0";
-const DSAPI_ABI_VERSION: u32 = 0x0001_0000;
+const VERSION_CSTR: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
 impl From<DsapiDisplayState> for DisplayState {
     fn from(v: DsapiDisplayState) -> Self {
@@ -165,7 +163,6 @@ fn with_engine_ref(ctx: *mut DsapiContext, f: impl FnOnce(&RuntimeEngine) -> Sta
 
 #[no_mangle]
 pub extern "C" fn dsapi_version() -> *const c_char {
-    let _ = DIRECTSCREEN_CORE_VERSION;
     VERSION_CSTR.as_ptr() as *const c_char
 }
 
@@ -540,6 +537,22 @@ pub unsafe extern "C" fn dsapi_render_submit_frame_rgba(
         Ok(v) => v,
         Err(_) => return Status::OutOfRange as i32,
     };
+    if width == 0 || height == 0 {
+        return Status::InvalidArgument as i32;
+    }
+    let expected_len = match (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|v| v.checked_mul(4usize))
+    {
+        Some(v) => v,
+        None => return Status::OutOfRange as i32,
+    };
+    if expected_len > RENDER_MAX_FRAME_BYTES {
+        return Status::OutOfRange as i32;
+    }
+    if len != expected_len {
+        return Status::InvalidArgument as i32;
+    }
     let bytes = unsafe { std::slice::from_raw_parts(pixels_rgba8, len) }.to_vec();
 
     with_engine_mut(ctx, |engine| {

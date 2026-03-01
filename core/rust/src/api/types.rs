@@ -8,9 +8,22 @@ pub enum Status {
     InternalError = 4,
 }
 
+impl Status {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "OK",
+            Self::NullPointer => "NULL_POINTER",
+            Self::InvalidArgument => "INVALID_ARGUMENT",
+            Self::OutOfRange => "OUT_OF_RANGE",
+            Self::InternalError => "INTERNAL_ERROR",
+        }
+    }
+}
+
 pub const TOUCH_MAX_POINTERS: usize = 16;
 pub const RENDER_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const RENDER_MAX_CHUNK_BYTES: usize = 1024 * 1024;
+pub const DSAPI_ABI_VERSION: u32 = 0x0001_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct RenderStats {

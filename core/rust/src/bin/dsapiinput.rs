@@ -3,6 +3,10 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
 
+use directscreen_core::util::{
+    default_control_socket_path, derive_data_socket_path_text, timeout_from_env,
+};
+
 const EV_SYN: u16 = 0x00;
 const EV_ABS: u16 = 0x03;
 
@@ -50,17 +54,6 @@ struct Args {
     device: String,
     cfg: Config,
     quiet: bool,
-}
-
-fn default_control_socket_path() -> String {
-    "artifacts/run/dsapi.sock".to_string()
-}
-
-fn derive_data_socket_path(control_socket_path: &str) -> String {
-    if let Some(prefix) = control_socket_path.strip_suffix(".sock") {
-        return format!("{}.data.sock", prefix);
-    }
-    format!("{}.data", control_socket_path)
 }
 
 fn usage() {
@@ -172,7 +165,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         return Err("rotation_must_be_0_3".to_string());
     }
 
-    let data_socket = data_socket.unwrap_or_else(|| derive_data_socket_path(&control_socket));
+    let data_socket = data_socket.unwrap_or_else(|| derive_data_socket_path_text(&control_socket));
     if data_socket == control_socket {
         return Err("control_socket_and_data_socket_must_differ".to_string());
     }
@@ -187,6 +180,10 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 
 fn connect_touch_stream(socket: &str) -> io::Result<BufWriter<UnixStream>> {
     let mut stream = UnixStream::connect(socket)?;
+    let timeout = timeout_from_env("DSAPI_CLIENT_TIMEOUT_MS", 5000, 100);
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+
     stream.write_all(b"STREAM_TOUCH_V1\n")?;
     stream.flush()?;
 

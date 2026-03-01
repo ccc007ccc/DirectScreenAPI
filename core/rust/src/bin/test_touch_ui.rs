@@ -2,6 +2,7 @@ use directscreen_core::client::{
     spawn_touch_router, DisplayEvent, DsapiClient, TouchMessage, TouchPhase, TouchRouterConfig,
     TouchRouterHandle,
 };
+use directscreen_core::util::{default_control_socket_path, derive_data_socket_path_text};
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -406,17 +407,6 @@ impl UiState {
     }
 }
 
-fn default_control_socket_path() -> String {
-    "artifacts/run/dsapi.sock".to_string()
-}
-
-fn derive_data_socket_path(control_socket_path: &str) -> String {
-    if let Some(prefix) = control_socket_path.strip_suffix(".sock") {
-        return format!("{}.data.sock", prefix);
-    }
-    format!("{}.data", control_socket_path)
-}
-
 fn usage() {
     eprintln!("usage:");
     eprintln!(
@@ -504,7 +494,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 
     let data_socket = data_socket
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| derive_data_socket_path(&control_socket));
+        .unwrap_or_else(|| derive_data_socket_path_text(&control_socket));
     if control_socket == data_socket {
         return Err("control_socket_and_data_socket_must_differ".to_string());
     }

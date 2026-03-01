@@ -2,6 +2,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+use crate::util::{derive_data_socket_path, timeout_from_env};
+
 use super::display::DisplayStream;
 use super::error::{DsapiError, Result};
 use super::render::RenderSession;
@@ -25,7 +27,14 @@ pub(crate) struct SocketConnection {
 impl SocketConnection {
     pub(crate) fn connect(socket_path: &Path) -> Result<Self> {
         let writer = UnixStream::connect(socket_path)?;
-        let reader = BufReader::new(writer.try_clone()?);
+        let timeout = timeout_from_env("DSAPI_CLIENT_TIMEOUT_MS", 5000, 100);
+        writer.set_read_timeout(timeout)?;
+        writer.set_write_timeout(timeout)?;
+
+        let reader_stream = writer.try_clone()?;
+        reader_stream.set_read_timeout(timeout)?;
+        reader_stream.set_write_timeout(timeout)?;
+        let reader = BufReader::new(reader_stream);
         Ok(Self { writer, reader })
     }
 
@@ -206,14 +215,6 @@ impl DsapiClient {
         }
         Ok(())
     }
-}
-
-fn derive_data_socket_path(control_socket_path: &Path) -> PathBuf {
-    let text = control_socket_path.to_string_lossy();
-    if let Some(prefix) = text.strip_suffix(".sock") {
-        return PathBuf::from(format!("{}.data.sock", prefix));
-    }
-    PathBuf::from(format!("{}.data", text))
 }
 
 #[cfg(test)]

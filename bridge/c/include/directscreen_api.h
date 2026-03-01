@@ -71,6 +71,12 @@ typedef struct dsapi_render_present_info {
 const char* dsapi_version(void);
 uint32_t dsapi_abi_version(void);
 
+/*
+ * 生命周期与并发约束：
+ * 1) ctx 必须由 dsapi_context_create 或 dsapi_context_create_with_abi 创建，并且只销毁一次。
+ * 2) dsapi_context_destroy(ctx) 不能与任何其它 dsapi_* 调用并发执行。
+ * 3) 任何 API 返回前都不会持有调用方传入缓冲区的所有权；调用方负责其内存生命周期。
+ */
 dsapi_context_t* dsapi_context_create(void);
 int32_t dsapi_context_create_with_abi(uint32_t abi_version, dsapi_context_t** out_ctx);
 void dsapi_context_destroy(dsapi_context_t* ctx);

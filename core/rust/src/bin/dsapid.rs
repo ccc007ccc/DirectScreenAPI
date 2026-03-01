@@ -1,19 +1,38 @@
-use std::collections::HashSet;
-use std::ffi::CString;
 use std::fs;
-use std::io::{BufRead, BufReader, IoSlice, Read, Write};
-use std::os::fd::AsRawFd;
+use std::io::{BufReader, Read, Write};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use directscreen_core::api::{RouteResult, Status, TouchEvent, RENDER_MAX_FRAME_BYTES};
-use directscreen_core::engine::{execute_command, RuntimeEngine};
-use nix::sys::socket::{getsockopt, sendmsg, sockopt, ControlMessage, MsgFlags};
+use directscreen_core::api::{RouteResult, Status, TouchEvent};
+use directscreen_core::engine::RuntimeEngine;
+use nix::sys::socket::{getsockopt, sockopt};
+
+#[path = "dsapid/config.rs"]
+mod dsapid_config;
+#[path = "dsapid/control_dispatch.rs"]
+mod dsapid_control_dispatch;
+#[path = "dsapid/data_dispatch.rs"]
+mod dsapid_data_dispatch;
+#[path = "dsapid/frame_fd.rs"]
+mod dsapid_frame_fd;
+#[path = "dsapid/parse.rs"]
+mod dsapid_parse;
+use dsapid_config::{ensure_parent, parse_daemon_config};
+use dsapid_control_dispatch::handle_control_client;
+use dsapid_data_dispatch::handle_data_client;
+use dsapid_parse::RawFrameSubmitRequest;
+#[cfg(test)]
+use dsapid_parse::{
+    parse_display_stream_v1_request, parse_frame_bind_fd_request, parse_frame_get_bound_request,
+    parse_frame_get_fd_request, parse_frame_get_raw_request,
+    parse_frame_wait_bound_present_request, parse_raw_frame_submit_request,
+};
 
 struct SocketGuard {
     path: PathBuf,
@@ -27,370 +46,14 @@ impl SocketGuard {
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = remove_stale_socket(&self.path);
     }
-}
-
-fn default_control_socket_path() -> String {
-    "artifacts/run/dsapi.sock".to_string()
-}
-
-fn derive_data_socket_path(control_socket_path: &str) -> String {
-    if let Some(prefix) = control_socket_path.strip_suffix(".sock") {
-        return format!("{}.data.sock", prefix);
-    }
-    format!("{}.data", control_socket_path)
 }
 
 #[derive(Debug, Clone)]
-struct DaemonConfig {
-    control_socket_path: String,
-    data_socket_path: String,
-    render_output_dir: String,
-    supervise_presenter_cmd: Option<String>,
-    supervise_input_cmd: Option<String>,
-    supervise_restart_ms: u64,
-    allowed_uids: HashSet<u32>,
-}
-
-fn parse_u64_arg(token: &str) -> Result<u64, String> {
-    token
-        .parse::<u64>()
-        .map_err(|_| format!("invalid_u64_value:{}", token))
-}
-
-fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
-    let mut control_socket_path = std::env::var("DSAPI_CONTROL_SOCKET_PATH")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            std::env::var("DSAPI_SOCKET_PATH")
-                .ok()
-                .filter(|v| !v.is_empty())
-        })
-        .unwrap_or_else(default_control_socket_path);
-    let mut data_socket_path = std::env::var("DSAPI_DATA_SOCKET_PATH")
-        .ok()
-        .filter(|v| !v.is_empty());
-    let mut render_output_dir =
-        std::env::var("DSAPI_RENDER_OUTPUT_DIR").unwrap_or_else(|_| "artifacts/render".to_string());
-    let mut supervise_presenter_cmd = std::env::var("DSAPI_SUPERVISE_PRESENTER_CMD")
-        .ok()
-        .filter(|v| !v.is_empty());
-    let mut supervise_input_cmd = std::env::var("DSAPI_SUPERVISE_INPUT_CMD")
-        .ok()
-        .filter(|v| !v.is_empty());
-    let mut supervise_restart_ms = std::env::var("DSAPI_SUPERVISE_RESTART_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(500);
-
-    let mut i = 1usize;
-    while i < args.len() {
-        let key = args[i].as_str();
-        match key {
-            "--socket" => {
-                if (i + 1) >= args.len() {
-                    return Err("missing_socket_path".to_string());
-                }
-                control_socket_path = args[i + 1].clone();
-                i += 2;
-            }
-            "--control-socket" => {
-                if (i + 1) >= args.len() {
-                    return Err("missing_control_socket_path".to_string());
-                }
-                control_socket_path = args[i + 1].clone();
-                i += 2;
-            }
-            "--data-socket" => {
-                if (i + 1) >= args.len() {
-                    return Err("missing_data_socket_path".to_string());
-                }
-                data_socket_path = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--render-output-dir" => {
-                if (i + 1) >= args.len() {
-                    return Err("missing_render_output_dir".to_string());
-                }
-                render_output_dir = args[i + 1].clone();
-                i += 2;
-            }
-            "--supervise-presenter" => {
-                if (i + 1) >= args.len() {
-                    return Err("missing_supervise_presenter_cmd".to_string());
-                }
-                supervise_presenter_cmd = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--supervise-input" => {
-                if (i + 1) >= args.len() {
-                    return Err("missing_supervise_input_cmd".to_string());
-                }
-                supervise_input_cmd = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--supervise-restart-ms" => {
-                if (i + 1) >= args.len() {
-                    return Err("missing_supervise_restart_ms".to_string());
-                }
-                supervise_restart_ms = parse_u64_arg(&args[i + 1])?;
-                i += 2;
-            }
-            _ => return Err(format!("unknown_arg:{}", args[i])),
-        }
-    }
-
-    if supervise_restart_ms < 50 {
-        supervise_restart_ms = 50;
-    }
-
-    let data_socket_path = data_socket_path
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| derive_data_socket_path(&control_socket_path));
-    if control_socket_path == data_socket_path {
-        return Err("control_socket_and_data_socket_must_differ".to_string());
-    }
-
-    let allowed_uids = parse_allowed_uids_from_env()?;
-
-    Ok(DaemonConfig {
-        control_socket_path,
-        data_socket_path,
-        render_output_dir,
-        supervise_presenter_cmd,
-        supervise_input_cmd,
-        supervise_restart_ms,
-        allowed_uids,
-    })
-}
-
-fn parse_allowed_uids_from_env() -> Result<HashSet<u32>, String> {
-    let default_uid = unsafe { libc::geteuid() as u32 };
-    let raw = match std::env::var("DSAPI_ALLOWED_UIDS") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => {
-            let mut out = HashSet::new();
-            out.insert(default_uid);
-            return Ok(out);
-        }
-    };
-
-    let mut out = HashSet::new();
-    for token in raw.split(',') {
-        let t = token.trim();
-        if t.is_empty() {
-            continue;
-        }
-        let uid = t
-            .parse::<u32>()
-            .map_err(|_| format!("invalid_allowed_uid:{}", t))?;
-        out.insert(uid);
-    }
-
-    if out.is_empty() {
-        return Err("allowed_uids_empty".to_string());
-    }
-    Ok(out)
-}
-
-fn ensure_parent(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RawFrameSubmitRequest {
-    width: u32,
-    height: u32,
-    byte_len: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct BoundFrameFd {
-    fd: i32,
-    capacity: usize,
-}
-
-fn status_name(status: Status) -> &'static str {
-    match status {
-        Status::Ok => "OK",
-        Status::NullPointer => "NULL_POINTER",
-        Status::InvalidArgument => "INVALID_ARGUMENT",
-        Status::OutOfRange => "OUT_OF_RANGE",
-        Status::InternalError => "INTERNAL_ERROR",
-    }
-}
-
-fn parse_u32(token: &str) -> Result<u32, Status> {
-    token.parse::<u32>().map_err(|_| Status::InvalidArgument)
-}
-
-fn parse_u64(token: &str) -> Result<u64, Status> {
-    token.parse::<u64>().map_err(|_| Status::InvalidArgument)
-}
-
-fn parse_raw_frame_submit_request(line: &str) -> Result<Option<RawFrameSubmitRequest>, Status> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-
-    let mut tokens = trimmed.split_whitespace();
-    let Some(cmd) = tokens.next() else {
-        return Ok(None);
-    };
-
-    if !cmd.eq_ignore_ascii_case("RENDER_FRAME_SUBMIT_RGBA_RAW") {
-        return Ok(None);
-    }
-
-    let width = parse_u32(tokens.next().ok_or(Status::InvalidArgument)?)?;
-    let height = parse_u32(tokens.next().ok_or(Status::InvalidArgument)?)?;
-    let byte_len_u32 = parse_u32(tokens.next().ok_or(Status::InvalidArgument)?)?;
-    if tokens.next().is_some() {
-        return Err(Status::InvalidArgument);
-    }
-    if width == 0 || height == 0 {
-        return Err(Status::InvalidArgument);
-    }
-
-    let byte_len = usize::try_from(byte_len_u32).map_err(|_| Status::OutOfRange)?;
-    let expected_len = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|v| v.checked_mul(4usize))
-        .ok_or(Status::OutOfRange)?;
-    if expected_len != byte_len {
-        return Err(Status::InvalidArgument);
-    }
-    if expected_len > RENDER_MAX_FRAME_BYTES {
-        return Err(Status::OutOfRange);
-    }
-
-    Ok(Some(RawFrameSubmitRequest {
-        width,
-        height,
-        byte_len,
-    }))
-}
-
-fn parse_frame_get_raw_request(line: &str) -> Result<bool, Status> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(false);
-    }
-
-    let mut tokens = trimmed.split_whitespace();
-    let Some(cmd) = tokens.next() else {
-        return Ok(false);
-    };
-    if !cmd.eq_ignore_ascii_case("RENDER_FRAME_GET_RAW") {
-        return Ok(false);
-    }
-    if tokens.next().is_some() {
-        return Err(Status::InvalidArgument);
-    }
-    Ok(true)
-}
-
-fn parse_frame_get_fd_request(line: &str) -> Result<bool, Status> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(false);
-    }
-
-    let mut tokens = trimmed.split_whitespace();
-    let Some(cmd) = tokens.next() else {
-        return Ok(false);
-    };
-    if !cmd.eq_ignore_ascii_case("RENDER_FRAME_GET_FD") {
-        return Ok(false);
-    }
-    if tokens.next().is_some() {
-        return Err(Status::InvalidArgument);
-    }
-    Ok(true)
-}
-
-fn parse_frame_bind_fd_request(line: &str) -> Result<bool, Status> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(false);
-    }
-
-    let mut tokens = trimmed.split_whitespace();
-    let Some(cmd) = tokens.next() else {
-        return Ok(false);
-    };
-    if !cmd.eq_ignore_ascii_case("RENDER_FRAME_BIND_FD") {
-        return Ok(false);
-    }
-    if tokens.next().is_some() {
-        return Err(Status::InvalidArgument);
-    }
-    Ok(true)
-}
-
-fn parse_frame_get_bound_request(line: &str) -> Result<bool, Status> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(false);
-    }
-
-    let mut tokens = trimmed.split_whitespace();
-    let Some(cmd) = tokens.next() else {
-        return Ok(false);
-    };
-    if !cmd.eq_ignore_ascii_case("RENDER_FRAME_GET_BOUND") {
-        return Ok(false);
-    }
-    if tokens.next().is_some() {
-        return Err(Status::InvalidArgument);
-    }
-    Ok(true)
-}
-
-fn parse_frame_wait_bound_present_request(line: &str) -> Result<Option<(u64, u32)>, Status> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-
-    let mut tokens = trimmed.split_whitespace();
-    let Some(cmd) = tokens.next() else {
-        return Ok(None);
-    };
-    if !cmd.eq_ignore_ascii_case("RENDER_FRAME_WAIT_BOUND_PRESENT") {
-        return Ok(None);
-    }
-    let last_seq = parse_u64(tokens.next().ok_or(Status::InvalidArgument)?)?;
-    let timeout_ms = parse_u32(tokens.next().ok_or(Status::InvalidArgument)?)?;
-    if tokens.next().is_some() {
-        return Err(Status::InvalidArgument);
-    }
-    Ok(Some((last_seq, timeout_ms)))
-}
-
-fn parse_display_stream_v1_request(line: &str) -> Result<bool, Status> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(false);
-    }
-
-    let mut tokens = trimmed.split_whitespace();
-    let Some(cmd) = tokens.next() else {
-        return Ok(false);
-    };
-    if !cmd.eq_ignore_ascii_case("STREAM_DISPLAY_V1") {
-        return Ok(false);
-    }
-    if tokens.next().is_some() {
-        return Err(Status::InvalidArgument);
-    }
-    Ok(true)
+struct WorkerCommand {
+    program: String,
+    args: Vec<String>,
 }
 
 fn socket_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
@@ -399,12 +62,17 @@ fn socket_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
 }
 
 fn write_status_error(stream: &mut UnixStream, status: Status) {
-    let _ = stream.write_all(format!("ERR {}\n", status_name(status)).as_bytes());
+    let _ = stream.write_all(format!("ERR {}\n", status.as_str()).as_bytes());
     let _ = stream.flush();
 }
 
 fn write_internal_error(stream: &mut UnixStream, msg: &str) {
     let _ = stream.write_all(format!("ERR INTERNAL_ERROR {}\n", msg).as_bytes());
+    let _ = stream.flush();
+}
+
+fn write_busy(stream: &mut UnixStream) {
+    let _ = stream.write_all(b"ERR BUSY\n");
     let _ = stream.flush();
 }
 
@@ -440,24 +108,135 @@ fn write_line_allow_disconnect(stream: &mut UnixStream, line: &str) -> std::io::
     }
 }
 
+fn read_command_line(
+    reader: &mut BufReader<UnixStream>,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
+    let mut out: Vec<u8> = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                if out.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            Ok(_) => {
+                if out.len() >= max_bytes {
+                    // 超长命令直接丢弃本行剩余数据，避免单连接持续占用解析内存。
+                    loop {
+                        match reader.read(&mut byte) {
+                            Ok(0) => break,
+                            Ok(_) if byte[0] == b'\n' => break,
+                            Ok(_) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "command_too_long",
+                    ));
+                }
+                out.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    String::from_utf8(out)
+        .map(Some)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "command_not_utf8"))
+}
+
+fn contains_shell_meta(raw: &str) -> bool {
+    raw.chars().any(|c| {
+        matches!(
+            c,
+            ';' | '|' | '&' | '<' | '>' | '$' | '`' | '\n' | '\r' | '\'' | '"' | '\\'
+        )
+    })
+}
+
+fn parse_worker_command(raw: &str) -> Result<WorkerCommand, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("worker_cmd_empty".to_string());
+    }
+    if contains_shell_meta(trimmed) {
+        return Err("worker_cmd_contains_shell_meta".to_string());
+    }
+    let tokens: Vec<String> = trimmed
+        .split_whitespace()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .collect();
+    if tokens.is_empty() {
+        return Err("worker_cmd_empty".to_string());
+    }
+    if tokens[0].starts_with('-') {
+        return Err("worker_program_invalid".to_string());
+    }
+    Ok(WorkerCommand {
+        program: tokens[0].clone(),
+        args: tokens[1..].to_vec(),
+    })
+}
+
+fn backoff_delay(base: Duration, failures: u32) -> Duration {
+    let max_delay = Duration::from_secs(30);
+    let shift = failures.min(6);
+    let factor = 1u128 << shift;
+    let ms = base.as_millis().saturating_mul(factor);
+    let capped = ms.min(max_delay.as_millis());
+    Duration::from_millis(capped as u64)
+}
+
+fn remove_stale_socket(path: &std::path::Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_socket() {
+                fs::remove_file(path)
+            } else {
+                Err(std::io::Error::other("refuse_remove_non_socket"))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn secure_socket_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    let permissions = fs::Permissions::from_mode(0o600);
+    fs::set_permissions(path, permissions)
+}
+
 fn handle_raw_frame_submit(
     stream: &mut UnixStream,
     reader: &mut BufReader<UnixStream>,
     engine: &Arc<RuntimeEngine>,
     req: RawFrameSubmitRequest,
+    raw_read_timeout: Duration,
 ) -> std::io::Result<()> {
     stream.write_all(b"OK READY\n")?;
     stream.flush()?;
 
+    let original_timeout = reader.get_ref().read_timeout()?;
+    reader.get_ref().set_read_timeout(Some(raw_read_timeout))?;
     let mut pixels_rgba8 = vec![0u8; req.byte_len];
-    reader.read_exact(&mut pixels_rgba8)?;
+    let read_res = reader.read_exact(&mut pixels_rgba8);
+    let _ = reader.get_ref().set_read_timeout(original_timeout);
+    read_res?;
 
     let response = match engine.submit_render_frame_rgba(req.width, req.height, pixels_rgba8) {
         Ok(frame) => format!(
             "OK {} {} {} RGBA8888 {} {}",
             frame.frame_seq, frame.width, frame.height, frame.byte_len, frame.checksum_fnv1a32
         ),
-        Err(status) => format!("ERR {}", status_name(status)),
+        Err(status) => format!("ERR {}", status.as_str()),
     };
 
     stream.write_all(response.as_bytes())?;
@@ -502,195 +281,6 @@ fn handle_frame_get_raw(
         offset = end;
     }
 
-    stream.flush()?;
-    Ok(())
-}
-
-fn close_fd(fd: i32) {
-    if fd >= 0 {
-        let _ = unsafe { libc::close(fd) };
-    }
-}
-
-fn create_memfd_sized(name: &str, capacity: usize) -> std::io::Result<i32> {
-    let c_name = CString::new(name).map_err(|_| std::io::Error::other("memfd_name_invalid"))?;
-    let fd = unsafe { libc::memfd_create(c_name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    if unsafe { libc::ftruncate(fd, capacity as libc::off_t) } < 0 {
-        let err = std::io::Error::last_os_error();
-        close_fd(fd);
-        return Err(err);
-    }
-    Ok(fd)
-}
-
-fn write_all_to_fd_from_start(fd: i32, data: &[u8]) -> std::io::Result<()> {
-    if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let mut offset = 0usize;
-    while offset < data.len() {
-        let ptr = unsafe { data.as_ptr().add(offset) } as *const libc::c_void;
-        let remain = data.len() - offset;
-        let n = unsafe { libc::write(fd, ptr, remain) };
-        if n < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if n == 0 {
-            return Err(std::io::Error::other("fd_write_zero"));
-        }
-        offset += n as usize;
-    }
-    Ok(())
-}
-
-fn create_memfd_with_data(name: &str, data: &[u8]) -> std::io::Result<i32> {
-    let fd = create_memfd_sized(name, data.len())?;
-    if let Err(e) = write_all_to_fd_from_start(fd, data) {
-        close_fd(fd);
-        return Err(e);
-    }
-    if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
-        let err = std::io::Error::last_os_error();
-        close_fd(fd);
-        return Err(err);
-    }
-    Ok(fd)
-}
-
-fn send_line_with_fd(stream: &UnixStream, line: &str, fd: i32) -> std::io::Result<()> {
-    let payload = line.as_bytes();
-    let iov = [IoSlice::new(payload)];
-    let fds = [fd];
-    let cmsgs = [ControlMessage::ScmRights(&fds)];
-    let sent = sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsgs, MsgFlags::empty(), None)
-        .map_err(std::io::Error::other)?;
-    if sent != payload.len() {
-        return Err(std::io::Error::other("sendmsg_short_write"));
-    }
-    Ok(())
-}
-
-fn handle_frame_get_fd(
-    stream: &mut UnixStream,
-    engine: &Arc<RuntimeEngine>,
-) -> std::io::Result<()> {
-    let (frame, pixels_rgba8) = {
-        let Some(snapshot) = engine.render_frame_snapshot() else {
-            write_status_error(stream, Status::OutOfRange);
-            return Ok(());
-        };
-        snapshot
-    };
-
-    let total = frame.byte_len as usize;
-    if total != pixels_rgba8.len() {
-        return Err(std::io::Error::other("frame_snapshot_len_mismatch"));
-    }
-
-    let fd = create_memfd_with_data("dsapi_frame", pixels_rgba8.as_ref())?;
-    let header = format!(
-        "OK {} {} {} {}\n",
-        frame.frame_seq, frame.width, frame.height, frame.byte_len
-    );
-    let res = send_line_with_fd(stream, &header, fd);
-    close_fd(fd);
-    res
-}
-
-fn handle_frame_bind_fd(
-    stream: &UnixStream,
-    bound_fd: &mut Option<BoundFrameFd>,
-) -> std::io::Result<()> {
-    if bound_fd.is_none() {
-        let capacity = RENDER_MAX_FRAME_BYTES;
-        let fd = create_memfd_sized("dsapi_frame_bound", capacity)?;
-        *bound_fd = Some(BoundFrameFd { fd, capacity });
-    }
-    let bound = bound_fd.expect("bound fd must exist");
-    let line = format!("OK BOUND {}\n", bound.capacity);
-    send_line_with_fd(stream, &line, bound.fd)
-}
-
-fn handle_frame_get_bound(
-    stream: &mut UnixStream,
-    engine: &Arc<RuntimeEngine>,
-    bound_fd: &BoundFrameFd,
-) -> std::io::Result<()> {
-    let (frame, pixels_rgba8) = {
-        let Some(snapshot) = engine.render_frame_snapshot() else {
-            write_status_error(stream, Status::OutOfRange);
-            return Ok(());
-        };
-        snapshot
-    };
-
-    let total = frame.byte_len as usize;
-    if total != pixels_rgba8.len() {
-        return Err(std::io::Error::other("frame_snapshot_len_mismatch"));
-    }
-    if total > bound_fd.capacity {
-        write_status_error(stream, Status::OutOfRange);
-        return Ok(());
-    }
-
-    write_all_to_fd_from_start(bound_fd.fd, pixels_rgba8.as_ref())?;
-    let line = format!(
-        "OK {} {} {} {}\n",
-        frame.frame_seq, frame.width, frame.height, frame.byte_len
-    );
-    stream.write_all(line.as_bytes())?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn handle_frame_wait_bound_present(
-    stream: &mut UnixStream,
-    engine: &Arc<RuntimeEngine>,
-    bound_fd: &BoundFrameFd,
-    last_seq: u64,
-    timeout_ms: u32,
-) -> std::io::Result<()> {
-    let Some(_) = engine
-        .wait_for_frame_after(last_seq, timeout_ms)
-        .map_err(|_| std::io::Error::other("frame_wait_failed"))?
-    else {
-        stream.write_all(b"OK TIMEOUT\n")?;
-        stream.flush()?;
-        return Ok(());
-    };
-
-    let (frame, pixels_rgba8) = {
-        let Some(snapshot) = engine.render_frame_snapshot() else {
-            write_status_error(stream, Status::OutOfRange);
-            return Ok(());
-        };
-        snapshot
-    };
-
-    let total = frame.byte_len as usize;
-    if total != pixels_rgba8.len() {
-        return Err(std::io::Error::other("frame_snapshot_len_mismatch"));
-    }
-    if total > bound_fd.capacity {
-        write_status_error(stream, Status::OutOfRange);
-        return Ok(());
-    }
-
-    write_all_to_fd_from_start(bound_fd.fd, pixels_rgba8.as_ref())?;
-    engine
-        .render_present()
-        .map_err(|_| std::io::Error::other("frame_present_failed"))?;
-
-    let line = format!(
-        "OK {} {} {} RGBA8888 {} {}\n",
-        frame.frame_seq, frame.width, frame.height, frame.byte_len, frame.checksum_fnv1a32
-    );
-    stream.write_all(line.as_bytes())?;
     stream.flush()?;
     Ok(())
 }
@@ -807,232 +397,6 @@ fn handle_display_stream_v1(
     Ok(())
 }
 
-fn handle_control_client(
-    mut stream: UnixStream,
-    engine: Arc<RuntimeEngine>,
-    shutdown: Arc<AtomicBool>,
-) {
-    let reader_stream = match stream.try_clone() {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = stream.write_all(format!("ERR INTERNAL_ERROR clone_failed:{}\n", e).as_bytes());
-            return;
-        }
-    };
-
-    let mut reader = BufReader::new(reader_stream);
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                let display_stream = match parse_display_stream_v1_request(&line) {
-                    Ok(v) => v,
-                    Err(status) => {
-                        write_status_error(&mut stream, status);
-                        continue;
-                    }
-                };
-                if display_stream {
-                    if let Err(e) = handle_display_stream_v1(&mut stream, &engine, &shutdown) {
-                        write_internal_error(&mut stream, &format!("display_stream_failed:{}", e));
-                    }
-                    break;
-                }
-
-                if line.trim().eq_ignore_ascii_case("STREAM_TOUCH_V1")
-                    || line.trim().starts_with("RENDER_FRAME_SUBMIT_RGBA_RAW ")
-                    || line.trim().eq_ignore_ascii_case("RENDER_FRAME_GET_RAW")
-                    || line.trim().eq_ignore_ascii_case("RENDER_FRAME_GET_FD")
-                    || line.trim().eq_ignore_ascii_case("RENDER_FRAME_BIND_FD")
-                    || line.trim().eq_ignore_ascii_case("RENDER_FRAME_GET_BOUND")
-                    || line.trim().starts_with("RENDER_FRAME_WAIT_BOUND_PRESENT ")
-                {
-                    write_status_error(&mut stream, Status::InvalidArgument);
-                    continue;
-                }
-
-                let outcome = execute_command(&engine, &line);
-
-                let response = format!("{}\n", outcome.response_line);
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
-
-                if outcome.should_shutdown {
-                    shutdown.store(true, Ordering::SeqCst);
-                    break;
-                }
-            }
-            Err(e) => {
-                let _ =
-                    stream.write_all(format!("ERR INTERNAL_ERROR read_failed:{}\n", e).as_bytes());
-                break;
-            }
-        }
-    }
-}
-
-fn handle_data_client(
-    mut stream: UnixStream,
-    engine: Arc<RuntimeEngine>,
-    shutdown: Arc<AtomicBool>,
-) {
-    let reader_stream = match stream.try_clone() {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = stream.write_all(format!("ERR INTERNAL_ERROR clone_failed:{}\n", e).as_bytes());
-            return;
-        }
-    };
-
-    let mut reader = BufReader::new(reader_stream);
-    let mut bound_frame_fd: Option<BoundFrameFd> = None;
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                let raw_get = match parse_frame_get_raw_request(&line) {
-                    Ok(v) => v,
-                    Err(status) => {
-                        write_status_error(&mut stream, status);
-                        continue;
-                    }
-                };
-                if raw_get {
-                    if let Err(e) = handle_frame_get_raw(&mut stream, &engine) {
-                        write_internal_error(&mut stream, &format!("raw_get_failed:{}", e));
-                        break;
-                    }
-                    continue;
-                }
-
-                let bind_fd = match parse_frame_bind_fd_request(&line) {
-                    Ok(v) => v,
-                    Err(status) => {
-                        write_status_error(&mut stream, status);
-                        continue;
-                    }
-                };
-                if bind_fd {
-                    if let Err(e) = handle_frame_bind_fd(&stream, &mut bound_frame_fd) {
-                        write_internal_error(&mut stream, &format!("bind_fd_failed:{}", e));
-                        break;
-                    }
-                    continue;
-                }
-
-                let get_bound = match parse_frame_get_bound_request(&line) {
-                    Ok(v) => v,
-                    Err(status) => {
-                        write_status_error(&mut stream, status);
-                        continue;
-                    }
-                };
-                if get_bound {
-                    let Some(bound) = bound_frame_fd.as_ref() else {
-                        write_status_error(&mut stream, Status::InvalidArgument);
-                        continue;
-                    };
-                    if let Err(e) = handle_frame_get_bound(&mut stream, &engine, bound) {
-                        write_internal_error(&mut stream, &format!("get_bound_failed:{}", e));
-                        break;
-                    }
-                    continue;
-                }
-
-                let wait_bound_present = match parse_frame_wait_bound_present_request(&line) {
-                    Ok(v) => v,
-                    Err(status) => {
-                        write_status_error(&mut stream, status);
-                        continue;
-                    }
-                };
-                if let Some((last_seq, timeout_ms)) = wait_bound_present {
-                    let Some(bound) = bound_frame_fd.as_ref() else {
-                        write_status_error(&mut stream, Status::InvalidArgument);
-                        continue;
-                    };
-                    if let Err(e) = handle_frame_wait_bound_present(
-                        &mut stream,
-                        &engine,
-                        bound,
-                        last_seq,
-                        timeout_ms,
-                    ) {
-                        write_internal_error(
-                            &mut stream,
-                            &format!("wait_bound_present_failed:{}", e),
-                        );
-                        break;
-                    }
-                    continue;
-                }
-
-                let fd_get = match parse_frame_get_fd_request(&line) {
-                    Ok(v) => v,
-                    Err(status) => {
-                        write_status_error(&mut stream, status);
-                        continue;
-                    }
-                };
-                if fd_get {
-                    if let Err(e) = handle_frame_get_fd(&mut stream, &engine) {
-                        write_internal_error(&mut stream, &format!("fd_get_failed:{}", e));
-                        break;
-                    }
-                    continue;
-                }
-
-                let raw_submit = match parse_raw_frame_submit_request(&line) {
-                    Ok(v) => v,
-                    Err(status) => {
-                        write_status_error(&mut stream, status);
-                        continue;
-                    }
-                };
-
-                if let Some(req) = raw_submit {
-                    if let Err(e) = handle_raw_frame_submit(&mut stream, &mut reader, &engine, req)
-                    {
-                        write_internal_error(&mut stream, &format!("raw_read_failed:{}", e));
-                        break;
-                    }
-                    continue;
-                }
-
-                if line.trim().eq_ignore_ascii_case("STREAM_TOUCH_V1") {
-                    if let Err(e) =
-                        handle_touch_stream_v1(&mut stream, &mut reader, &engine, &shutdown)
-                    {
-                        write_internal_error(&mut stream, &format!("touch_stream_failed:{}", e));
-                    }
-                    break;
-                }
-
-                write_status_error(&mut stream, Status::InvalidArgument);
-            }
-            Err(e) => {
-                let _ =
-                    stream.write_all(format!("ERR INTERNAL_ERROR read_failed:{}\n", e).as_bytes());
-                break;
-            }
-        }
-    }
-
-    if let Some(bound) = bound_frame_fd.take() {
-        close_fd(bound.fd);
-    }
-}
-
 fn kill_process_quiet(pid: i32, sig: i32) {
     if pid > 0 {
         let _ = unsafe { libc::kill(pid, sig) };
@@ -1041,17 +405,20 @@ fn kill_process_quiet(pid: i32, sig: i32) {
 
 fn supervise_worker(
     name: &'static str,
-    cmd: String,
-    restart_delay: Duration,
+    cmd: WorkerCommand,
+    base_restart_delay: Duration,
     shutdown: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        let mut failures = 0u32;
         while !shutdown.load(Ordering::SeqCst) {
-            let mut child = match Command::new("sh").arg("-c").arg(&cmd).spawn() {
+            let started_at = Instant::now();
+            let mut child = match Command::new(&cmd.program).args(&cmd.args).spawn() {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("daemon_worker_error=name={} action=spawn err={}", name, e);
-                    thread::sleep(restart_delay);
+                    failures = failures.saturating_add(1);
+                    thread::sleep(backoff_delay(base_restart_delay, failures));
                     continue;
                 }
             };
@@ -1074,10 +441,18 @@ fn supervise_worker(
 
                 match child.try_wait() {
                     Ok(Some(status)) => {
+                        let runtime_ms = started_at.elapsed().as_millis() as u64;
+                        if runtime_ms >= 10_000 {
+                            failures = 0;
+                        } else {
+                            failures = failures.saturating_add(1);
+                        }
+                        let restart_delay = backoff_delay(base_restart_delay, failures);
                         eprintln!(
-                            "daemon_worker_warn=name={} state=exited status={} restart_in_ms={}",
+                            "daemon_worker_warn=name={} state=exited status={} runtime_ms={} restart_in_ms={}",
                             name,
                             status,
+                            runtime_ms,
                             restart_delay.as_millis()
                         );
                         break;
@@ -1093,10 +468,145 @@ fn supervise_worker(
             }
 
             if !shutdown.load(Ordering::SeqCst) {
-                thread::sleep(restart_delay);
+                thread::sleep(backoff_delay(base_restart_delay, failures));
             }
         }
     })
+}
+
+struct ActiveConnectionGuard {
+    active_connections: Arc<AtomicUsize>,
+}
+
+impl ActiveConnectionGuard {
+    fn new(active_connections: Arc<AtomicUsize>) -> Self {
+        Self { active_connections }
+    }
+}
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.active_connections.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_connection(active_connections: &Arc<AtomicUsize>, max_connections: usize) -> bool {
+    let mut current = active_connections.load(Ordering::Acquire);
+    loop {
+        if current >= max_connections {
+            return false;
+        }
+        match active_connections.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(next) => current = next,
+        }
+    }
+}
+
+struct DispatchContext {
+    allowed_uids: Arc<std::collections::HashSet<u32>>,
+    active_connections: Arc<AtomicUsize>,
+    max_connections: usize,
+    socket_rw_timeout_ms: u64,
+    command_max_bytes: usize,
+    raw_frame_max_bytes: usize,
+    raw_read_timeout: Duration,
+    engine: Arc<RuntimeEngine>,
+    shutdown: Arc<AtomicBool>,
+}
+
+fn dispatch_accepted_client(
+    mut stream: UnixStream,
+    socket_kind: &'static str,
+    ctx: &DispatchContext,
+) -> bool {
+    match socket_peer_uid(&stream) {
+        Ok(uid) if ctx.allowed_uids.contains(&uid) => {
+            if !try_acquire_connection(&ctx.active_connections, ctx.max_connections) {
+                write_busy(&mut stream);
+                eprintln!(
+                    "daemon_warn=too_many_connections socket_kind={} active={} limit={}",
+                    socket_kind,
+                    ctx.active_connections.load(Ordering::Acquire),
+                    ctx.max_connections
+                );
+                return true;
+            }
+
+            let socket_timeout = if ctx.socket_rw_timeout_ms == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(ctx.socket_rw_timeout_ms))
+            };
+            if let Err(e) = stream.set_read_timeout(socket_timeout) {
+                let _ = stream.write_all(b"ERR INTERNAL_ERROR set_read_timeout_failed\n");
+                let _ = stream.flush();
+                ctx.active_connections.fetch_sub(1, Ordering::AcqRel);
+                eprintln!(
+                    "daemon_warn=set_read_timeout_failed socket_kind={} err={}",
+                    socket_kind, e
+                );
+                return true;
+            }
+            if let Err(e) = stream.set_write_timeout(socket_timeout) {
+                let _ = stream.write_all(b"ERR INTERNAL_ERROR set_write_timeout_failed\n");
+                let _ = stream.flush();
+                ctx.active_connections.fetch_sub(1, Ordering::AcqRel);
+                eprintln!(
+                    "daemon_warn=set_write_timeout_failed socket_kind={} err={}",
+                    socket_kind, e
+                );
+                return true;
+            }
+
+            let engine_ref = Arc::clone(&ctx.engine);
+            let shutdown_ref = Arc::clone(&ctx.shutdown);
+            let active_connections_ref = Arc::clone(&ctx.active_connections);
+            let command_max_bytes = ctx.command_max_bytes;
+            let raw_frame_max_bytes = ctx.raw_frame_max_bytes;
+            let raw_read_timeout = ctx.raw_read_timeout;
+            thread::spawn(move || {
+                let _active_guard = ActiveConnectionGuard::new(active_connections_ref);
+                match socket_kind {
+                    "control" => {
+                        handle_control_client(stream, engine_ref, shutdown_ref, command_max_bytes)
+                    }
+                    "data" => handle_data_client(
+                        stream,
+                        engine_ref,
+                        shutdown_ref,
+                        command_max_bytes,
+                        raw_frame_max_bytes,
+                        raw_read_timeout,
+                    ),
+                    _ => {}
+                }
+            });
+        }
+        Ok(uid) => {
+            let _ = stream.write_all(b"ERR FORBIDDEN\n");
+            let _ = stream.flush();
+            eprintln!(
+                "daemon_warn=forbidden_peer socket_kind={} uid={}",
+                socket_kind, uid
+            );
+        }
+        Err(e) => {
+            let _ = stream.write_all(b"ERR INTERNAL_ERROR peer_cred_failed\n");
+            let _ = stream.flush();
+            eprintln!(
+                "daemon_warn=peer_cred_failed socket_kind={} err={}",
+                socket_kind, e
+            );
+        }
+    }
+
+    false
 }
 
 fn main() {
@@ -1120,8 +630,22 @@ fn main() {
         std::process::exit(2);
     }
 
-    let _ = fs::remove_file(&control_socket_path);
-    let _ = fs::remove_file(&data_socket_path);
+    if let Err(e) = remove_stale_socket(&control_socket_path) {
+        eprintln!(
+            "daemon_error=remove_stale_socket_failed socket_kind=control path={} err={}",
+            control_socket_path.display(),
+            e
+        );
+        std::process::exit(2);
+    }
+    if let Err(e) = remove_stale_socket(&data_socket_path) {
+        eprintln!(
+            "daemon_error=remove_stale_socket_failed socket_kind=data path={} err={}",
+            data_socket_path.display(),
+            e
+        );
+        std::process::exit(2);
+    }
 
     let control_listener = match UnixListener::bind(&control_socket_path) {
         Ok(v) => v,
@@ -1145,6 +669,22 @@ fn main() {
             std::process::exit(3);
         }
     };
+    if let Err(e) = secure_socket_permissions(&control_socket_path) {
+        eprintln!(
+            "daemon_error=set_permissions_failed socket_kind=control path={} err={}",
+            control_socket_path.display(),
+            e
+        );
+        std::process::exit(4);
+    }
+    if let Err(e) = secure_socket_permissions(&data_socket_path) {
+        eprintln!(
+            "daemon_error=set_permissions_failed socket_kind=data path={} err={}",
+            data_socket_path.display(),
+            e
+        );
+        std::process::exit(4);
+    }
 
     if let Err(e) = control_listener.set_nonblocking(true) {
         eprintln!(
@@ -1183,13 +723,44 @@ fn main() {
         cfg.render_output_dir.clone(),
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let dispatch_ctx = DispatchContext {
+        allowed_uids: Arc::clone(&allowed_uids),
+        active_connections: Arc::clone(&active_connections),
+        max_connections: cfg.max_connections,
+        socket_rw_timeout_ms: cfg.socket_rw_timeout_ms,
+        command_max_bytes: cfg.command_max_bytes,
+        raw_frame_max_bytes: cfg.raw_frame_max_bytes,
+        raw_read_timeout: Duration::from_millis(cfg.raw_read_timeout_ms),
+        engine: Arc::clone(&engine),
+        shutdown: Arc::clone(&shutdown),
+    };
     let mut worker_handles: Vec<thread::JoinHandle<()>> = Vec::new();
 
     println!("daemon_render_output_dir={}", cfg.render_output_dir);
+    println!("daemon_max_connections={}", cfg.max_connections);
+    println!("daemon_socket_rw_timeout_ms={}", cfg.socket_rw_timeout_ms);
+    println!("daemon_raw_read_timeout_ms={}", cfg.raw_read_timeout_ms);
+    println!("daemon_command_max_bytes={}", cfg.command_max_bytes);
+    println!("daemon_raw_frame_max_bytes={}", cfg.raw_frame_max_bytes);
 
     let restart_delay = Duration::from_millis(cfg.supervise_restart_ms);
-    if let Some(cmd) = cfg.supervise_presenter_cmd.clone() {
-        println!("daemon_worker_config=name=presenter cmd={}", cmd);
+    if let Some(raw_cmd) = cfg.supervise_presenter_cmd.clone() {
+        let cmd = match parse_worker_command(&raw_cmd) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "daemon_error=invalid_supervise_cmd name=presenter err={}",
+                    e
+                );
+                std::process::exit(1);
+            }
+        };
+        println!(
+            "daemon_worker_config=name=presenter program={} arg_count={}",
+            cmd.program,
+            cmd.args.len()
+        );
         worker_handles.push(supervise_worker(
             "presenter",
             cmd,
@@ -1197,8 +768,19 @@ fn main() {
             Arc::clone(&shutdown),
         ));
     }
-    if let Some(cmd) = cfg.supervise_input_cmd.clone() {
-        println!("daemon_worker_config=name=input cmd={}", cmd);
+    if let Some(raw_cmd) = cfg.supervise_input_cmd.clone() {
+        let cmd = match parse_worker_command(&raw_cmd) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("daemon_error=invalid_supervise_cmd name=input err={}", e);
+                std::process::exit(1);
+            }
+        };
+        println!(
+            "daemon_worker_config=name=input program={} arg_count={}",
+            cmd.program,
+            cmd.args.len()
+        );
         worker_handles.push(supervise_worker(
             "input",
             cmd,
@@ -1211,26 +793,10 @@ fn main() {
         let mut accepted = false;
 
         match control_listener.accept() {
-            Ok((mut stream, _addr)) => {
+            Ok((stream, _addr)) => {
                 accepted = true;
-                match socket_peer_uid(&stream) {
-                    Ok(uid) if allowed_uids.contains(&uid) => {
-                        let engine_ref = Arc::clone(&engine);
-                        let shutdown_ref = Arc::clone(&shutdown);
-                        thread::spawn(move || {
-                            handle_control_client(stream, engine_ref, shutdown_ref);
-                        });
-                    }
-                    Ok(uid) => {
-                        let _ = stream.write_all(b"ERR FORBIDDEN\n");
-                        let _ = stream.flush();
-                        eprintln!("daemon_warn=forbidden_peer socket_kind=control uid={}", uid);
-                    }
-                    Err(e) => {
-                        let _ = stream.write_all(b"ERR INTERNAL_ERROR peer_cred_failed\n");
-                        let _ = stream.flush();
-                        eprintln!("daemon_warn=peer_cred_failed socket_kind=control err={}", e);
-                    }
+                if dispatch_accepted_client(stream, "control", &dispatch_ctx) {
+                    continue;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -1241,26 +807,10 @@ fn main() {
         }
 
         match data_listener.accept() {
-            Ok((mut stream, _addr)) => {
+            Ok((stream, _addr)) => {
                 accepted = true;
-                match socket_peer_uid(&stream) {
-                    Ok(uid) if allowed_uids.contains(&uid) => {
-                        let engine_ref = Arc::clone(&engine);
-                        let shutdown_ref = Arc::clone(&shutdown);
-                        thread::spawn(move || {
-                            handle_data_client(stream, engine_ref, shutdown_ref);
-                        });
-                    }
-                    Ok(uid) => {
-                        let _ = stream.write_all(b"ERR FORBIDDEN\n");
-                        let _ = stream.flush();
-                        eprintln!("daemon_warn=forbidden_peer socket_kind=data uid={}", uid);
-                    }
-                    Err(e) => {
-                        let _ = stream.write_all(b"ERR INTERNAL_ERROR peer_cred_failed\n");
-                        let _ = stream.flush();
-                        eprintln!("daemon_warn=peer_cred_failed socket_kind=data err={}", e);
-                    }
+                if dispatch_accepted_client(stream, "data", &dispatch_ctx) {
+                    continue;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -1312,6 +862,8 @@ mod tests {
             "echo input".to_string(),
             "--supervise-restart-ms".to_string(),
             "777".to_string(),
+            "--max-connections".to_string(),
+            "321".to_string(),
         ];
         let cfg = parse_daemon_config(&args).expect("parse daemon cfg");
         assert_eq!(cfg.control_socket_path, "/tmp/a.sock");
@@ -1323,6 +875,7 @@ mod tests {
         );
         assert_eq!(cfg.supervise_input_cmd.as_deref(), Some("echo input"));
         assert_eq!(cfg.supervise_restart_ms, 777);
+        assert_eq!(cfg.max_connections, 321);
         assert!(!cfg.allowed_uids.is_empty());
     }
 
@@ -1334,8 +887,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_worker_command_accepts_simple_command() {
+        let cmd = parse_worker_command("./scripts/dsapi.sh presenter run").expect("parse");
+        assert_eq!(cmd.program, "./scripts/dsapi.sh");
+        assert_eq!(cmd.args, vec!["presenter".to_string(), "run".to_string()]);
+    }
+
+    #[test]
+    fn parse_worker_command_rejects_shell_meta() {
+        let err = parse_worker_command("echo ok; id").expect_err("must reject");
+        assert!(err.contains("shell_meta"));
+    }
+
+    #[test]
     fn parse_raw_frame_submit_request_accepts_valid_header() {
-        let req = parse_raw_frame_submit_request("RENDER_FRAME_SUBMIT_RGBA_RAW 2 1 8")
+        let req = parse_raw_frame_submit_request("RENDER_FRAME_SUBMIT_RGBA_RAW 2 1 8", 8)
             .expect("parse ok")
             .expect("has request");
         assert_eq!(req.width, 2);
@@ -1345,14 +911,14 @@ mod tests {
 
     #[test]
     fn parse_raw_frame_submit_request_rejects_mismatched_len() {
-        let out = parse_raw_frame_submit_request("RENDER_FRAME_SUBMIT_RGBA_RAW 2 1 7")
+        let out = parse_raw_frame_submit_request("RENDER_FRAME_SUBMIT_RGBA_RAW 2 1 7", 8)
             .expect_err("must reject");
         assert_eq!(out, Status::InvalidArgument);
     }
 
     #[test]
     fn parse_raw_frame_submit_request_ignores_other_commands() {
-        let out = parse_raw_frame_submit_request("PING").expect("parse ping");
+        let out = parse_raw_frame_submit_request("PING", 8).expect("parse ping");
         assert_eq!(out, None);
     }
 

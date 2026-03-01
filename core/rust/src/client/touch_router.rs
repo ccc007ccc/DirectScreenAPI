@@ -9,13 +9,27 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::SystemTime;
 
-use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
-use evdev::{
-    AbsInfo, AbsoluteAxisType, AttributeSet, Device, EventType, InputEvent, InputEventKind, Key,
-    PropType, Synchronization, UinputAbsSetup,
-};
+use evdev::{Device, EventType, InputEvent, InputEventKind, Key, Synchronization};
 
-use super::{DsapiClient, TouchEvent};
+use super::DsapiClient;
+#[path = "touch_router/device.rs"]
+mod touch_router_device;
+#[path = "touch_router/event.rs"]
+mod touch_router_event;
+#[path = "touch_router/io.rs"]
+mod touch_router_io;
+#[path = "touch_router/map.rs"]
+mod touch_router_map;
+#[path = "touch_router/passthrough.rs"]
+mod touch_router_passthrough;
+#[path = "touch_router/routing.rs"]
+mod touch_router_routing;
+use touch_router_device::{build_virtual_touch_device, read_touch_axis_caps};
+use touch_router_event::{kind_to_phase, to_client_touch_event};
+use touch_router_io::{close_fd, close_fd_value, make_wake_pipe, set_fd_nonblocking, wait_ready};
+use touch_router_map::normalize_axis;
+use touch_router_passthrough::{build_passthrough_frame_events, has_passthrough_active_touch};
+use touch_router_routing::resolve_pointer_route;
 
 const ABS_MT_SLOT: u16 = 0x2f;
 const ABS_MT_POSITION_X: u16 = 0x35;
@@ -467,28 +481,15 @@ where
                                 }
                                 let (x, y) = map_cfg.map_point(p.raw_x, p.raw_y);
 
-                                let route = match p.kind {
-                                    TOUCH_PACKET_DOWN => {
-                                        let route = if hit_test(snapshot, x, y) {
-                                            PointerRoute::Ui
-                                        } else {
-                                            PointerRoute::PassThrough
-                                        };
-                                        pointer_routes.insert(p.pointer_id, route);
-                                        route
-                                    }
-                                    TOUCH_PACKET_MOVE => *pointer_routes
-                                        .get(&p.pointer_id)
-                                        .unwrap_or(&PointerRoute::PassThrough),
-                                    TOUCH_PACKET_UP => {
-                                        let route = *pointer_routes
-                                            .get(&p.pointer_id)
-                                            .unwrap_or(&PointerRoute::PassThrough);
-                                        pointer_routes.remove(&p.pointer_id);
-                                        route
-                                    }
-                                    _ => PointerRoute::PassThrough,
-                                };
+                                let route = resolve_pointer_route(
+                                    p.kind,
+                                    p.pointer_id,
+                                    x,
+                                    y,
+                                    snapshot,
+                                    &hit_test,
+                                    &mut pointer_routes,
+                                );
 
                                 frame_slot_routes.insert(*slot_id, route);
                                 if route == PointerRoute::Ui {
@@ -558,94 +559,6 @@ where
     run_result
 }
 
-fn build_passthrough_frame_events(
-    frame_events: &[InputEvent],
-    frame_start_slot: i32,
-    frame_slot_routes: &HashMap<i32, PointerRoute>,
-    slots: &HashMap<i32, SlotState>,
-    pointer_routes: &HashMap<i32, PointerRoute>,
-) -> Vec<InputEvent> {
-    let mut out: Vec<InputEvent> = Vec::new();
-    let mut cur_slot = frame_start_slot;
-    let mut emitted_slot: Option<i32> = None;
-
-    for ev in frame_events {
-        match ev.kind() {
-            InputEventKind::AbsAxis(axis) => {
-                if axis.0 == ABS_MT_SLOT {
-                    cur_slot = ev.value();
-                    continue;
-                }
-
-                // 只透传 MT 轴；ABS_X/ABS_Y 等全局轴会混入 UI 指针状态，不能直接透传。
-                if !is_mt_axis(axis.0) {
-                    continue;
-                }
-
-                let route =
-                    slot_route_for_frame(cur_slot, frame_slot_routes, slots, pointer_routes);
-                if route != PointerRoute::PassThrough {
-                    continue;
-                }
-
-                if emitted_slot != Some(cur_slot) {
-                    out.push(InputEvent::new(EventType::ABSOLUTE, ABS_MT_SLOT, cur_slot));
-                    emitted_slot = Some(cur_slot);
-                }
-                out.push(*ev);
-            }
-            // 触摸相关按键由路由器重建，避免 UI 触点污染系统侧状态。
-            InputEventKind::Key(key) if is_touch_related_key(key) => {}
-            InputEventKind::Synchronization(_) => {}
-            _ => out.push(*ev),
-        }
-    }
-
-    out
-}
-
-fn slot_route_for_frame(
-    slot_id: i32,
-    frame_slot_routes: &HashMap<i32, PointerRoute>,
-    slots: &HashMap<i32, SlotState>,
-    pointer_routes: &HashMap<i32, PointerRoute>,
-) -> PointerRoute {
-    if let Some(route) = frame_slot_routes.get(&slot_id) {
-        return *route;
-    }
-
-    let Some(slot) = slots.get(&slot_id) else {
-        return PointerRoute::PassThrough;
-    };
-
-    if !slot.active || slot.pointer_id < 0 {
-        return PointerRoute::PassThrough;
-    }
-
-    *pointer_routes
-        .get(&slot.pointer_id)
-        .unwrap_or(&PointerRoute::PassThrough)
-}
-
-fn has_passthrough_active_touch(
-    slots: &HashMap<i32, SlotState>,
-    pointer_routes: &HashMap<i32, PointerRoute>,
-) -> bool {
-    slots.values().any(|slot| {
-        if !slot.active || slot.pointer_id < 0 {
-            return false;
-        }
-        *pointer_routes
-            .get(&slot.pointer_id)
-            .unwrap_or(&PointerRoute::PassThrough)
-            == PointerRoute::PassThrough
-    })
-}
-
-fn is_mt_axis(code: u16) -> bool {
-    code >= ABS_MT_SLOT
-}
-
 fn current_display_transform(
     display_transform: &Arc<Mutex<TouchDisplayTransform>>,
 ) -> TouchDisplayTransform {
@@ -655,264 +568,9 @@ fn current_display_transform(
     }
 }
 
-fn is_touch_related_key(key: Key) -> bool {
-    matches!(
-        key,
-        Key::BTN_TOUCH
-            | Key::BTN_TOOL_FINGER
-            | Key::BTN_TOOL_DOUBLETAP
-            | Key::BTN_TOOL_TRIPLETAP
-            | Key::BTN_TOOL_QUADTAP
-            | Key::BTN_TOOL_QUINTTAP
-            | Key::BTN_TOOL_PEN
-            | Key::BTN_TOOL_RUBBER
-            | Key::BTN_TOOL_BRUSH
-            | Key::BTN_TOOL_PENCIL
-            | Key::BTN_TOOL_AIRBRUSH
-            | Key::BTN_TOOL_MOUSE
-            | Key::BTN_TOOL_LENS
-    )
-}
-
-fn clamp01(v: f32) -> f32 {
-    v.clamp(0.0, 1.0)
-}
-
-fn normalize_axis(raw: i32, min_v: i32, max_v: i32) -> f32 {
-    if max_v <= min_v {
-        return 0.0;
-    }
-    let num = (raw - min_v) as f32;
-    let den = (max_v - min_v) as f32;
-    clamp01(num / den)
-}
-
-fn set_fd_nonblocking(fd: RawFd) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(())
-}
-
-fn read_touch_axis_caps(device: &Device) -> io::Result<TouchAxisCaps> {
-    let Some(supported_abs) = device.supported_absolute_axes() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "device_has_no_absolute_axes",
-        ));
-    };
-
-    let required_axes = [
-        AbsoluteAxisType::ABS_MT_POSITION_X,
-        AbsoluteAxisType::ABS_MT_POSITION_Y,
-        AbsoluteAxisType::ABS_MT_SLOT,
-        AbsoluteAxisType::ABS_MT_TRACKING_ID,
-    ];
-
-    for axis in required_axes {
-        if !supported_abs.contains(axis) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("missing_required_abs_axis:{}", axis.0),
-            ));
-        }
-    }
-
-    let abs_state = device.get_abs_state()?;
-    let x = abs_state[AbsoluteAxisType::ABS_MT_POSITION_X.0 as usize];
-    let y = abs_state[AbsoluteAxisType::ABS_MT_POSITION_Y.0 as usize];
-    let slot = abs_state[AbsoluteAxisType::ABS_MT_SLOT.0 as usize];
-    let tracking = abs_state[AbsoluteAxisType::ABS_MT_TRACKING_ID.0 as usize];
-
-    if x.maximum <= x.minimum || y.maximum <= y.minimum {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid_abs_xy_range",
-        ));
-    }
-
-    Ok(TouchAxisCaps {
-        x_min: x.minimum,
-        x_max: x.maximum,
-        y_min: y.minimum,
-        y_max: y.maximum,
-        slot_min: slot.minimum,
-        slot_max: slot.maximum,
-        tracking_min: tracking.minimum,
-        tracking_max: tracking.maximum,
-    })
-}
-
-fn build_virtual_touch_device(device: &Device) -> io::Result<VirtualDevice> {
-    let mut key_set: AttributeSet<Key> = device
-        .supported_keys()
-        .map(|keys| keys.iter().collect())
-        .unwrap_or_default();
-    key_set.insert(Key::BTN_TOUCH);
-
-    let mut props: AttributeSet<PropType> = device.properties().iter().collect();
-    props.insert(PropType::DIRECT);
-
-    let Some(abs_axes) = device.supported_absolute_axes() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "device_has_no_absolute_axes",
-        ));
-    };
-
-    let abs_state = device.get_abs_state()?;
-    let device_name = format!(
-        "DirectScreenAPI Touch Clone ({})",
-        device.name().unwrap_or("unknown")
-    );
-
-    let mut builder = VirtualDeviceBuilder::new()?
-        .name(&device_name)
-        .input_id(device.input_id())
-        .with_properties(&props)?
-        .with_keys(&key_set)?;
-
-    for axis in abs_axes.iter() {
-        let info = abs_state[axis.0 as usize];
-        let setup = UinputAbsSetup::new(
-            axis,
-            AbsInfo::new(
-                info.value,
-                info.minimum,
-                info.maximum,
-                info.fuzz,
-                info.flat,
-                info.resolution,
-            ),
-        );
-        builder = builder.with_absolute_axis(&setup)?;
-    }
-
-    builder.build()
-}
-
-fn to_client_touch_event(kind: u8, pointer_id: i32, x: f32, y: f32) -> Option<TouchEvent> {
-    if pointer_id < 0 {
-        return None;
-    }
-
-    let id = pointer_id as u32;
-    let sx = x.max(0.0).round() as u32;
-    let sy = y.max(0.0).round() as u32;
-
-    match kind {
-        TOUCH_PACKET_DOWN => Some(TouchEvent::Down { id, x: sx, y: sy }),
-        TOUCH_PACKET_MOVE => Some(TouchEvent::Move { id, x: sx, y: sy }),
-        TOUCH_PACKET_UP => Some(TouchEvent::Up { id }),
-        _ => None,
-    }
-}
-
-fn kind_to_phase(kind: u8) -> Option<TouchPhase> {
-    match kind {
-        TOUCH_PACKET_DOWN => Some(TouchPhase::Down),
-        TOUCH_PACKET_MOVE => Some(TouchPhase::Move),
-        TOUCH_PACKET_UP => Some(TouchPhase::Up),
-        _ => None,
-    }
-}
-
 fn touch_latency_ms(event_time: SystemTime) -> f32 {
     match SystemTime::now().duration_since(event_time) {
         Ok(d) => d.as_secs_f32() * 1000.0,
         Err(_) => 0.0,
-    }
-}
-
-fn make_wake_pipe() -> io::Result<(RawFd, RawFd)> {
-    let mut fds = [0i32; 2];
-    let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((fds[0], fds[1]))
-}
-
-fn wait_ready(device_fd: RawFd, wake_read_fd: RawFd) -> io::Result<bool> {
-    let mut fds = [
-        libc::pollfd {
-            fd: device_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: wake_read_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
-
-    loop {
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-        break;
-    }
-
-    if (fds[1].revents & libc::POLLIN) != 0 {
-        drain_fd(wake_read_fd);
-        return Ok(false);
-    }
-    if (fds[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
-        return Ok(false);
-    }
-    if (fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
-        return Err(io::Error::other("device_poll_error_or_hup"));
-    }
-    Ok((fds[0].revents & libc::POLLIN) != 0)
-}
-
-fn drain_fd(fd: RawFd) {
-    let mut buf = [0u8; 64];
-    loop {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n > 0 {
-            if (n as usize) < buf.len() {
-                break;
-            }
-            continue;
-        }
-        if n == 0 {
-            break;
-        }
-        let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::Interrupted {
-            break;
-        }
-        break;
-    }
-}
-
-fn close_fd(fd: &mut RawFd) {
-    if *fd >= 0 {
-        unsafe {
-            libc::close(*fd);
-        }
-        *fd = -1;
-    }
-}
-
-fn close_fd_value(fd: RawFd) {
-    if fd >= 0 {
-        unsafe {
-            libc::close(fd);
-        }
     }
 }

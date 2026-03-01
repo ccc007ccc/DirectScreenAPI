@@ -9,6 +9,12 @@
 - `dsapi_context_create_with_abi`
 - `dsapi_context_destroy`
 
+### 并发与生命周期约束
+
+- `dsapi_context_t*` 只能由 `dsapi_context_create*` 创建，并且只能销毁一次。
+- `dsapi_context_destroy(ctx)` 不能与任何其它 `dsapi_*` 调用并发执行。
+- 调用方传入的输出指针必须可写；输入指针必须可读；错误指针属于未定义行为（UB）。
+
 ## 显示状态接口
 
 - `dsapi_set_display_state`

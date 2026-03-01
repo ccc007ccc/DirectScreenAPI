@@ -8,11 +8,18 @@ cd "$ROOT_DIR"
 
 OUT_DIR="artifacts/bin"
 OUT_BIN="$OUT_DIR/dsapi_example"
+TARGET_DIR="${CARGO_TARGET_DIR:-${DSAPI_TARGET_DIR:-target}}"
+LIB_PATH="$TARGET_DIR/release/libdirectscreen_core.a"
 mkdir -p "$OUT_DIR"
+
+if [ ! -f "$LIB_PATH" ]; then
+  echo "c_example_error=core_static_lib_missing path=$LIB_PATH"
+  exit 3
+fi
 
 cc -Ibridge/c/include \
   bridge/c/examples/simple_route.c \
-  target/release/libdirectscreen_core.a \
+  "$LIB_PATH" \
   -ldl -lpthread -lm \
   -o "$OUT_BIN"
 

@@ -59,46 +59,33 @@ public final class AndroidDisplayAdapter implements DisplayAdapter {
         return r;
     }
 
-    private static Object getDisplayInfo(Object dmg, int displayId) {
-        Method m = null;
-        for (Method x : dmg.getClass().getMethods()) {
-            if (!"getDisplayInfo".equals(x.getName())) continue;
-            if (x.getParameterTypes().length != 1) continue;
-            m = x;
-            break;
-        }
-        if (m == null) return null;
-        try {
-            Class<?> t = m.getParameterTypes()[0];
-            if (t == int.class || t == Integer.class) {
-                return m.invoke(dmg, Integer.valueOf(displayId));
-            }
-            if (t == long.class || t == Long.class) {
-                return m.invoke(dmg, Long.valueOf(displayId));
-            }
-        } catch (Throwable ignored) {
-        }
-        return null;
+    private static Object invokeSingleDisplayIdMethod(Object target, String methodName, int displayId) {
+        Object out = invokeSingleDisplayIdMethodByType(target, methodName, displayId, int.class);
+        if (out != null) return out;
+        out = invokeSingleDisplayIdMethodByType(target, methodName, displayId, Integer.class);
+        if (out != null) return out;
+        out = invokeSingleDisplayIdMethodByType(target, methodName, displayId, long.class);
+        if (out != null) return out;
+        return invokeSingleDisplayIdMethodByType(target, methodName, displayId, Long.class);
     }
 
-    private static Object getRealDisplay(Object dmg, int displayId) {
-        Method m = null;
-        for (Method x : dmg.getClass().getMethods()) {
-            if (!"getRealDisplay".equals(x.getName())) continue;
-            if (x.getParameterTypes().length != 1) continue;
-            m = x;
-            break;
-        }
-        if (m == null) return null;
-        try {
-            Class<?> t = m.getParameterTypes()[0];
-            if (t == int.class || t == Integer.class) {
-                return m.invoke(dmg, Integer.valueOf(displayId));
+    private static Object invokeSingleDisplayIdMethodByType(
+            Object target,
+            String methodName,
+            int displayId,
+            Class<?> paramType
+    ) {
+        for (Method method : target.getClass().getMethods()) {
+            if (!methodName.equals(method.getName())) continue;
+            Class<?>[] params = method.getParameterTypes();
+            if (params.length != 1 || params[0] != paramType) continue;
+            try {
+                if (paramType == long.class || paramType == Long.class) {
+                    return method.invoke(target, Long.valueOf(displayId));
+                }
+                return method.invoke(target, Integer.valueOf(displayId));
+            } catch (Throwable ignored) {
             }
-            if (t == long.class || t == Long.class) {
-                return m.invoke(dmg, Long.valueOf(displayId));
-            }
-        } catch (Throwable ignored) {
         }
         return null;
     }
@@ -189,7 +176,7 @@ public final class AndroidDisplayAdapter implements DisplayAdapter {
             Object dmg = getInstance != null ? getInstance.invoke(null) : null;
 
             if (dmg != null) {
-                Object info = getDisplayInfo(dmg, 0);
+                Object info = invokeSingleDisplayIdMethod(dmg, "getDisplayInfo", 0);
                 if (info != null) {
                     int w = readIntField(info, "logicalWidth", "appWidth", "width");
                     int h = readIntField(info, "logicalHeight", "appHeight", "height");
@@ -210,7 +197,7 @@ public final class AndroidDisplayAdapter implements DisplayAdapter {
                     rotation = rot;
                 }
 
-                Object display = getRealDisplay(dmg, 0);
+                Object display = invokeSingleDisplayIdMethod(dmg, "getRealDisplay", 0);
                 if (display != null) {
                     int rw = invokeIntFromPoint(display, "getRealSize", true);
                     int rh = invokeIntFromPoint(display, "getRealSize", false);

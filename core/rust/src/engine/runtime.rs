@@ -33,6 +33,8 @@ struct StoredRenderFrame {
     pixels_rgba8: Arc<[u8]>,
 }
 
+type FrameSnapshot = (RenderFrameInfo, Arc<[u8]>);
+
 #[derive(Debug)]
 struct RouteState {
     default_decision: Decision,
@@ -367,6 +369,32 @@ impl RuntimeEngine {
         Ok(frame.filter(|v| v.frame_seq > last_frame_seq))
     }
 
+    pub fn wait_for_frame_after_and_present(
+        &self,
+        last_frame_seq: u64,
+        timeout_ms: u32,
+    ) -> Result<Option<FrameSnapshot>, Status> {
+        if let Some(snapshot) = self.present_latest_if_newer(last_frame_seq)? {
+            return Ok(Some(snapshot));
+        }
+
+        let timeout = Duration::from_millis(timeout_ms as u64);
+        let mut seq = self
+            .frame_signal_seq
+            .lock()
+            .map_err(|_| Status::InternalError)?;
+        if *seq <= last_frame_seq {
+            let (next, _) = self
+                .frame_signal_cv
+                .wait_timeout_while(seq, timeout, |v| *v <= last_frame_seq)
+                .map_err(|_| Status::InternalError)?;
+            seq = next;
+        }
+        drop(seq);
+
+        self.present_latest_if_newer(last_frame_seq)
+    }
+
     pub fn render_frame_info(&self) -> Option<RenderFrameInfo> {
         self.render
             .read()
@@ -485,6 +513,33 @@ impl RuntimeEngine {
             *seq = frame_seq;
             self.frame_signal_cv.notify_all();
         }
+    }
+
+    fn present_latest_if_newer(
+        &self,
+        last_frame_seq: u64,
+    ) -> Result<Option<FrameSnapshot>, Status> {
+        let mut render = self.render.write().map_err(|_| Status::InternalError)?;
+        let (frame_info, pixels) = {
+            let Some(frame) = render.last_render_frame.as_ref() else {
+                return Ok(None);
+            };
+            if frame.info.frame_seq <= last_frame_seq {
+                return Ok(None);
+            }
+            (frame.info, frame.pixels_rgba8.clone())
+        };
+
+        render.present_seq = render.present_seq.saturating_add(1);
+        render.last_present = Some(RenderPresentInfo {
+            present_seq: render.present_seq,
+            frame_seq: frame_info.frame_seq,
+            width: frame_info.width,
+            height: frame_info.height,
+            byte_len: frame_info.byte_len,
+            checksum_fnv1a32: frame_info.checksum_fnv1a32,
+        });
+        Ok(Some((frame_info, pixels)))
     }
 
     fn notify_display_changed(&self) {
@@ -798,6 +853,32 @@ mod tests {
             .expect("wait with frame")
             .expect("new frame expected");
         assert_eq!(waited.frame_seq, frame.frame_seq);
+    }
+
+    #[test]
+    fn wait_for_frame_after_and_present_keeps_frame_consistent() {
+        let engine = RuntimeEngine::default();
+        assert_eq!(
+            engine
+                .wait_for_frame_after_and_present(0, 1)
+                .expect("wait without frame"),
+            None
+        );
+
+        let pixels = vec![9u8; 16];
+        let frame = engine
+            .submit_render_frame_rgba(2, 2, pixels)
+            .expect("submit frame");
+
+        let (waited_frame, waited_pixels) = engine
+            .wait_for_frame_after_and_present(0, 10)
+            .expect("wait with frame")
+            .expect("frame expected");
+        assert_eq!(waited_frame.frame_seq, frame.frame_seq);
+        assert_eq!(waited_pixels.len(), frame.byte_len as usize);
+
+        let present = engine.render_present_get().expect("present state exists");
+        assert_eq!(present.frame_seq, waited_frame.frame_seq);
     }
 
     #[test]

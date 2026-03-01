@@ -44,6 +44,26 @@ fn parse_region(token: &str) -> Result<RectRegion, Status> {
     })
 }
 
+fn parse_or_exit_u32(label: &str, input: &str) -> u32 {
+    match parse_u32(input) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("dsapi_error=invalid_{} value={}", label, input);
+            std::process::exit(2);
+        }
+    }
+}
+
+fn parse_or_exit_f32(label: &str, input: &str) -> f32 {
+    match parse_f32(input) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("dsapi_error=invalid_{} value={}", label, input);
+            std::process::exit(2);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -69,11 +89,11 @@ fn main() {
                 std::process::exit(1);
             }
             let display = DisplayState {
-                width: parse_u32(&args[2]).unwrap_or(1080),
-                height: parse_u32(&args[3]).unwrap_or(2400),
-                refresh_hz: parse_f32(&args[4]).unwrap_or(60.0),
-                density_dpi: parse_u32(&args[5]).unwrap_or(420),
-                rotation: parse_u32(&args[6]).unwrap_or(0),
+                width: parse_or_exit_u32("width", &args[2]),
+                height: parse_or_exit_u32("height", &args[3]),
+                refresh_hz: parse_or_exit_f32("refresh_hz", &args[4]),
+                density_dpi: parse_or_exit_u32("density_dpi", &args[5]),
+                rotation: parse_or_exit_u32("rotation", &args[6]),
             };
 
             let engine = RuntimeEngine::default();
@@ -88,8 +108,8 @@ fn main() {
                 std::process::exit(1);
             }
 
-            let x = parse_f32(&args[2]).unwrap_or(0.0);
-            let y = parse_f32(&args[3]).unwrap_or(0.0);
+            let x = parse_or_exit_f32("x", &args[2]);
+            let y = parse_or_exit_f32("y", &args[3]);
             let engine = RuntimeEngine::default();
             engine.set_default_decision(Decision::Pass);
 

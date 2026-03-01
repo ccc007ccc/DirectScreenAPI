@@ -51,13 +51,14 @@
 
 - 成功：`OK ...`
 - 失败：`ERR <STATUS_NAME>`
+- 连接超限：`ERR BUSY`（超过 `DSAPI_MAX_CONNECTIONS` / `--max-connections`）
 - `RENDER_FRAME_WAIT` / `RENDER_FRAME_WAIT_BOUND_PRESENT` 超时：`OK TIMEOUT`
 
 ## 生命周期管理
 
-- 启动：`scripts/daemon_start.sh`
-- 状态：`scripts/daemon_status.sh`
-- 停止：`scripts/daemon_stop.sh`
+- 启动：`scripts/dsapi.sh daemon start`
+- 状态：`scripts/dsapi.sh daemon status`
+- 停止：`scripts/dsapi.sh daemon stop`
 - 可选 Supervisor：`dsapid` 可通过 `--supervise-presenter/--supervise-input`
   托管子进程并自动重启
 

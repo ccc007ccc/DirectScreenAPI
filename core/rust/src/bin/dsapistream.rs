@@ -1,6 +1,8 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
+use directscreen_core::util::{default_control_socket_path, timeout_from_env};
+
 struct SocketClient {
     writer: UnixStream,
     reader: BufReader<UnixStream>,
@@ -9,7 +11,14 @@ struct SocketClient {
 impl SocketClient {
     fn connect(socket: &str) -> io::Result<Self> {
         let writer = UnixStream::connect(socket)?;
-        let reader = BufReader::new(writer.try_clone()?);
+        let timeout = timeout_from_env("DSAPI_CLIENT_TIMEOUT_MS", 5000, 100);
+        writer.set_read_timeout(timeout)?;
+        writer.set_write_timeout(timeout)?;
+
+        let reader_stream = writer.try_clone()?;
+        reader_stream.set_read_timeout(timeout)?;
+        reader_stream.set_write_timeout(timeout)?;
+        let reader = BufReader::new(reader_stream);
         Ok(Self { writer, reader })
     }
 
@@ -28,10 +37,6 @@ impl SocketClient {
         }
         Ok(response.trim_end().to_string())
     }
-}
-
-fn default_control_socket_path() -> String {
-    "artifacts/run/dsapi.sock".to_string()
 }
 
 fn usage() {

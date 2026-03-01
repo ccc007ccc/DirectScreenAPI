@@ -13,6 +13,7 @@
 ## 指南
 
 - `guides/build.md`
+- `guides/commands.md`
 - `guides/daemon_ops.md`
 - `guides/android_adapter.md`
 - `guides/touch_routing.md`
