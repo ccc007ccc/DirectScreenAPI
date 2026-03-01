@@ -539,7 +539,6 @@ fn dispatch_accepted_client(
                     ctx.active_connections.load(Ordering::Acquire),
                     ctx.max_connections
                 );
-                return;
             }
         }
         Ok(uid) => {
