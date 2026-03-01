@@ -1,24 +1,23 @@
-use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
-use directscreen_core::util::{default_control_socket_path, timeout_from_env};
+use directscreen_core::util::timeout_from_env;
+
+use directscreen_core::util::ctl_wire;
 
 fn usage() {
     println!("usage:");
     println!("  dsapictl [--socket <path>] <COMMAND ...>");
-    println!("example:");
-    println!("  dsapictl PING");
-    println!("  dsapictl DISPLAY_SET 1440 3168 120 640 0");
-    println!("  dsapictl ROUTE_ADD_RECT 10 block 100 100 300 300");
-    println!("  dsapictl ROUTE_POINT 120 140");
-    println!("  dsapictl RENDER_SUBMIT 12 2 3");
-    println!("  dsapictl RENDER_GET");
-    println!("  dsapictl RENDER_FRAME_GET");
-    println!("  dsapictl RENDER_FRAME_WAIT 0 16");
-    println!("  dsapictl RENDER_FRAME_CLEAR");
-    println!("  dsapictl RENDER_PRESENT");
-    println!("  dsapictl RENDER_PRESENT_GET");
-    println!("  dsapictl RENDER_DUMP_PPM");
+    println!("supported commands:");
+    println!("  PING");
+    println!("  VERSION");
+    println!("  DISPLAY_GET");
+    println!("  DISPLAY_SET <w> <h> <hz> <dpi> <rotation>");
+    println!("  TOUCH_CLEAR");
+    println!("  TOUCH_COUNT");
+    println!("  TOUCH_MOVE <pointer_id> <x> <y>");
+    println!("  RENDER_SUBMIT <draw_calls> <frost_passes> <text_calls>");
+    println!("  RENDER_GET");
+    println!("  SHUTDOWN");
 }
 
 fn main() {
@@ -28,7 +27,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut socket = default_control_socket_path();
+    let mut socket = directscreen_core::util::default_control_socket_path();
     let mut cmd_start = 1usize;
     if args.len() >= 4 && args[1] == "--socket" {
         socket = args[2].clone();
@@ -40,7 +39,14 @@ fn main() {
         std::process::exit(1);
     }
 
-    let cmd = args[cmd_start..].join(" ");
+    let cmd_tokens: Vec<&str> = args[cmd_start..].iter().map(String::as_str).collect();
+    let cmd = match ctl_wire::parse_command_tokens(&cmd_tokens) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ctl_error=command_parse_failed reason={}", e);
+            std::process::exit(1);
+        }
+    };
 
     let mut stream = match UnixStream::connect(&socket) {
         Ok(s) => s,
@@ -59,22 +65,27 @@ fn main() {
         std::process::exit(6);
     }
 
-    if let Err(e) = stream.write_all(format!("{}\n", cmd).as_bytes()) {
+    if let Err(e) = ctl_wire::write_request(&mut stream, 1, &cmd) {
         eprintln!("ctl_error=write_failed err={}", e);
         std::process::exit(3);
     }
 
-    let mut response = String::new();
-    let mut reader = BufReader::new(&stream);
-    if let Err(e) = reader.read_line(&mut response) {
-        eprintln!("ctl_error=read_failed err={}", e);
-        std::process::exit(4);
-    }
+    let response = match ctl_wire::read_response(&mut stream) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            eprintln!("ctl_error=read_failed err=socket_closed");
+            std::process::exit(4);
+        }
+        Err(e) => {
+            eprintln!("ctl_error=read_failed err={}", e);
+            std::process::exit(4);
+        }
+    };
 
-    let response = response.trim_end().to_string();
-    println!("{}", response);
+    let line = ctl_wire::format_response(&cmd, &response);
+    println!("{}", line);
 
-    if response.starts_with("OK") {
+    if line.starts_with("OK") {
         std::process::exit(0);
     }
 

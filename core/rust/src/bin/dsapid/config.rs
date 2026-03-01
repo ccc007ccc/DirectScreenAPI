@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use directscreen_core::api::RENDER_MAX_FRAME_BYTES;
 use directscreen_core::util::{default_control_socket_path, derive_data_socket_path_text};
 
 #[derive(Debug, Clone)]
@@ -13,10 +12,9 @@ pub(super) struct DaemonConfig {
     pub(super) supervise_input_cmd: Option<String>,
     pub(super) supervise_restart_ms: u64,
     pub(super) max_connections: usize,
+    pub(super) dispatch_workers: usize,
     pub(super) socket_rw_timeout_ms: u64,
-    pub(super) raw_read_timeout_ms: u64,
     pub(super) command_max_bytes: usize,
-    pub(super) raw_frame_max_bytes: usize,
     pub(super) allowed_uids: HashSet<u32>,
 }
 
@@ -61,22 +59,22 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(64usize);
+    let mut dispatch_workers = std::env::var("DSAPI_DISPATCH_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|v| v.get().min(4))
+                .unwrap_or(2)
+        });
     let mut socket_rw_timeout_ms = std::env::var("DSAPI_SOCKET_RW_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(5000);
-    let mut raw_read_timeout_ms = std::env::var("DSAPI_RAW_READ_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(15000);
     let mut command_max_bytes = std::env::var("DSAPI_COMMAND_MAX_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4096usize);
-    let mut raw_frame_max_bytes = std::env::var("DSAPI_RAW_FRAME_MAX_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16 * 1024 * 1024usize);
 
     let mut i = 1usize;
     while i < args.len() {
@@ -138,6 +136,13 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
                 max_connections = parse_usize_arg(&args[i + 1])?;
                 i += 2;
             }
+            "--dispatch-workers" => {
+                if (i + 1) >= args.len() {
+                    return Err("missing_dispatch_workers".to_string());
+                }
+                dispatch_workers = parse_usize_arg(&args[i + 1])?;
+                i += 2;
+            }
             "--socket-rw-timeout-ms" => {
                 if (i + 1) >= args.len() {
                     return Err("missing_socket_rw_timeout_ms".to_string());
@@ -145,25 +150,11 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
                 socket_rw_timeout_ms = parse_u64_arg(&args[i + 1])?;
                 i += 2;
             }
-            "--raw-read-timeout-ms" => {
-                if (i + 1) >= args.len() {
-                    return Err("missing_raw_read_timeout_ms".to_string());
-                }
-                raw_read_timeout_ms = parse_u64_arg(&args[i + 1])?;
-                i += 2;
-            }
             "--command-max-bytes" => {
                 if (i + 1) >= args.len() {
                     return Err("missing_command_max_bytes".to_string());
                 }
                 command_max_bytes = parse_usize_arg(&args[i + 1])?;
-                i += 2;
-            }
-            "--raw-frame-max-bytes" => {
-                if (i + 1) >= args.len() {
-                    return Err("missing_raw_frame_max_bytes".to_string());
-                }
-                raw_frame_max_bytes = parse_usize_arg(&args[i + 1])?;
                 i += 2;
             }
             _ => return Err(format!("unknown_arg:{}", args[i])),
@@ -176,16 +167,18 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
     if max_connections == 0 {
         max_connections = 1;
     }
+    if dispatch_workers == 0 {
+        dispatch_workers = 1;
+    }
+    if dispatch_workers > max_connections {
+        dispatch_workers = max_connections;
+    }
     if socket_rw_timeout_ms > 0 && socket_rw_timeout_ms < 100 {
         socket_rw_timeout_ms = 100;
-    }
-    if raw_read_timeout_ms > 0 && raw_read_timeout_ms < 500 {
-        raw_read_timeout_ms = 500;
     }
     if command_max_bytes < 128 {
         command_max_bytes = 128;
     }
-    raw_frame_max_bytes = raw_frame_max_bytes.clamp(1024, RENDER_MAX_FRAME_BYTES);
 
     let data_socket_path = data_socket_path
         .filter(|v| !v.is_empty())
@@ -204,10 +197,9 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
         supervise_input_cmd,
         supervise_restart_ms,
         max_connections,
+        dispatch_workers,
         socket_rw_timeout_ms,
-        raw_read_timeout_ms,
         command_max_bytes,
-        raw_frame_max_bytes,
         allowed_uids,
     })
 }

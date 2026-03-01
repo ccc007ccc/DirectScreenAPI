@@ -33,3 +33,5 @@ pub fn timeout_from_env(env_key: &str, default_ms: u64, min_ms: u64) -> Option<D
     }
     Some(Duration::from_millis(raw.max(min_ms)))
 }
+
+pub mod ctl_wire;

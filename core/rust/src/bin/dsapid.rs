@@ -1,16 +1,20 @@
 use std::fs;
 use std::io::{BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use directscreen_core::api::{RouteResult, Status, TouchEvent};
 use directscreen_core::engine::RuntimeEngine;
+use mio::unix::SourceFd;
+use mio::{Events, Interest, Poll, Token};
 use nix::sys::socket::{getsockopt, sockopt};
 
 #[path = "dsapid/config.rs"]
@@ -26,13 +30,8 @@ mod dsapid_parse;
 use dsapid_config::{ensure_parent, parse_daemon_config};
 use dsapid_control_dispatch::handle_control_client;
 use dsapid_data_dispatch::handle_data_client;
-use dsapid_parse::RawFrameSubmitRequest;
 #[cfg(test)]
-use dsapid_parse::{
-    parse_display_stream_v1_request, parse_frame_bind_fd_request, parse_frame_get_bound_request,
-    parse_frame_get_fd_request, parse_frame_get_raw_request,
-    parse_frame_wait_bound_present_request, parse_raw_frame_submit_request,
-};
+use dsapid_parse::{parse_frame_bind_shm_request, parse_frame_wait_shm_present_request};
 
 struct SocketGuard {
     path: PathBuf,
@@ -74,38 +73,6 @@ fn write_internal_error(stream: &mut UnixStream, msg: &str) {
 fn write_busy(stream: &mut UnixStream) {
     let _ = stream.write_all(b"ERR BUSY\n");
     let _ = stream.flush();
-}
-
-fn write_line_allow_disconnect(stream: &mut UnixStream, line: &str) -> std::io::Result<bool> {
-    match stream.write_all(line.as_bytes()) {
-        Ok(()) => {}
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::UnexpectedEof
-            ) =>
-        {
-            return Ok(false);
-        }
-        Err(e) => return Err(e),
-    }
-
-    match stream.flush() {
-        Ok(()) => Ok(true),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::UnexpectedEof
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(e) => Err(e),
-    }
 }
 
 fn read_command_line(
@@ -214,77 +181,6 @@ fn secure_socket_permissions(path: &std::path::Path) -> std::io::Result<()> {
     fs::set_permissions(path, permissions)
 }
 
-fn handle_raw_frame_submit(
-    stream: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
-    engine: &Arc<RuntimeEngine>,
-    req: RawFrameSubmitRequest,
-    raw_read_timeout: Duration,
-) -> std::io::Result<()> {
-    stream.write_all(b"OK READY\n")?;
-    stream.flush()?;
-
-    let original_timeout = reader.get_ref().read_timeout()?;
-    reader.get_ref().set_read_timeout(Some(raw_read_timeout))?;
-    let mut pixels_rgba8 = vec![0u8; req.byte_len];
-    let read_res = reader.read_exact(&mut pixels_rgba8);
-    let _ = reader.get_ref().set_read_timeout(original_timeout);
-    read_res?;
-
-    let response = match engine.submit_render_frame_rgba(req.width, req.height, pixels_rgba8) {
-        Ok(frame) => format!(
-            "OK {} {} {} RGBA8888 {} {}",
-            frame.frame_seq, frame.width, frame.height, frame.byte_len, frame.checksum_fnv1a32
-        ),
-        Err(status) => format!("ERR {}", status.as_str()),
-    };
-
-    stream.write_all(response.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn handle_frame_get_raw(
-    stream: &mut UnixStream,
-    engine: &Arc<RuntimeEngine>,
-) -> std::io::Result<()> {
-    const RAW_CHUNK_BYTES: usize = 1024 * 1024;
-
-    let (frame, pixels_rgba8) = {
-        let Some(snapshot) = engine.render_frame_snapshot() else {
-            write_status_error(stream, Status::OutOfRange);
-            return Ok(());
-        };
-        snapshot
-    };
-
-    let header = format!(
-        "OK {} {} {} {}\n",
-        frame.frame_seq, frame.width, frame.height, frame.byte_len
-    );
-    stream.write_all(header.as_bytes())?;
-
-    let total = frame.byte_len as usize;
-    if total != pixels_rgba8.len() {
-        return Err(std::io::Error::other("frame_snapshot_len_mismatch"));
-    }
-
-    let mut offset = 0usize;
-    while offset < total {
-        let end = offset.saturating_add(RAW_CHUNK_BYTES).min(total);
-        let chunk = &pixels_rgba8[offset..end];
-        if chunk.is_empty() {
-            return Err(std::io::Error::other("frame_chunk_empty"));
-        }
-        stream.write_all(chunk)?;
-        offset = end;
-    }
-
-    stream.flush()?;
-    Ok(())
-}
-
 const TOUCH_PACKET_BYTES: usize = 16;
 const TOUCH_PACKET_DOWN: u8 = 1;
 const TOUCH_PACKET_MOVE: u8 = 2;
@@ -340,60 +236,6 @@ fn handle_touch_stream_v1(
             Err(e) => return Err(e),
         }
     }
-    Ok(())
-}
-
-fn handle_display_stream_v1(
-    stream: &mut UnixStream,
-    engine: &Arc<RuntimeEngine>,
-    shutdown: &Arc<AtomicBool>,
-) -> std::io::Result<()> {
-    stream.write_all(b"OK STREAM_DISPLAY_V1\n")?;
-    stream.flush()?;
-
-    let mut last_seq = engine.display_signal_seq();
-    let initial = engine.display_state();
-    let initial_line = format!(
-        "EVENT {} {} {} {} {} {}\n",
-        last_seq,
-        initial.width,
-        initial.height,
-        initial.refresh_hz,
-        initial.density_dpi,
-        initial.rotation
-    );
-    if !write_line_allow_disconnect(stream, &initial_line)? {
-        return Ok(());
-    }
-
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-
-        let waited = engine
-            .wait_for_display_after(last_seq, 1000)
-            .map_err(|_| std::io::Error::other("display_wait_failed"))?;
-        let Some((seq, display)) = waited else {
-            continue;
-        };
-
-        let line = format!(
-            "EVENT {} {} {} {} {} {}\n",
-            seq,
-            display.width,
-            display.height,
-            display.refresh_hz,
-            display.density_dpi,
-            display.rotation
-        );
-        if !write_line_allow_disconnect(stream, &line)? {
-            break;
-        }
-
-        last_seq = seq;
-    }
-
     Ok(())
 }
 
@@ -512,19 +354,127 @@ struct DispatchContext {
     allowed_uids: Arc<std::collections::HashSet<u32>>,
     active_connections: Arc<AtomicUsize>,
     max_connections: usize,
+    dispatch_workers: usize,
     socket_rw_timeout_ms: u64,
     command_max_bytes: usize,
-    raw_frame_max_bytes: usize,
-    raw_read_timeout: Duration,
     engine: Arc<RuntimeEngine>,
     shutdown: Arc<AtomicBool>,
+}
+
+struct WorkerJob {
+    stream: UnixStream,
+    socket_kind: &'static str,
+}
+
+struct DispatchPool {
+    senders: Vec<SyncSender<WorkerJob>>,
+    handles: Vec<thread::JoinHandle<()>>,
+    next_worker: AtomicUsize,
+}
+
+impl DispatchPool {
+    fn start(ctx: &DispatchContext) -> Self {
+        let worker_count = ctx.dispatch_workers.max(1);
+        let mut senders = Vec::with_capacity(worker_count);
+        let mut handles = Vec::with_capacity(worker_count);
+
+        for idx in 0..worker_count {
+            let (tx, rx) = mpsc::sync_channel::<WorkerJob>(ctx.max_connections.max(1));
+            let engine_ref = Arc::clone(&ctx.engine);
+            let shutdown_ref = Arc::clone(&ctx.shutdown);
+            let active_connections_ref = Arc::clone(&ctx.active_connections);
+            let command_max_bytes = ctx.command_max_bytes;
+            let handle = thread::spawn(move || {
+                loop {
+                    if shutdown_ref.load(Ordering::SeqCst) {
+                        match rx.try_recv() {
+                            Ok(job) => {
+                                let _active_guard =
+                                    ActiveConnectionGuard::new(Arc::clone(&active_connections_ref));
+                                dispatch_worker_job(
+                                    job,
+                                    &engine_ref,
+                                    &shutdown_ref,
+                                    command_max_bytes,
+                                );
+                                continue;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    let job = match rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(v) => v,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+
+                    let _active_guard =
+                        ActiveConnectionGuard::new(Arc::clone(&active_connections_ref));
+                    dispatch_worker_job(job, &engine_ref, &shutdown_ref, command_max_bytes);
+                }
+                println!("daemon_dispatch_worker_status=index={} state=stopped", idx);
+            });
+
+            senders.push(tx);
+            handles.push(handle);
+        }
+
+        Self {
+            senders,
+            handles,
+            next_worker: AtomicUsize::new(0),
+        }
+    }
+
+    fn submit(&self, job: WorkerJob) -> Result<(), WorkerJob> {
+        if self.senders.is_empty() {
+            return Err(job);
+        }
+        let idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.senders.len();
+        match self.senders[idx].try_send(job) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => Err(job),
+        }
+    }
+
+    fn stop(self) {
+        drop(self.senders);
+        for handle in self.handles {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn dispatch_worker_job(
+    job: WorkerJob,
+    engine: &Arc<RuntimeEngine>,
+    shutdown: &Arc<AtomicBool>,
+    command_max_bytes: usize,
+) {
+    match job.socket_kind {
+        "control" => handle_control_client(
+            job.stream,
+            Arc::clone(engine),
+            Arc::clone(shutdown),
+            command_max_bytes,
+        ),
+        "data" => handle_data_client(
+            job.stream,
+            Arc::clone(engine),
+            Arc::clone(shutdown),
+            command_max_bytes,
+        ),
+        _ => {}
+    }
 }
 
 fn dispatch_accepted_client(
     mut stream: UnixStream,
     socket_kind: &'static str,
     ctx: &DispatchContext,
-) -> bool {
+    dispatch_pool: &DispatchPool,
+) {
     match socket_peer_uid(&stream) {
         Ok(uid) if ctx.allowed_uids.contains(&uid) => {
             if !try_acquire_connection(&ctx.active_connections, ctx.max_connections) {
@@ -535,7 +485,7 @@ fn dispatch_accepted_client(
                     ctx.active_connections.load(Ordering::Acquire),
                     ctx.max_connections
                 );
-                return true;
+                return;
             }
 
             let socket_timeout = if ctx.socket_rw_timeout_ms == 0 {
@@ -543,6 +493,17 @@ fn dispatch_accepted_client(
             } else {
                 Some(Duration::from_millis(ctx.socket_rw_timeout_ms))
             };
+
+            if let Err(e) = stream.set_nonblocking(false) {
+                let _ = stream.write_all(b"ERR INTERNAL_ERROR set_blocking_failed\n");
+                let _ = stream.flush();
+                ctx.active_connections.fetch_sub(1, Ordering::AcqRel);
+                eprintln!(
+                    "daemon_warn=set_blocking_failed socket_kind={} err={}",
+                    socket_kind, e
+                );
+                return;
+            }
             if let Err(e) = stream.set_read_timeout(socket_timeout) {
                 let _ = stream.write_all(b"ERR INTERNAL_ERROR set_read_timeout_failed\n");
                 let _ = stream.flush();
@@ -551,7 +512,7 @@ fn dispatch_accepted_client(
                     "daemon_warn=set_read_timeout_failed socket_kind={} err={}",
                     socket_kind, e
                 );
-                return true;
+                return;
             }
             if let Err(e) = stream.set_write_timeout(socket_timeout) {
                 let _ = stream.write_all(b"ERR INTERNAL_ERROR set_write_timeout_failed\n");
@@ -561,32 +522,25 @@ fn dispatch_accepted_client(
                     "daemon_warn=set_write_timeout_failed socket_kind={} err={}",
                     socket_kind, e
                 );
-                return true;
+                return;
             }
 
-            let engine_ref = Arc::clone(&ctx.engine);
-            let shutdown_ref = Arc::clone(&ctx.shutdown);
-            let active_connections_ref = Arc::clone(&ctx.active_connections);
-            let command_max_bytes = ctx.command_max_bytes;
-            let raw_frame_max_bytes = ctx.raw_frame_max_bytes;
-            let raw_read_timeout = ctx.raw_read_timeout;
-            thread::spawn(move || {
-                let _active_guard = ActiveConnectionGuard::new(active_connections_ref);
-                match socket_kind {
-                    "control" => {
-                        handle_control_client(stream, engine_ref, shutdown_ref, command_max_bytes)
-                    }
-                    "data" => handle_data_client(
-                        stream,
-                        engine_ref,
-                        shutdown_ref,
-                        command_max_bytes,
-                        raw_frame_max_bytes,
-                        raw_read_timeout,
-                    ),
-                    _ => {}
-                }
-            });
+            let job = WorkerJob {
+                stream,
+                socket_kind,
+            };
+            if let Err(mut rejected) = dispatch_pool.submit(job) {
+                let _ = rejected.stream.write_all(b"ERR BUSY\n");
+                let _ = rejected.stream.flush();
+                ctx.active_connections.fetch_sub(1, Ordering::AcqRel);
+                eprintln!(
+                    "daemon_warn=dispatch_queue_busy socket_kind={} active={} limit={}",
+                    socket_kind,
+                    ctx.active_connections.load(Ordering::Acquire),
+                    ctx.max_connections
+                );
+                return;
+            }
         }
         Ok(uid) => {
             let _ = stream.write_all(b"ERR FORBIDDEN\n");
@@ -605,8 +559,32 @@ fn dispatch_accepted_client(
             );
         }
     }
+}
 
-    false
+const TOKEN_CONTROL_LISTENER: Token = Token(1);
+const TOKEN_DATA_LISTENER: Token = Token(2);
+
+fn accept_pending(
+    listener: &UnixListener,
+    socket_kind: &'static str,
+    ctx: &DispatchContext,
+    dispatch_pool: &DispatchPool,
+) {
+    loop {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                dispatch_accepted_client(stream, socket_kind, ctx, dispatch_pool);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                eprintln!(
+                    "daemon_warn=accept_failed socket_kind={} err={}",
+                    socket_kind, e
+                );
+                break;
+            }
+        }
+    }
 }
 
 fn main() {
@@ -728,21 +706,19 @@ fn main() {
         allowed_uids: Arc::clone(&allowed_uids),
         active_connections: Arc::clone(&active_connections),
         max_connections: cfg.max_connections,
+        dispatch_workers: cfg.dispatch_workers,
         socket_rw_timeout_ms: cfg.socket_rw_timeout_ms,
         command_max_bytes: cfg.command_max_bytes,
-        raw_frame_max_bytes: cfg.raw_frame_max_bytes,
-        raw_read_timeout: Duration::from_millis(cfg.raw_read_timeout_ms),
         engine: Arc::clone(&engine),
         shutdown: Arc::clone(&shutdown),
     };
-    let mut worker_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+    let mut supervise_handles: Vec<thread::JoinHandle<()>> = Vec::new();
 
     println!("daemon_render_output_dir={}", cfg.render_output_dir);
     println!("daemon_max_connections={}", cfg.max_connections);
+    println!("daemon_dispatch_workers={}", cfg.dispatch_workers);
     println!("daemon_socket_rw_timeout_ms={}", cfg.socket_rw_timeout_ms);
-    println!("daemon_raw_read_timeout_ms={}", cfg.raw_read_timeout_ms);
     println!("daemon_command_max_bytes={}", cfg.command_max_bytes);
-    println!("daemon_raw_frame_max_bytes={}", cfg.raw_frame_max_bytes);
 
     let restart_delay = Duration::from_millis(cfg.supervise_restart_ms);
     if let Some(raw_cmd) = cfg.supervise_presenter_cmd.clone() {
@@ -761,7 +737,7 @@ fn main() {
             cmd.program,
             cmd.args.len()
         );
-        worker_handles.push(supervise_worker(
+        supervise_handles.push(supervise_worker(
             "presenter",
             cmd,
             restart_delay,
@@ -781,7 +757,7 @@ fn main() {
             cmd.program,
             cmd.args.len()
         );
-        worker_handles.push(supervise_worker(
+        supervise_handles.push(supervise_worker(
             "input",
             cmd,
             restart_delay,
@@ -789,46 +765,86 @@ fn main() {
         ));
     }
 
+    let dispatch_pool = DispatchPool::start(&dispatch_ctx);
+
+    let mut poll = match Poll::new() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("daemon_error=poll_create_failed err={}", e);
+            shutdown.store(true, Ordering::SeqCst);
+            dispatch_pool.stop();
+            for handle in supervise_handles {
+                let _ = handle.join();
+            }
+            std::process::exit(4);
+        }
+    };
+    let control_raw_fd = control_listener.as_raw_fd();
+    let data_raw_fd = data_listener.as_raw_fd();
+    let mut control_source = SourceFd(&control_raw_fd);
+    let mut data_source = SourceFd(&data_raw_fd);
+
+    if let Err(e) = poll.registry().register(
+        &mut control_source,
+        TOKEN_CONTROL_LISTENER,
+        Interest::READABLE,
+    ) {
+        eprintln!(
+            "daemon_error=poll_register_failed socket_kind=control err={}",
+            e
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        dispatch_pool.stop();
+        for handle in supervise_handles {
+            let _ = handle.join();
+        }
+        std::process::exit(4);
+    }
+
+    if let Err(e) =
+        poll.registry()
+            .register(&mut data_source, TOKEN_DATA_LISTENER, Interest::READABLE)
+    {
+        eprintln!(
+            "daemon_error=poll_register_failed socket_kind=data err={}",
+            e
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        dispatch_pool.stop();
+        for handle in supervise_handles {
+            let _ = handle.join();
+        }
+        std::process::exit(4);
+    }
+
+    let mut events = Events::with_capacity(256);
     while !shutdown.load(Ordering::SeqCst) {
-        let mut accepted = false;
-
-        match control_listener.accept() {
-            Ok((stream, _addr)) => {
-                accepted = true;
-                if dispatch_accepted_client(stream, "control", &dispatch_ctx) {
-                    continue;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        match poll.poll(&mut events, Some(Duration::from_millis(250))) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                accepted = true;
-                eprintln!("daemon_warn=accept_failed socket_kind=control err={}", e);
+                eprintln!("daemon_warn=poll_wait_failed err={}", e);
+                thread::sleep(Duration::from_millis(20));
+                continue;
             }
         }
 
-        match data_listener.accept() {
-            Ok((stream, _addr)) => {
-                accepted = true;
-                if dispatch_accepted_client(stream, "data", &dispatch_ctx) {
-                    continue;
+        for event in events.iter() {
+            match event.token() {
+                TOKEN_CONTROL_LISTENER => {
+                    accept_pending(&control_listener, "control", &dispatch_ctx, &dispatch_pool);
                 }
+                TOKEN_DATA_LISTENER => {
+                    accept_pending(&data_listener, "data", &dispatch_ctx, &dispatch_pool);
+                }
+                _ => {}
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => {
-                accepted = true;
-                eprintln!("daemon_warn=accept_failed socket_kind=data err={}", e);
-            }
-        }
-
-        if !accepted {
-            thread::sleep(Duration::from_millis(20));
-        } else {
-            thread::sleep(Duration::from_millis(1));
         }
     }
 
     shutdown.store(true, Ordering::SeqCst);
-    for handle in worker_handles {
+    dispatch_pool.stop();
+    for handle in supervise_handles {
         let _ = handle.join();
     }
 
@@ -864,6 +880,8 @@ mod tests {
             "777".to_string(),
             "--max-connections".to_string(),
             "321".to_string(),
+            "--dispatch-workers".to_string(),
+            "8".to_string(),
         ];
         let cfg = parse_daemon_config(&args).expect("parse daemon cfg");
         assert_eq!(cfg.control_socket_path, "/tmp/a.sock");
@@ -876,6 +894,7 @@ mod tests {
         assert_eq!(cfg.supervise_input_cmd.as_deref(), Some("echo input"));
         assert_eq!(cfg.supervise_restart_ms, 777);
         assert_eq!(cfg.max_connections, 321);
+        assert_eq!(cfg.dispatch_workers, 8);
         assert!(!cfg.allowed_uids.is_empty());
     }
 
@@ -900,79 +919,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_raw_frame_submit_request_accepts_valid_header() {
-        let req = parse_raw_frame_submit_request("RENDER_FRAME_SUBMIT_RGBA_RAW 2 1 8", 8)
-            .expect("parse ok")
-            .expect("has request");
-        assert_eq!(req.width, 2);
-        assert_eq!(req.height, 1);
-        assert_eq!(req.byte_len, 8);
-    }
-
-    #[test]
-    fn parse_raw_frame_submit_request_rejects_mismatched_len() {
-        let out = parse_raw_frame_submit_request("RENDER_FRAME_SUBMIT_RGBA_RAW 2 1 7", 8)
-            .expect_err("must reject");
-        assert_eq!(out, Status::InvalidArgument);
-    }
-
-    #[test]
-    fn parse_raw_frame_submit_request_ignores_other_commands() {
-        let out = parse_raw_frame_submit_request("PING", 8).expect("parse ping");
-        assert_eq!(out, None);
-    }
-
-    #[test]
-    fn parse_frame_get_raw_request_accepts_header() {
-        let out = parse_frame_get_raw_request("RENDER_FRAME_GET_RAW").expect("parse raw get");
+    fn parse_frame_bind_shm_request_accepts_header() {
+        let out = parse_frame_bind_shm_request("RENDER_FRAME_BIND_SHM").expect("parse bind shm");
         assert!(out);
     }
 
     #[test]
-    fn parse_frame_get_raw_request_rejects_extra_tokens() {
-        let out = parse_frame_get_raw_request("RENDER_FRAME_GET_RAW extra").expect_err("reject");
+    fn parse_frame_bind_shm_request_rejects_extra_tokens() {
+        let out = parse_frame_bind_shm_request("RENDER_FRAME_BIND_SHM x").expect_err("reject");
         assert_eq!(out, Status::InvalidArgument);
     }
 
     #[test]
-    fn parse_frame_get_fd_request_accepts_header() {
-        let out = parse_frame_get_fd_request("RENDER_FRAME_GET_FD").expect("parse fd get");
-        assert!(out);
-    }
-
-    #[test]
-    fn parse_frame_get_fd_request_rejects_extra_tokens() {
-        let out = parse_frame_get_fd_request("RENDER_FRAME_GET_FD extra").expect_err("reject");
-        assert_eq!(out, Status::InvalidArgument);
-    }
-
-    #[test]
-    fn parse_frame_bind_fd_request_accepts_header() {
-        let out = parse_frame_bind_fd_request("RENDER_FRAME_BIND_FD").expect("parse bind");
-        assert!(out);
-    }
-
-    #[test]
-    fn parse_frame_bind_fd_request_rejects_extra_tokens() {
-        let out = parse_frame_bind_fd_request("RENDER_FRAME_BIND_FD x").expect_err("reject");
-        assert_eq!(out, Status::InvalidArgument);
-    }
-
-    #[test]
-    fn parse_frame_get_bound_request_accepts_header() {
-        let out = parse_frame_get_bound_request("RENDER_FRAME_GET_BOUND").expect("parse bound");
-        assert!(out);
-    }
-
-    #[test]
-    fn parse_frame_get_bound_request_rejects_extra_tokens() {
-        let out = parse_frame_get_bound_request("RENDER_FRAME_GET_BOUND x").expect_err("reject");
-        assert_eq!(out, Status::InvalidArgument);
-    }
-
-    #[test]
-    fn parse_frame_wait_bound_present_request_accepts() {
-        let out = parse_frame_wait_bound_present_request("RENDER_FRAME_WAIT_BOUND_PRESENT 7 16")
+    fn parse_frame_wait_shm_present_request_accepts() {
+        let out = parse_frame_wait_shm_present_request("RENDER_FRAME_WAIT_SHM_PRESENT 7 16")
             .expect("parse")
             .expect("request");
         assert_eq!(out.0, 7);
@@ -980,21 +940,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_frame_wait_bound_present_request_rejects_extra_tokens() {
-        let out = parse_frame_wait_bound_present_request("RENDER_FRAME_WAIT_BOUND_PRESENT 7 16 x")
+    fn parse_frame_wait_shm_present_request_rejects_extra_tokens() {
+        let out = parse_frame_wait_shm_present_request("RENDER_FRAME_WAIT_SHM_PRESENT 7 16 x")
             .expect_err("reject");
-        assert_eq!(out, Status::InvalidArgument);
-    }
-
-    #[test]
-    fn parse_display_stream_v1_request_accepts_header() {
-        let out = parse_display_stream_v1_request("STREAM_DISPLAY_V1").expect("parse stream");
-        assert!(out);
-    }
-
-    #[test]
-    fn parse_display_stream_v1_request_rejects_extra_tokens() {
-        let out = parse_display_stream_v1_request("STREAM_DISPLAY_V1 x").expect_err("reject");
         assert_eq!(out, Status::InvalidArgument);
     }
 

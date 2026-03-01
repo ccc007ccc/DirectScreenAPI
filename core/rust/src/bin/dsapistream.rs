@@ -1,41 +1,35 @@
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead};
 use std::os::unix::net::UnixStream;
 
 use directscreen_core::util::{default_control_socket_path, timeout_from_env};
 
+use directscreen_core::util::ctl_wire;
+
 struct SocketClient {
-    writer: UnixStream,
-    reader: BufReader<UnixStream>,
+    stream: UnixStream,
+    seq: u64,
 }
 
 impl SocketClient {
     fn connect(socket: &str) -> io::Result<Self> {
-        let writer = UnixStream::connect(socket)?;
+        let stream = UnixStream::connect(socket)?;
         let timeout = timeout_from_env("DSAPI_CLIENT_TIMEOUT_MS", 5000, 100);
-        writer.set_read_timeout(timeout)?;
-        writer.set_write_timeout(timeout)?;
-
-        let reader_stream = writer.try_clone()?;
-        reader_stream.set_read_timeout(timeout)?;
-        reader_stream.set_write_timeout(timeout)?;
-        let reader = BufReader::new(reader_stream);
-        Ok(Self { writer, reader })
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+        Ok(Self { stream, seq: 1 })
     }
 
-    fn send_line(&mut self, line: &str) -> io::Result<String> {
-        self.writer.write_all(line.as_bytes())?;
-        self.writer.write_all(b"\n")?;
-        self.writer.flush()?;
+    fn send_command(&mut self, cmd: &ctl_wire::BinaryCtlCommand) -> io::Result<String> {
+        ctl_wire::write_request(&mut self.stream, self.seq, cmd)?;
+        self.seq = self.seq.saturating_add(1);
 
-        let mut response = String::new();
-        let n = self.reader.read_line(&mut response)?;
-        if n == 0 {
+        let Some(resp) = ctl_wire::read_response(&mut self.stream)? else {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "socket_closed",
             ));
-        }
-        Ok(response.trim_end().to_string())
+        };
+        Ok(ctl_wire::format_response(cmd, &resp))
     }
 }
 
@@ -100,18 +94,31 @@ fn main() {
             break;
         }
 
-        let cmd = line.trim();
-        if cmd.is_empty() {
+        let cmd_line = line.trim();
+        if cmd_line.is_empty() {
             continue;
         }
 
+        let cmd = match ctl_wire::parse_command_line(cmd_line) {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format!("ERR INVALID_ARGUMENT {}", e);
+                if !quiet {
+                    println!("{}", msg);
+                } else {
+                    eprintln!("stream_warn=parse_failed cmd={} reason={}", cmd_line, e);
+                }
+                continue;
+            }
+        };
+
         let mut retried = false;
         let response = loop {
-            match client.send_line(cmd) {
+            match client.send_command(&cmd) {
                 Ok(resp) => break resp,
                 Err(e) => {
                     if retried {
-                        eprintln!("stream_error=send_failed cmd={} err={}", cmd, e);
+                        eprintln!("stream_error=send_failed cmd={} err={}", cmd_line, e);
                         std::process::exit(4);
                     }
                     retried = true;
@@ -132,7 +139,10 @@ fn main() {
         if !quiet {
             println!("{}", response);
         } else if !response.starts_with("OK") {
-            eprintln!("stream_warn=daemon_error cmd={} response={}", cmd, response);
+            eprintln!(
+                "stream_warn=daemon_error cmd={} response={}",
+                cmd_line, response
+            );
         }
     }
 }

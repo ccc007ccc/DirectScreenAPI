@@ -1,14 +1,10 @@
 package org.directscreenapi.adapter;
 
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.io.OutputStreamWriter;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
@@ -19,6 +15,26 @@ final class DaemonSession {
     private static final String SOCKET_TIMEOUT_PROPERTY = "dsapi.socket_timeout_ms";
     private static final String PIXEL_FORMAT_RGBA8888 = "RGBA8888";
 
+    private static final int BIN_MAGIC = 0x50415344; // "DSAP"
+    private static final int BIN_VERSION = 1;
+    private static final int BIN_HEADER_BYTES = 20;
+    private static final int BIN_RESPONSE_VALUES = 8;
+    private static final int BIN_RESPONSE_PAYLOAD_BYTES = 4 + (BIN_RESPONSE_VALUES * 8);
+
+    private static final int BIN_OP_PING = 1;
+    private static final int BIN_OP_VERSION = 2;
+    private static final int BIN_OP_SHUTDOWN = 3;
+    private static final int BIN_OP_DISPLAY_GET = 4;
+    private static final int BIN_OP_DISPLAY_SET = 5;
+    private static final int BIN_OP_TOUCH_CLEAR = 6;
+    private static final int BIN_OP_TOUCH_COUNT = 7;
+    private static final int BIN_OP_TOUCH_MOVE = 8;
+    private static final int BIN_OP_RENDER_SUBMIT = 9;
+    private static final int BIN_OP_RENDER_GET = 10;
+
+    private static final String CMD_BIND_SHM = "RENDER_FRAME_BIND_SHM";
+    private static final String CMD_WAIT_SHM = "RENDER_FRAME_WAIT_SHM_PRESENT";
+
     static final class MappedFrame {
         final long frameSeq;
         final int width;
@@ -26,13 +42,7 @@ final class DaemonSession {
         final int byteLen;
         final ByteBuffer rgba8;
 
-        MappedFrame(
-                long frameSeq,
-                int width,
-                int height,
-                int byteLen,
-                ByteBuffer rgba8
-        ) {
+        MappedFrame(long frameSeq, int width, int height, int byteLen, ByteBuffer rgba8) {
             this.frameSeq = frameSeq;
             this.width = width;
             this.height = height;
@@ -57,18 +67,37 @@ final class DaemonSession {
         }
     }
 
+    private static final class BinaryReply {
+        final long seq;
+        final int opcode;
+        final int status;
+        final long[] values;
+
+        BinaryReply(long seq, int opcode, int status, long[] values) {
+            this.seq = seq;
+            this.opcode = opcode;
+            this.status = status;
+            this.values = values;
+        }
+    }
+
     private final String controlSocketPath;
     private final String dataSocketPath;
-    private Object localSocket;
-    private BufferedReader reader;
-    private BufferedWriter writer;
+
+    private Object controlSocket;
+    private InputStream controlInput;
+    private OutputStream controlOutput;
+    private long controlSeq = 1L;
+
     private Object rawSocket;
     private InputStream rawInput;
     private OutputStream rawOutput;
     private FileInputStream rawFrameFdStream;
     private FileChannel rawFrameFdChannel;
     private MappedByteBuffer rawFrameMapped;
+    private int rawFrameMappedLen;
     private int rawFrameCapacity;
+    private int rawFrameOffset;
 
     DaemonSession(String controlSocketPath, String dataSocketPath) {
         this.controlSocketPath = controlSocketPath;
@@ -79,11 +108,13 @@ final class DaemonSession {
         Exception last = null;
         for (int attempt = 0; attempt < 2; attempt++) {
             try {
-                ensureConnected();
-                writer.write(cmd);
-                writer.write('\n');
-                writer.flush();
-                return requireOkLine(reader.readLine(), "daemon_command");
+                ensureControlConnected();
+                String[] tokens = splitTokens(cmd);
+                BinaryReply reply = executeControlCommand(tokens);
+                if (reply.status != 0) {
+                    throw new IOException("daemon_command_status=" + reply.status);
+                }
+                return formatControlReply(tokens, reply);
             } catch (Exception e) {
                 last = e;
                 closeQuietly();
@@ -100,40 +131,44 @@ final class DaemonSession {
                 bindFrameFdIfNeeded();
                 long safeSeq = Math.max(0L, lastFrameSeq);
                 int safeTimeout = Math.max(1, timeoutMs);
-                writeAsciiLine(rawOutput, "RENDER_FRAME_WAIT_BOUND_PRESENT " + safeSeq + " " + safeTimeout);
-                String trimmed = requireOkLine(readAsciiLine(rawInput), "daemon_wait_bound_present");
+                writeAsciiLine(rawOutput, CMD_WAIT_SHM + " " + safeSeq + " " + safeTimeout);
+                String trimmed = requireOkLine(readAsciiLine(rawInput), "daemon_wait_shm_present");
                 String[] tokens = trimmed.split("\\s+");
                 if (tokens.length == 2 && "TIMEOUT".equals(tokens[1])) {
                     return null;
                 }
-                if (tokens.length != 7) {
-                    throw new IOException("daemon_wait_bound_present_tokens_invalid");
+                if (tokens.length != 8) {
+                    throw new IOException("daemon_wait_shm_present_tokens_invalid");
                 }
                 if (!PIXEL_FORMAT_RGBA8888.equals(tokens[4])) {
-                    throw new IOException("daemon_wait_bound_present_pixel_format_invalid");
+                    throw new IOException("daemon_wait_shm_present_pixel_format_invalid");
                 }
 
                 long frameSeq = parseLong(tokens[1], -1L);
                 int width = parseInt(tokens[2], -1);
                 int height = parseInt(tokens[3], -1);
                 int byteLen = parseInt(tokens[5], -1);
-                if (frameSeq < 0 || width <= 0 || height <= 0 || byteLen <= 0) {
-                    throw new IOException("daemon_wait_bound_present_header_invalid");
+                int offset = parseInt(tokens[7], -1);
+                if (frameSeq < 0 || width <= 0 || height <= 0 || byteLen <= 0 || offset < 0) {
+                    throw new IOException("daemon_wait_shm_present_header_invalid");
                 }
                 long expectedByteLen = (long) width * (long) height * 4L;
                 if (expectedByteLen <= 0L || expectedByteLen > Integer.MAX_VALUE || byteLen != (int) expectedByteLen) {
-                    throw new IOException("daemon_wait_bound_present_len_mismatch");
+                    throw new IOException("daemon_wait_shm_present_len_mismatch");
                 }
-                if (rawFrameMapped == null || rawFrameCapacity <= 0) {
-                    throw new IOException("daemon_wait_bound_present_uninitialized");
+                if (rawFrameMapped == null || rawFrameCapacity <= 0 || rawFrameMappedLen <= 0) {
+                    throw new IOException("daemon_wait_shm_present_uninitialized");
                 }
                 if (byteLen > rawFrameCapacity) {
-                    throw new IOException("daemon_wait_bound_present_len_over_capacity");
+                    throw new IOException("daemon_wait_shm_present_len_over_capacity");
+                }
+                if (offset > rawFrameMappedLen || byteLen > (rawFrameMappedLen - offset)) {
+                    throw new IOException("daemon_wait_shm_present_offset_overflow");
                 }
 
                 ByteBuffer view = rawFrameMapped.duplicate();
-                view.position(0);
-                view.limit(byteLen);
+                view.position(offset);
+                view.limit(offset + byteLen);
                 ByteBuffer rgba = view.slice();
                 return new MappedFrame(frameSeq, width, height, byteLen, rgba);
             } catch (Exception e) {
@@ -141,43 +176,41 @@ final class DaemonSession {
                 closeRawQuietly();
             }
         }
-        throw last != null ? last : new IOException("daemon_wait_bound_present_failed");
+        throw last != null ? last : new IOException("daemon_wait_shm_present_failed");
     }
 
     synchronized void closeQuietly() {
-        if (reader != null) {
+        if (controlInput != null) {
             try {
-                reader.close();
+                controlInput.close();
             } catch (Throwable ignored) {
             }
-            reader = null;
+            controlInput = null;
         }
-        if (writer != null) {
+        if (controlOutput != null) {
             try {
-                writer.close();
+                controlOutput.close();
             } catch (Throwable ignored) {
             }
-            writer = null;
+            controlOutput = null;
         }
-        if (localSocket != null) {
-            try {
-                ReflectBridge.invoke(localSocket, "close");
-            } catch (Throwable ignored) {
-            }
-            localSocket = null;
+        if (controlSocket != null) {
+            closeSocketQuietly(controlSocket);
+            controlSocket = null;
         }
+        controlSeq = 1L;
         closeRawQuietly();
     }
 
-    private void ensureConnected() throws Exception {
-        if (localSocket != null && reader != null && writer != null) {
+    private void ensureControlConnected() throws Exception {
+        if (controlSocket != null && controlInput != null && controlOutput != null) {
             return;
         }
-
         SocketIo io = openSocket(controlSocketPath);
-        this.localSocket = io.socket;
-        this.writer = new BufferedWriter(new OutputStreamWriter(io.output, StandardCharsets.UTF_8));
-        this.reader = new BufferedReader(new InputStreamReader(io.input, StandardCharsets.UTF_8));
+        controlSocket = io.socket;
+        controlInput = io.input;
+        controlOutput = io.output;
+        controlSeq = 1L;
     }
 
     private SocketIo openSocket(String path) throws Exception {
@@ -234,7 +267,9 @@ final class DaemonSession {
             rawFrameFdStream = null;
         }
         rawFrameMapped = null;
+        rawFrameMappedLen = 0;
         rawFrameCapacity = 0;
+        rawFrameOffset = 0;
 
         if (rawInput != null) {
             try {
@@ -260,27 +295,34 @@ final class DaemonSession {
         if (rawFrameMapped != null && rawFrameCapacity > 0) {
             return;
         }
+        bindFrameShm();
+    }
 
-        writeAsciiLine(rawOutput, "RENDER_FRAME_BIND_FD");
-        String trimmed = requireOkLine(readAsciiLine(rawInput), "daemon_bind_fd");
+    private void bindFrameShm() throws Exception {
+        writeAsciiLine(rawOutput, CMD_BIND_SHM);
+        String trimmed = requireOkLine(readAsciiLine(rawInput), "daemon_bind_shm");
         String[] tokens = trimmed.split("\\s+");
-        if (tokens.length != 3 || !"BOUND".equals(tokens[1])) {
-            throw new IOException("daemon_bind_fd_tokens_invalid");
+        if (tokens.length != 4 || !"SHM_BOUND".equals(tokens[1])) {
+            throw new IOException("daemon_bind_shm_tokens_invalid");
         }
         int capacity = parseInt(tokens[2], -1);
-        if (capacity <= 0) {
-            throw new IOException("daemon_bind_fd_capacity_invalid");
+        int offset = parseInt(tokens[3], -1);
+        if (capacity <= 0 || offset < 0) {
+            throw new IOException("daemon_bind_shm_layout_invalid");
         }
+        int mapLen = safeAdd(capacity, offset, "daemon_bind_shm_map_len_overflow");
 
         FileDescriptor fd = pollSingleAncillaryFd(rawSocket);
         FileInputStream stream = new FileInputStream(fd);
         FileChannel channel = stream.getChannel();
         try {
-            MappedByteBuffer mapped = channel.map(FileChannel.MapMode.READ_ONLY, 0L, capacity);
+            MappedByteBuffer mapped = channel.map(FileChannel.MapMode.READ_ONLY, 0L, mapLen);
             rawFrameFdStream = stream;
             rawFrameFdChannel = channel;
             rawFrameMapped = mapped;
+            rawFrameMappedLen = mapLen;
             rawFrameCapacity = capacity;
+            rawFrameOffset = offset;
         } catch (Throwable t) {
             try {
                 channel.close();
@@ -292,6 +334,117 @@ final class DaemonSession {
             }
             throw t;
         }
+    }
+
+    private BinaryReply executeControlCommand(String[] tokens) throws Exception {
+        if (tokens.length == 0) {
+            throw new IOException("control_command_empty");
+        }
+
+        String cmd = tokens[0].toUpperCase();
+        if ("DISPLAY_SET".equals(cmd)) {
+            if (tokens.length != 6) {
+                throw new IOException("display_set_args_invalid");
+            }
+            int width = parseInt(tokens[1], -1);
+            int height = parseInt(tokens[2], -1);
+            float refresh = parseFloat(tokens[3], Float.NaN);
+            int dpi = parseInt(tokens[4], -1);
+            int rotation = parseInt(tokens[5], -1);
+            if (width <= 0 || height <= 0 || !Float.isFinite(refresh) || refresh <= 0f || dpi <= 0 || rotation < 0) {
+                throw new IOException("display_set_args_invalid");
+            }
+            byte[] payload = new byte[20];
+            writeLe32(payload, 0, width);
+            writeLe32(payload, 4, height);
+            writeLe32(payload, 8, Float.floatToIntBits(refresh));
+            writeLe32(payload, 12, dpi);
+            writeLe32(payload, 16, rotation);
+            return sendBinaryControl(BIN_OP_DISPLAY_SET, payload);
+        }
+
+        if ("DISPLAY_GET".equals(cmd)) {
+            if (tokens.length != 1) {
+                throw new IOException("display_get_args_invalid");
+            }
+            return sendBinaryControl(BIN_OP_DISPLAY_GET, new byte[0]);
+        }
+
+        if ("PING".equals(cmd)) {
+            if (tokens.length != 1) {
+                throw new IOException("ping_args_invalid");
+            }
+            return sendBinaryControl(BIN_OP_PING, new byte[0]);
+        }
+
+        throw new IOException("control_command_unsupported:" + cmd);
+    }
+
+    private String formatControlReply(String[] tokens, BinaryReply reply) throws IOException {
+        if (reply.status != 0) {
+            throw new IOException("daemon_control_status=" + reply.status);
+        }
+        String cmd = tokens[0].toUpperCase();
+        if ("DISPLAY_SET".equals(cmd)) {
+            return "OK";
+        }
+        if ("DISPLAY_GET".equals(cmd)) {
+            float refresh = Float.intBitsToFloat((int) reply.values[2]);
+            return "OK "
+                    + reply.values[0] + " "
+                    + reply.values[1] + " "
+                    + String.format(java.util.Locale.US, "%.2f", refresh) + " "
+                    + reply.values[3] + " "
+                    + reply.values[4];
+        }
+        if ("PING".equals(cmd)) {
+            return "OK PONG";
+        }
+        return "OK";
+    }
+
+    private BinaryReply sendBinaryControl(int opcode, byte[] payload) throws Exception {
+        byte[] header = new byte[BIN_HEADER_BYTES];
+        writeLe32(header, 0, BIN_MAGIC);
+        writeLe16(header, 4, BIN_VERSION);
+        writeLe16(header, 6, opcode);
+        writeLe32(header, 8, payload.length);
+        writeLe64(header, 12, controlSeq);
+
+        controlOutput.write(header);
+        if (payload.length > 0) {
+            controlOutput.write(payload);
+        }
+        controlOutput.flush();
+
+        byte[] respHeader = new byte[BIN_HEADER_BYTES];
+        readFully(controlInput, respHeader);
+        int magic = readLe32(respHeader, 0);
+        int version = readLe16(respHeader, 4);
+        int respOpcode = readLe16(respHeader, 6);
+        int payloadLen = readLe32(respHeader, 8);
+        long seq = readLe64(respHeader, 12);
+
+        if (magic != BIN_MAGIC || version != BIN_VERSION) {
+            throw new IOException("daemon_control_header_invalid");
+        }
+        if (payloadLen != BIN_RESPONSE_PAYLOAD_BYTES) {
+            throw new IOException("daemon_control_payload_len_invalid");
+        }
+
+        byte[] respPayload = new byte[BIN_RESPONSE_PAYLOAD_BYTES];
+        readFully(controlInput, respPayload);
+
+        int status = readLe32(respPayload, 0);
+        long[] values = new long[BIN_RESPONSE_VALUES];
+        int cursor = 4;
+        for (int i = 0; i < BIN_RESPONSE_VALUES; i++) {
+            values[i] = readLe64(respPayload, cursor);
+            cursor += 8;
+        }
+
+        controlSeq = seq + 1L;
+        return new BinaryReply(seq, respOpcode, status, values);
     }
 
     private static void writeAsciiLine(OutputStream os, String line) throws IOException {
@@ -369,6 +522,14 @@ final class DaemonSession {
         }
     }
 
+    private static float parseFloat(String s, float fallback) {
+        try {
+            return Float.parseFloat(s);
+        } catch (Throwable ignored) {
+            return fallback;
+        }
+    }
+
     private static Object resolveNamespaceFilesystem(Class<?> namespaceClass) throws Exception {
         Object[] constants = namespaceClass.getEnumConstants();
         if (constants == null || constants.length == 0) {
@@ -392,5 +553,80 @@ final class DaemonSession {
             throw new IOException("daemon_frame_fd_empty_ancillary");
         }
         return fds[0];
+    }
+
+    private static int safeAdd(int a, int b, String errMsg) throws IOException {
+        long out = (long) a + (long) b;
+        if (out <= 0L || out > Integer.MAX_VALUE) {
+            throw new IOException(errMsg);
+        }
+        return (int) out;
+    }
+
+    private static String[] splitTokens(String cmd) {
+        if (cmd == null) {
+            return new String[0];
+        }
+        String trimmed = cmd.trim();
+        if (trimmed.isEmpty()) {
+            return new String[0];
+        }
+        return trimmed.split("\\s+");
+    }
+
+    private static void readFully(InputStream is, byte[] out) throws IOException {
+        int offset = 0;
+        while (offset < out.length) {
+            int n = is.read(out, offset, out.length - offset);
+            if (n < 0) {
+                throw new IOException("daemon_binary_eof");
+            }
+            offset += n;
+        }
+    }
+
+    private static int readLe16(byte[] buf, int off) {
+        return (buf[off] & 0xff) | ((buf[off + 1] & 0xff) << 8);
+    }
+
+    private static int readLe32(byte[] buf, int off) {
+        return (buf[off] & 0xff)
+                | ((buf[off + 1] & 0xff) << 8)
+                | ((buf[off + 2] & 0xff) << 16)
+                | ((buf[off + 3] & 0xff) << 24);
+    }
+
+    private static long readLe64(byte[] buf, int off) {
+        return ((long) buf[off] & 0xffL)
+                | (((long) buf[off + 1] & 0xffL) << 8)
+                | (((long) buf[off + 2] & 0xffL) << 16)
+                | (((long) buf[off + 3] & 0xffL) << 24)
+                | (((long) buf[off + 4] & 0xffL) << 32)
+                | (((long) buf[off + 5] & 0xffL) << 40)
+                | (((long) buf[off + 6] & 0xffL) << 48)
+                | (((long) buf[off + 7] & 0xffL) << 56);
+    }
+
+    private static void writeLe16(byte[] buf, int off, int value) {
+        buf[off] = (byte) (value & 0xff);
+        buf[off + 1] = (byte) ((value >>> 8) & 0xff);
+    }
+
+    private static void writeLe32(byte[] buf, int off, int value) {
+        buf[off] = (byte) (value & 0xff);
+        buf[off + 1] = (byte) ((value >>> 8) & 0xff);
+        buf[off + 2] = (byte) ((value >>> 16) & 0xff);
+        buf[off + 3] = (byte) ((value >>> 24) & 0xff);
+    }
+
+    private static void writeLe64(byte[] buf, int off, long value) {
+        buf[off] = (byte) (value & 0xffL);
+        buf[off + 1] = (byte) ((value >>> 8) & 0xffL);
+        buf[off + 2] = (byte) ((value >>> 16) & 0xffL);
+        buf[off + 3] = (byte) ((value >>> 24) & 0xffL);
+        buf[off + 4] = (byte) ((value >>> 32) & 0xffL);
+        buf[off + 5] = (byte) ((value >>> 40) & 0xffL);
+        buf[off + 6] = (byte) ((value >>> 48) & 0xffL);
+        buf[off + 7] = (byte) ((value >>> 56) & 0xffL);
     }
 }

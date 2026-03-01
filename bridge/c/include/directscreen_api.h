@@ -68,6 +68,22 @@ typedef struct dsapi_render_present_info {
     uint32_t checksum_fnv1a32;
 } dsapi_render_present_info_t;
 
+/*
+ * Android 零拷贝硬件缓冲区描述：
+ * - fd 为来自 AHardwareBuffer/native_handle 的 dma-buf 描述符（调用方需保证可读）
+ * - width/height/stride/format 与 AHardwareBuffer_Desc 对齐
+ * - byte_offset 用于平面偏移（RGBA 通常为 0）
+ */
+typedef struct dsapi_hwbuffer_desc {
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t format;
+    uint64_t usage;
+    uint32_t byte_offset;
+    uint32_t byte_len;
+} dsapi_hwbuffer_desc_t;
+
 const char* dsapi_version(void);
 uint32_t dsapi_abi_version(void);
 
@@ -152,6 +168,17 @@ int32_t dsapi_render_submit_frame_rgba(
     uint32_t height,
     const uint8_t* pixels_rgba8,
     uint32_t pixels_len,
+    dsapi_render_frame_info_t* out_info
+);
+
+/*
+ * Android 桥接入口：从 dma-buf fd 导入硬件缓冲区元数据并提交到核心。
+ * 注意：当前实现保持 ABI 稳定，具体零拷贝策略由 Rust/平台层后续分阶段启用。
+ */
+int32_t dsapi_render_submit_frame_ahb_fd(
+    dsapi_context_t* ctx,
+    int32_t fd,
+    const dsapi_hwbuffer_desc_t* desc,
     dsapi_render_frame_info_t* out_info
 );
 

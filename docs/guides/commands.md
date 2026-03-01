@@ -91,5 +91,5 @@ Touch bridge：
 
 ## 注意事项
 
-- `dsapi.sh daemon cmd` 走控制面 socket，不适合二进制命令（如 `RENDER_FRAME_GET_RAW`）。
-- 需要 fd 透传的命令（如 `RENDER_FRAME_GET_FD`）应由支持 `SCM_RIGHTS` 的客户端调用。
+- `dsapi.sh daemon cmd` 通过 `dsapictl` 走控制面二进制协议，不再支持旧文本控制协议。
+- `frame pull` 已切换为 `RENDER_FRAME_BIND_SHM + RENDER_FRAME_WAIT_SHM_PRESENT` 的零拷贝路径。

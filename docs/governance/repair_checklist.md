@@ -1,6 +1,6 @@
-# DirectScreenAPI 修复清单（2026-03-01）
+# DirectScreenAPI 高性能改造清单（2026-03-01）
 
-> 本清单是本轮修复的唯一事实源。每项必须含“动作 + 验收”。
+> 本清单为本轮改造唯一事实源，按“无回退、删旧路径”执行。
 
 ## 状态说明
 
@@ -8,75 +8,91 @@
 - `[-]` 处理中
 - `[x]` 已完成
 
-## P0：核心稳定性
+## 任务 1：共享内存与零拷贝机制改造（已硬切换）
 
-- [x] `daemon` 连接计数泄漏修复  
-  动作：`dispatch_accepted_client` 在 `set_*_timeout` 失败路径回收连接配额。  
-  验收：异常路径不会导致 `active_connections` 长期偏高或误报 `ERR BUSY`。
+- [x] 数据面仅保留 SHM 取帧协议
+  动作：`dsapid/data_dispatch.rs` 仅接受 `RENDER_FRAME_BIND_SHM` 与 `RENDER_FRAME_WAIT_SHM_PRESENT`。
+  验收：旧 `RENDER_FRAME_GET_FD / BIND_FD / GET_BOUND / WAIT_BOUND_PRESENT / GET_RAW` 分发路径已删除。
 
-- [x] `RENDER_FRAME_BIND_FD` 内存占用收敛  
-  动作：绑定 fd 改为小容量起步 + 按需扩容，禁止每连接预分配 64MiB。  
-  验收：空闲连接不产生大块共享内存占用；大帧仍可按需工作。
+- [x] Rust 共享内存生命周期模型落地
+  动作：`frame_fd.rs` 重构为 `SharedFrameMeta + MappedSharedRegion + BoundFrameFd`。
+  验收：`memfd_create + mmap(MAP_SHARED)` 持续映射，`Drop` 自动 `munmap/close`。
 
-- [x] `WAIT_BOUND_PRESENT` 原子语义修复  
-  动作：在 runtime 提供“快照+present”原子接口，数据面只走单次调用。  
-  验收：返回帧信息与 present 元数据始终同帧一致。
+- [x] 数据通道 socket 仅传输 fd + 元数据
+  动作：绑定时通过 `SCM_RIGHTS` 发 memfd；等待时返回 `seq/w/h/byte_len/checksum/offset`。
+  验收：像素不再经 socket body 传输。
 
-## P1：Android 稳定性
+- [x] 配套脚本切换至 SHM 路径
+  动作：`scripts/dsapi_frame.sh` 改为 `BIND_SHM + WAIT_SHM_PRESENT` 并通过 `recvmsg` 收 fd。
+  验收：`frame pull` 不再依赖 `RENDER_FRAME_GET_RAW`。
 
-- [x] 显示监听初始化失败回滚  
-  动作：`initDisplayListener` 部分失败时执行 unregister/quit 回收。  
-  验收：初始化失败不遗留 listener 线程或注册状态。
+## 任务 2：协议二进制化/零分配解析（已硬切换）
 
-- [x] `SurfaceLayerSession.create` 失败回滚  
-  动作：创建流程增加事务/对象回滚，异常时 remove/release。  
-  验收：创建失败后无遗留 SurfaceControl/Surface 资源。
+- [x] 控制面协议全量二进制化
+  动作：`engine/protocol.rs` 保留二进制协议实现，删除 `execute_command` 文本命令执行路径。
+  验收：控制面仅接受 `DSAP` 二进制帧，响应为固定 `status + [u64;8]`。
 
-- [x] `RgbaFramePresenter` 关闭并发安全  
-  动作：`shutdown` 增加幂等保护，避免 hook 与主循环并发重复释放。  
-  验收：重复触发 `shutdown` 不抛错、不双重释放。
+- [x] 控制面命令集明确收敛
+  动作：实现并暴露 `PING / VERSION / SHUTDOWN / DISPLAY_GET / DISPLAY_SET / TOUCH_CLEAR / TOUCH_COUNT / TOUCH_MOVE / RENDER_SUBMIT / RENDER_GET`。
+  验收：`dsapictl` 与 `dsapistream` 全部通过二进制 opcode 通信。
 
-- [x] 反射方法选择与代理返回值稳健化  
-  动作：显示探测方法按参数类型筛选；`DisplayListener` 代理处理
-  `equals/hashCode/toString`。  
-  验收：跨版本重载下仍能稳定命中，代理不会返回类型不匹配值。
+- [x] 移除旧文本解析热路径分配
+  动作：删除文本命令解析；`ctl_wire::parse_command_line` 改为迭代器切片解析，无 token `Vec` 分配。
+  验收：控制命令解析不再走 `split_whitespace().collect()`。
 
-- [x] 帧头一致性校验补齐  
-  动作：`DaemonSession.frameWaitBoundPresent` 校验
-  `byteLen == width * height * 4`。  
-  验收：异常头在绘制前被拒绝并重连。
+- [x] 控制面读取缓冲区复用
+  动作：`control_dispatch.rs` 改为单次分配 frame buffer，循环复用读取 header/payload。
+  验收：每条命令不再重复分配拼接 frame 缓冲。
 
-## P2：工程化与文档一致性
+## 任务 3：异步 I/O（epoll 事件驱动）迁移
 
-- [x] 构建目标目录语义统一  
-  动作：`build_core.sh` 与脚本入口统一 `target` 目录变量。  
-  验收：设置 `DSAPI_TARGET_DIR` 或 `CARGO_TARGET_DIR` 后构建与执行路径一致。
+- [x] `mio` 主循环保留并稳定运行
+  动作：`dsapid.rs` 使用 `Poll + SourceFd + Token` 监听 control/data listener。
+  验收：主线程事件驱动，多路复用正常。
 
-- [x] CI 可复现性增强  
-  动作：CI 固定镜像版本与 Rust 版本；`cargo` 命令加 `--locked`。  
-  验收：同提交在不同时间重复构建结果一致。
+- [x] 固定线程池分发保留
+  动作：`DispatchPool` 处理连接任务，拒绝超载连接并返回 `ERR BUSY`。
+  验收：不再 thread-per-connection。
 
-- [x] 发布流程补版本/ABI 联动校验  
-  动作：发布文档增加 `Cargo.toml`、`DSAPI_ABI_VERSION`、C 头宏的一致性核查。  
-  验收：发布步骤可防止 tag/二进制/ABI 文档漂移。
+## 任务 4：Android 硬件渲染桥接设计
 
-- [x] 文档与默认值纠偏  
-  动作：修正文档中 `DSAPI_PRESENTER_POLL_MS`、touch 故障码等偏差。  
-  验收：文档示例与实际脚本输出一致。
+- [x] AHardwareBuffer JNI/C 桥接结构与导出实现
+  动作：`android/adapter/native/dsapi_hwbuffer_bridge.h/.c` 导出 `fd + desc`。
+  验收：Java `HardwareBuffer` 可转 native handle fd。
 
-## 进度日志
+- [x] C ABI 与 Rust FFI 接入 AHB 描述符
+  动作：`directscreen_api.h` + `ffi/mod.rs` 增加 `dsapi_hwbuffer_desc_t` 与提交接口。
+  验收：Rust 核心可接收平台硬件缓冲区描述。
 
-- 2026-03-01：建立本轮清单，重置状态为待处理。
-- 2026-03-01：修复 `dispatch_accepted_client` 连接配额泄漏，异常路径回收计数。
-- 2026-03-01：`RENDER_FRAME_BIND_FD` 改为按当前帧大小与最小容量（512KiB）绑定，移除 64MiB 固定预分配。
-- 2026-03-01：新增 `wait_for_frame_after_and_present` 原子接口，`WAIT_BOUND_PRESENT` 改为单次一致性路径。
-- 2026-03-01：`RgbaFramePresenter` 显示监听初始化增加失败回滚（unregister/quit）。
-- 2026-03-01：`RgbaFramePresenter.shutdown` 增加幂等保护，避免并发重复释放。
-- 2026-03-01：`DisplayListener` 代理补齐 `equals/hashCode/toString` 返回语义。
-- 2026-03-01：`AndroidDisplayAdapter` 显示探测按参数类型选择重载，减少跨版本反射不确定性。
-- 2026-03-01：`SurfaceLayerSession.create` 增加失败回滚，避免 SurfaceControl/Surface 资源遗留。
-- 2026-03-01：`DaemonSession.frameWaitBoundPresent` 新增 `byteLen == width*height*4` 校验。
-- 2026-03-01：统一 `build_core.sh`/`build_c_example.sh` 的 target 目录语义并兼容 `DSAPI_TARGET_DIR`。
-- 2026-03-01：CI 固定 `ubuntu-24.04` 与 Rust `1.93.1`，并去除 C example job 的重复构建步骤。
-- 2026-03-01：`check/fix` 增加 `--locked`；发布文档补齐版本/ABI 联动核查；修正文档默认值与故障码。
-- 2026-03-01：回归通过：`./scripts/check.sh`、`cargo test --workspace`、`./scripts/build_android_adapter.sh`。
+- [x] Android presenter 数据面无回退
+  动作：`DaemonSession.java` 仅使用 `RENDER_FRAME_BIND_SHM + RENDER_FRAME_WAIT_SHM_PRESENT`。
+  验收：已删除旧 `BIND_FD/WAIT_BOUND_PRESENT` 回退逻辑。
+
+## 验证结果
+
+- [x] `cargo fmt --all`
+- [x] `cargo check --workspace`
+- [x] `cargo test --workspace`（42 passed）
+- [x] `./scripts/build_android_adapter.sh`
+
+## 关键变更文件
+
+- `core/rust/src/engine/protocol.rs`
+- `core/rust/src/engine/mod.rs`
+- `core/rust/src/util/ctl_wire.rs`
+- `core/rust/src/bin/dsapid/control_dispatch.rs`
+- `core/rust/src/bin/dsapid/data_dispatch.rs`
+- `core/rust/src/bin/dsapid/frame_fd.rs`
+- `core/rust/src/bin/dsapid/parse.rs`
+- `core/rust/src/bin/dsapid/config.rs`
+- `core/rust/src/bin/dsapid.rs`
+- `core/rust/src/bin/dsapictl.rs`
+- `core/rust/src/bin/dsapistream.rs`
+- `android/adapter/src/main/java/org/directscreenapi/adapter/DaemonSession.java`
+- `android/adapter/native/dsapi_hwbuffer_bridge.h`
+- `android/adapter/native/dsapi_hwbuffer_bridge.c`
+- `bridge/c/include/directscreen_api.h`
+- `core/rust/src/ffi/mod.rs`
+- `scripts/dsapi_frame.sh`
+- `docs/architecture/daemon_model.md`
+- `docs/guides/android_adapter.md`

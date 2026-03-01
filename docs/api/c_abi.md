@@ -41,11 +41,22 @@
 - `dsapi_render_submit_stats`
 - `dsapi_render_get_stats`
 - `dsapi_render_submit_frame_rgba`
+- `dsapi_render_submit_frame_ahb_fd`
 - `dsapi_render_get_frame_info`
 - `dsapi_render_clear_frame`
 - `dsapi_render_frame_read_chunk`
 - `dsapi_render_present`
 - `dsapi_render_get_present`
+
+### Android 硬件缓冲区桥接（新增）
+
+- `dsapi_hwbuffer_desc_t`：描述 `AHardwareBuffer` 的核心元数据（宽高、stride、format、usage、偏移、长度）。
+- `dsapi_render_submit_frame_ahb_fd`：通过 dma-buf fd + 元数据提交帧。
+
+说明：
+
+- 当前接口优先保障 ABI 与调用路径稳定，零拷贝策略由守护进程共享内存链路与后续平台后端逐步启用。
+- 建议 JNI 层传入 `AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM`（值 `1`）并保证 `byte_len` 覆盖有效像素区。
 
 ## 状态码
 

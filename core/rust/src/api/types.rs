@@ -18,6 +18,17 @@ impl Status {
             Self::InternalError => "INTERNAL_ERROR",
         }
     }
+
+    pub const fn from_i32(v: i32) -> Option<Self> {
+        match v {
+            0 => Some(Self::Ok),
+            1 => Some(Self::NullPointer),
+            2 => Some(Self::InvalidArgument),
+            3 => Some(Self::OutOfRange),
+            4 => Some(Self::InternalError),
+            _ => None,
+        }
+    }
 }
 
 pub const TOUCH_MAX_POINTERS: usize = 16;

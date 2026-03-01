@@ -2,12 +2,10 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::core::{parse_ok_tokens, SocketConnection};
 use super::error::{DsapiError, Result};
 
 #[derive(Debug)]
 pub struct RenderSession {
-    connection: SocketConnection,
     display_width: u32,
     display_height: u32,
     logical_width: u32,
@@ -24,7 +22,7 @@ pub struct RenderSession {
 
 impl RenderSession {
     pub(crate) fn connect(
-        socket_path: PathBuf,
+        _socket_path: PathBuf,
         width: u32,
         height: u32,
         rotation: u32,
@@ -35,10 +33,8 @@ impl RenderSession {
                 "render_session_invalid_display_size".to_string(),
             ));
         }
-        let connection = SocketConnection::connect(socket_path.as_path())?;
         let (logical_width, logical_height) = logical_size(width, height, rotation);
         Ok(Self {
-            connection,
             display_width: width,
             display_height: height,
             logical_width,
@@ -182,60 +178,10 @@ impl RenderSession {
     }
 
     fn submit_display_frame(&mut self, rgba_buffer: &[u8], width: u32, height: u32) -> Result<()> {
-        let command = format!(
-            "RENDER_FRAME_SUBMIT_RGBA_RAW {} {} {}",
-            width,
-            height,
-            rgba_buffer.len()
-        );
-        let ready = self.connection.send_line(&command)?;
-        if ready != "OK READY" {
-            return Err(DsapiError::ProtocolError(format!(
-                "RENDER_FRAME_SUBMIT_RGBA_RAW_bad_ready:{}",
-                ready
-            )));
-        }
-
-        self.connection.write_all(rgba_buffer)?;
-        self.connection.flush()?;
-
-        let response = self.connection.read_line()?;
-        let tokens = parse_ok_tokens(&response)?;
-        if tokens.len() != 6 {
-            return Err(DsapiError::ProtocolError(format!(
-                "RENDER_FRAME_SUBMIT_RGBA_RAW_bad_token_count:{} line={}",
-                tokens.len(),
-                response
-            )));
-        }
-        if tokens[3] != "RGBA8888" {
-            return Err(DsapiError::ProtocolError(format!(
-                "RENDER_FRAME_SUBMIT_RGBA_RAW_bad_pixel_format:{}",
-                response
-            )));
-        }
-
-        let frame_seq = parse_u64(tokens[0], "frame_seq")?;
-        let width = parse_u32(tokens[1], "width")?;
-        let height = parse_u32(tokens[2], "height")?;
-        let byte_len = parse_u32(tokens[4], "byte_len")?;
-        let _checksum = parse_u32(tokens[5], "checksum_fnv1a32")?;
-
-        if width != self.display_width || height != self.display_height {
-            return Err(DsapiError::ProtocolError(format!(
-                "submit_frame_response_size_mismatch line={}",
-                response
-            )));
-        }
-        if byte_len as usize != rgba_buffer.len() {
-            return Err(DsapiError::ProtocolError(format!(
-                "submit_frame_response_len_mismatch line={}",
-                response
-            )));
-        }
-
-        self.last_frame_seq = frame_seq;
-        Ok(())
+        let _ = (rgba_buffer, width, height);
+        Err(DsapiError::ProtocolError(
+            "render_session_submit_removed_use_platform_frame_producer".to_string(),
+        ))
     }
 
     fn pace_before_submit(&mut self) {
@@ -346,18 +292,6 @@ fn expected_rgba_len(width: u32, height: u32) -> Result<usize> {
         .checked_mul(height as usize)
         .and_then(|v| v.checked_mul(4))
         .ok_or_else(|| DsapiError::ParseError("frame_size_overflow".to_string()))
-}
-
-fn parse_u32(token: &str, field: &str) -> Result<u32> {
-    token
-        .parse::<u32>()
-        .map_err(|_| DsapiError::ParseError(format!("invalid_{}:{}", field, token)))
-}
-
-fn parse_u64(token: &str, field: &str) -> Result<u64> {
-    token
-        .parse::<u64>()
-        .map_err(|_| DsapiError::ParseError(format!("invalid_{}:{}", field, token)))
 }
 
 #[cfg(test)]

@@ -16,35 +16,21 @@
 
 ```sh
 ./scripts/dsapi.sh daemon cmd PING
+./scripts/dsapi.sh daemon cmd VERSION
 ./scripts/dsapi.sh daemon cmd DISPLAY_GET
-./scripts/dsapi.sh daemon cmd ROUTE_ADD_RECT 9 block 100 100 280 280
-./scripts/dsapi.sh daemon cmd ROUTE_POINT 120 120
-./scripts/dsapi.sh daemon cmd TOUCH_DOWN 1 120 120
 ./scripts/dsapi.sh daemon cmd TOUCH_MOVE 1 300 300
-./scripts/dsapi.sh daemon cmd TOUCH_UP 1 300 300
 ./scripts/dsapi.sh daemon cmd TOUCH_COUNT
+./scripts/dsapi.sh daemon cmd TOUCH_CLEAR
 ./scripts/dsapi.sh daemon cmd RENDER_SUBMIT 12 2 3
 ./scripts/dsapi.sh daemon cmd RENDER_GET
-./scripts/dsapi.sh daemon cmd RENDER_FRAME_GET
-./scripts/dsapi.sh daemon cmd RENDER_FRAME_WAIT 0 16
-./scripts/dsapi.sh daemon cmd RENDER_PRESENT
-./scripts/dsapi.sh daemon cmd RENDER_PRESENT_GET
-./scripts/dsapi.sh daemon cmd RENDER_DUMP_PPM
 ./scripts/dsapi.sh frame pull artifacts/frame/latest.rgba
-./scripts/dsapi.sh daemon cmd RENDER_FRAME_CLEAR
 ```
 
-`dsapi.sh daemon cmd` / `dsapictl` 连接的是 **control socket**（默认 `artifacts/run/dsapi.sock`）。
+`dsapi.sh daemon cmd` / `dsapictl` 连接的是 **control socket**（默认 `artifacts/run/dsapi.sock`），
+并自动使用二进制控制协议（`DSAP` header）。
 
-`RENDER_FRAME_SUBMIT_RGBA_RAW` 需要先读写握手再发送二进制 body，不适合
-`dsapi.sh daemon cmd` 这种逐行文本工具；请使用长连接客户端（如 FrostUI runtime）。
-
-`RENDER_FRAME_GET_RAW` 会返回二进制 RGBA body，同样不适合 `dsapi.sh daemon cmd`。
-
-`RENDER_FRAME_GET_FD` 依赖 Unix Socket ancillary fd（`SCM_RIGHTS`），
-`dsapi.sh daemon cmd` / `dsapictl` 不支持该能力，需由支持 fd 透传的客户端调用（如 Android presenter）。
-
-二进制命令与触控流走 **data socket**（默认 `artifacts/run/dsapi.data.sock`）。
+像素帧拉取走 **data socket**（默认 `artifacts/run/dsapi.data.sock`）的
+`RENDER_FRAME_BIND_SHM + RENDER_FRAME_WAIT_SHM_PRESENT` 零拷贝路径。
 
 同步 Android 实际显示参数：
 

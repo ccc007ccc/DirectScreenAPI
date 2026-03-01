@@ -68,6 +68,18 @@ pub struct DsapiRenderFrameChunk {
     pub chunk_len: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DsapiHwBufferDesc {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: u32,
+    pub usage: u64,
+    pub byte_offset: u32,
+    pub byte_len: u32,
+}
+
 const VERSION_CSTR: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
 impl From<DsapiDisplayState> for DisplayState {
@@ -561,6 +573,99 @@ pub unsafe extern "C" fn dsapi_render_submit_frame_rgba(
                 let info: DsapiRenderFrameInfo = info.into();
                 unsafe {
                     ptr::write(out_info, info);
+                }
+                Status::Ok
+            }
+            Err(e) => e,
+        }
+    }) as i32
+}
+
+#[no_mangle]
+/// # Safety
+///
+/// `ctx` must be a valid context pointer from `dsapi_context_create`.
+/// `desc` and `out_info` must be valid pointers.
+/// `fd` must be a readable dma-buf/file descriptor that maps at least `desc->byte_len` bytes.
+pub unsafe extern "C" fn dsapi_render_submit_frame_ahb_fd(
+    ctx: *mut DsapiContext,
+    fd: i32,
+    desc: *const DsapiHwBufferDesc,
+    out_info: *mut DsapiRenderFrameInfo,
+) -> i32 {
+    if desc.is_null() || out_info.is_null() {
+        return Status::NullPointer as i32;
+    }
+    if fd < 0 {
+        return Status::InvalidArgument as i32;
+    }
+
+    let desc = unsafe { *desc };
+    if desc.width == 0 || desc.height == 0 || desc.stride == 0 {
+        return Status::InvalidArgument as i32;
+    }
+    // AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
+    if desc.format != 1 {
+        return Status::InvalidArgument as i32;
+    }
+
+    let map_len = match usize::try_from(desc.byte_len) {
+        Ok(v) => v,
+        Err(_) => return Status::OutOfRange as i32,
+    };
+    if map_len == 0 || map_len > RENDER_MAX_FRAME_BYTES {
+        return Status::OutOfRange as i32;
+    }
+
+    let offset = match usize::try_from(desc.byte_offset) {
+        Ok(v) => v,
+        Err(_) => return Status::OutOfRange as i32,
+    };
+    if offset >= map_len {
+        return Status::InvalidArgument as i32;
+    }
+
+    let expected_len = match (desc.width as usize)
+        .checked_mul(desc.height as usize)
+        .and_then(|v| v.checked_mul(4usize))
+    {
+        Some(v) => v,
+        None => return Status::OutOfRange as i32,
+    };
+    let end = match offset.checked_add(expected_len) {
+        Some(v) => v,
+        None => return Status::OutOfRange as i32,
+    };
+    if end > map_len {
+        return Status::InvalidArgument as i32;
+    }
+
+    let mapped = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            map_len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        return Status::InternalError as i32;
+    }
+
+    let bytes = unsafe {
+        let base = mapped as *const u8;
+        let frame_ptr = base.add(offset);
+        std::slice::from_raw_parts(frame_ptr, expected_len).to_vec()
+    };
+    let _ = unsafe { libc::munmap(mapped, map_len) };
+
+    with_engine_mut(ctx, |engine| {
+        match engine.submit_render_frame_rgba(desc.width, desc.height, bytes) {
+            Ok(info) => {
+                unsafe {
+                    ptr::write(out_info, info.into());
                 }
                 Status::Ok
             }
