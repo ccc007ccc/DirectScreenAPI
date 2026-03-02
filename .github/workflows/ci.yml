@@ -7,6 +7,9 @@ on:
 jobs:
   rust-check:
     runs-on: ubuntu-24.04
+    env:
+      CARGO_NET_RETRY: "5"
+      CARGO_HTTP_TIMEOUT: "120"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -17,11 +20,27 @@ jobs:
           components: rustfmt, clippy
 
       - name: DSAPI check
-        run: ./scripts/dsapi.sh check
+        run: |
+          attempt=1
+          max_attempts=2
+          while [ "$attempt" -le "$max_attempts" ]; do
+            if ./scripts/dsapi.sh check; then
+              exit 0
+            fi
+            if [ "$attempt" -eq "$max_attempts" ]; then
+              exit 1
+            fi
+            echo "ci_warn=dsapi_check_retry attempt=$attempt"
+            attempt=$((attempt + 1))
+            sleep 3
+          done
 
   c-example-build:
     runs-on: ubuntu-24.04
     needs: rust-check
+    env:
+      CARGO_NET_RETRY: "5"
+      CARGO_HTTP_TIMEOUT: "120"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
