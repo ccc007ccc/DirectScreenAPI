@@ -3,6 +3,7 @@ use crate::api::{
     RouteResult, Status, TouchEvent, RENDER_MAX_CHUNK_BYTES, RENDER_MAX_FRAME_BYTES,
     TOUCH_MAX_POINTERS,
 };
+use crate::backend::filter::{apply_filter_pipeline_rgba, FilterPipeline};
 use std::collections::HashMap;
 use std::fs::{create_dir_all, File};
 use std::io::Write;
@@ -93,6 +94,7 @@ pub struct RuntimeEngine {
     display_signal_cv: Condvar,
     frame_signal_seq: Mutex<u64>,
     frame_signal_cv: Condvar,
+    filter_pipeline: RwLock<FilterPipeline>,
     render_output_dir: PathBuf,
 }
 
@@ -113,6 +115,7 @@ impl RuntimeEngine {
             display_signal_cv: Condvar::new(),
             frame_signal_seq: Mutex::new(0),
             frame_signal_cv: Condvar::new(),
+            filter_pipeline: RwLock::new(FilterPipeline::default()),
             render_output_dir: render_output_dir.into(),
         }
     }
@@ -298,11 +301,24 @@ impl RuntimeEngine {
         }
     }
 
+    pub fn set_filter_pipeline(&self, pipeline: FilterPipeline) -> Result<(), Status> {
+        let mut guard = self
+            .filter_pipeline
+            .write()
+            .map_err(|_| Status::InternalError)?;
+        *guard = pipeline;
+        Ok(())
+    }
+
+    pub fn clear_filter_pipeline(&self) -> Result<(), Status> {
+        self.set_filter_pipeline(FilterPipeline::default())
+    }
+
     pub fn submit_render_frame_rgba(
         &self,
         width: u32,
         height: u32,
-        pixels_rgba8: Vec<u8>,
+        mut pixels_rgba8: Vec<u8>,
     ) -> Result<RenderFrameInfo, Status> {
         if width == 0 || height == 0 {
             return Err(Status::InvalidArgument);
@@ -318,6 +334,8 @@ impl RuntimeEngine {
         if pixels_rgba8.len() != expected_len {
             return Err(Status::InvalidArgument);
         }
+
+        self.apply_filter_pipeline(width, height, &mut pixels_rgba8)?;
 
         let checksum = fnv1a32(&pixels_rgba8);
         let pixels_rgba8: Arc<[u8]> = pixels_rgba8.into();
@@ -506,6 +524,23 @@ impl RuntimeEngine {
         )
         .map_err(|_| Status::InternalError)?;
         Ok(path.display().to_string())
+    }
+
+    fn apply_filter_pipeline(
+        &self,
+        width: u32,
+        height: u32,
+        pixels_rgba8: &mut [u8],
+    ) -> Result<(), Status> {
+        let pipeline = self
+            .filter_pipeline
+            .read()
+            .map_err(|_| Status::InternalError)?;
+        if pipeline.passes.is_empty() {
+            return Ok(());
+        }
+        let _report = apply_filter_pipeline_rgba(&pipeline, width, height, pixels_rgba8)?;
+        Ok(())
     }
 
     fn notify_new_frame(&self, frame_seq: u64) {
@@ -735,6 +770,40 @@ mod tests {
         engine.clear_render_frame();
         assert_eq!(engine.render_frame_info(), None);
         assert_eq!(engine.render_frame_byte_len(), None);
+    }
+
+    #[test]
+    fn render_frame_submit_applies_gaussian_blur_pipeline() {
+        use crate::backend::filter::{FilterPass, GaussianBlurPass};
+
+        let engine = RuntimeEngine::default();
+        engine
+            .set_filter_pipeline(FilterPipeline {
+                passes: vec![FilterPass::GaussianBlur(GaussianBlurPass {
+                    radius: 1,
+                    sigma: 1.0,
+                })],
+            })
+            .expect("set filter pipeline");
+
+        let mut pixels = vec![0u8; 5 * 5 * 4];
+        let center = ((2usize * 5usize) + 2usize) * 4usize;
+        pixels[center] = 255;
+        pixels[center + 1] = 255;
+        pixels[center + 2] = 255;
+        pixels[center + 3] = 255;
+
+        engine
+            .submit_render_frame_rgba(5, 5, pixels)
+            .expect("submit filtered frame");
+        let (_, output) = engine
+            .render_frame_snapshot()
+            .expect("render frame snapshot should exist");
+
+        let center_after = output[center];
+        let left = ((2usize * 5usize) + 1usize) * 4usize;
+        assert!(center_after < 255);
+        assert!(output[left] > 0);
     }
 
     #[test]
