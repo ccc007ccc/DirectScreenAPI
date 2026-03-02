@@ -35,7 +35,18 @@ pub enum BinaryCtlCommand {
         text_calls: u32,
     },
     RenderGet,
+    FilterChainSet {
+        passes: Vec<BinaryCtlGaussianPass>,
+    },
+    FilterClear,
+    FilterGet,
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BinaryCtlGaussianPass {
+    pub radius: u32,
+    pub sigma: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +79,47 @@ fn parse_f32(token: &str) -> Result<f32, String> {
     token
         .parse::<f32>()
         .map_err(|_| format!("invalid_f32:{}", token))
+}
+
+fn parse_filter_chain_passes(
+    tokens: &[&str],
+    err: &str,
+) -> Result<Vec<BinaryCtlGaussianPass>, String> {
+    if tokens.len() < 2 {
+        return Err(err.to_string());
+    }
+    let count = parse_u32(tokens[1])? as usize;
+    let expected = 2usize
+        .checked_add(count.saturating_mul(2usize))
+        .ok_or_else(|| err.to_string())?;
+    if tokens.len() != expected {
+        return Err(err.to_string());
+    }
+
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let radius = parse_u32(tokens[2 + i * 2])?;
+        let sigma = parse_f32(tokens[3 + i * 2])?;
+        out.push(BinaryCtlGaussianPass { radius, sigma });
+    }
+    Ok(out)
+}
+
+fn format_filter_info(values: &[u64; BINARY_RESPONSE_VALUE_COUNT]) -> String {
+    let backend = match values[0] {
+        1 => "vulkan",
+        _ => "cpu",
+    };
+    let gpu_active = values[1];
+    let pass_count = values[2];
+    let first_radius = values[3];
+    let first_sigma = f32::from_bits(values[4] as u32);
+    let second_radius = values[5];
+    let second_sigma = f32::from_bits(values[6] as u32);
+    format!(
+        "backend={} gpu_active={} pass_count={} first_gaussian={}:{:.3} second_gaussian={}:{:.3}",
+        backend, gpu_active, pass_count, first_radius, first_sigma, second_radius, second_sigma
+    )
 }
 
 pub fn parse_command_tokens(tokens: &[&str]) -> Result<BinaryCtlCommand, String> {
@@ -153,6 +205,34 @@ pub fn parse_command_tokens(tokens: &[&str]) -> Result<BinaryCtlCommand, String>
         }
         return Ok(BinaryCtlCommand::RenderGet);
     }
+    if cmd.eq_ignore_ascii_case("FILTER_SET_GAUSSIAN") {
+        if tokens.len() != 3 {
+            return Err("filter_set_gaussian_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::FilterChainSet {
+            passes: vec![BinaryCtlGaussianPass {
+                radius: parse_u32(tokens[1])?,
+                sigma: parse_f32(tokens[2])?,
+            }],
+        });
+    }
+    if cmd.eq_ignore_ascii_case("FILTER_CHAIN_SET") {
+        return Ok(BinaryCtlCommand::FilterChainSet {
+            passes: parse_filter_chain_passes(tokens, "filter_chain_set_args_invalid")?,
+        });
+    }
+    if cmd.eq_ignore_ascii_case("FILTER_CLEAR") || cmd.eq_ignore_ascii_case("FILTER_CHAIN_CLEAR") {
+        if tokens.len() != 1 {
+            return Err("filter_clear_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::FilterClear);
+    }
+    if cmd.eq_ignore_ascii_case("FILTER_GET") {
+        if tokens.len() != 1 {
+            return Err("filter_get_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::FilterGet);
+    }
     if cmd.eq_ignore_ascii_case("SHUTDOWN") {
         if tokens.len() != 1 {
             return Err("shutdown_args_invalid".to_string());
@@ -164,144 +244,8 @@ pub fn parse_command_tokens(tokens: &[&str]) -> Result<BinaryCtlCommand, String>
 }
 
 pub fn parse_command_line(line: &str) -> Result<BinaryCtlCommand, String> {
-    let mut tokens = line.split_ascii_whitespace();
-    let Some(cmd) = tokens.next() else {
-        return Err("empty_command".to_string());
-    };
-
-    if cmd.eq_ignore_ascii_case("PING") {
-        if tokens.next().is_some() {
-            return Err("ping_args_invalid".to_string());
-        }
-        return Ok(BinaryCtlCommand::Ping);
-    }
-    if cmd.eq_ignore_ascii_case("VERSION") {
-        if tokens.next().is_some() {
-            return Err("version_args_invalid".to_string());
-        }
-        return Ok(BinaryCtlCommand::Version);
-    }
-    if cmd.eq_ignore_ascii_case("DISPLAY_GET") {
-        if tokens.next().is_some() {
-            return Err("display_get_args_invalid".to_string());
-        }
-        return Ok(BinaryCtlCommand::DisplayGet);
-    }
-    if cmd.eq_ignore_ascii_case("DISPLAY_WAIT") {
-        let last_seq = tokens
-            .next()
-            .ok_or_else(|| "display_wait_args_invalid".to_string())
-            .and_then(parse_u64)?;
-        let timeout_ms = tokens
-            .next()
-            .ok_or_else(|| "display_wait_args_invalid".to_string())
-            .and_then(parse_u32)?;
-        if tokens.next().is_some() {
-            return Err("display_wait_args_invalid".to_string());
-        }
-        return Ok(BinaryCtlCommand::DisplayWait {
-            last_seq,
-            timeout_ms,
-        });
-    }
-    if cmd.eq_ignore_ascii_case("DISPLAY_SET") {
-        let width = tokens
-            .next()
-            .ok_or_else(|| "display_set_args_invalid".to_string())
-            .and_then(parse_u32)?;
-        let height = tokens
-            .next()
-            .ok_or_else(|| "display_set_args_invalid".to_string())
-            .and_then(parse_u32)?;
-        let refresh_hz = tokens
-            .next()
-            .ok_or_else(|| "display_set_args_invalid".to_string())
-            .and_then(parse_f32)?;
-        let density_dpi = tokens
-            .next()
-            .ok_or_else(|| "display_set_args_invalid".to_string())
-            .and_then(parse_u32)?;
-        let rotation = tokens
-            .next()
-            .ok_or_else(|| "display_set_args_invalid".to_string())
-            .and_then(parse_u32)?;
-        if tokens.next().is_some() {
-            return Err("display_set_args_invalid".to_string());
-        }
-        return Ok(BinaryCtlCommand::DisplaySet {
-            width,
-            height,
-            refresh_hz,
-            density_dpi,
-            rotation,
-        });
-    }
-    if cmd.eq_ignore_ascii_case("TOUCH_CLEAR") {
-        if tokens.next().is_some() {
-            return Err("touch_clear_args_invalid".to_string());
-        }
-        return Ok(BinaryCtlCommand::TouchClear);
-    }
-    if cmd.eq_ignore_ascii_case("TOUCH_COUNT") {
-        if tokens.next().is_some() {
-            return Err("touch_count_args_invalid".to_string());
-        }
-        return Ok(BinaryCtlCommand::TouchCount);
-    }
-    if cmd.eq_ignore_ascii_case("TOUCH_MOVE") {
-        let pointer_id = tokens
-            .next()
-            .ok_or_else(|| "touch_move_args_invalid".to_string())
-            .and_then(parse_i32)?;
-        let x = tokens
-            .next()
-            .ok_or_else(|| "touch_move_args_invalid".to_string())
-            .and_then(parse_f32)?;
-        let y = tokens
-            .next()
-            .ok_or_else(|| "touch_move_args_invalid".to_string())
-            .and_then(parse_f32)?;
-        if tokens.next().is_some() {
-            return Err("touch_move_args_invalid".to_string());
-        }
-        return Ok(BinaryCtlCommand::TouchMove { pointer_id, x, y });
-    }
-    if cmd.eq_ignore_ascii_case("RENDER_SUBMIT") {
-        let draw_calls = tokens
-            .next()
-            .ok_or_else(|| "render_submit_args_invalid".to_string())
-            .and_then(parse_u32)?;
-        let frost_passes = tokens
-            .next()
-            .ok_or_else(|| "render_submit_args_invalid".to_string())
-            .and_then(parse_u32)?;
-        let text_calls = tokens
-            .next()
-            .ok_or_else(|| "render_submit_args_invalid".to_string())
-            .and_then(parse_u32)?;
-        if tokens.next().is_some() {
-            return Err("render_submit_args_invalid".to_string());
-        }
-        return Ok(BinaryCtlCommand::RenderSubmit {
-            draw_calls,
-            frost_passes,
-            text_calls,
-        });
-    }
-    if cmd.eq_ignore_ascii_case("RENDER_GET") {
-        if tokens.next().is_some() {
-            return Err("render_get_args_invalid".to_string());
-        }
-        return Ok(BinaryCtlCommand::RenderGet);
-    }
-    if cmd.eq_ignore_ascii_case("SHUTDOWN") {
-        if tokens.next().is_some() {
-            return Err("shutdown_args_invalid".to_string());
-        }
-        return Ok(BinaryCtlCommand::Shutdown);
-    }
-
-    Err(format!("unsupported_command:{}", cmd))
+    let tokens: Vec<&str> = line.split_ascii_whitespace().collect();
+    parse_command_tokens(&tokens)
 }
 
 fn opcode_of(cmd: &BinaryCtlCommand) -> BinaryOpcode {
@@ -316,6 +260,9 @@ fn opcode_of(cmd: &BinaryCtlCommand) -> BinaryOpcode {
         BinaryCtlCommand::TouchMove { .. } => BinaryOpcode::TouchMove,
         BinaryCtlCommand::RenderSubmit { .. } => BinaryOpcode::RenderSubmit,
         BinaryCtlCommand::RenderGet => BinaryOpcode::RenderGet,
+        BinaryCtlCommand::FilterChainSet { .. } => BinaryOpcode::FilterChainSet,
+        BinaryCtlCommand::FilterClear => BinaryOpcode::FilterClear,
+        BinaryCtlCommand::FilterGet => BinaryOpcode::FilterGet,
         BinaryCtlCommand::Shutdown => BinaryOpcode::Shutdown,
     }
 }
@@ -328,6 +275,8 @@ fn payload_of(cmd: &BinaryCtlCommand) -> Vec<u8> {
         | BinaryCtlCommand::TouchClear
         | BinaryCtlCommand::TouchCount
         | BinaryCtlCommand::RenderGet
+        | BinaryCtlCommand::FilterClear
+        | BinaryCtlCommand::FilterGet
         | BinaryCtlCommand::Shutdown => Vec::new(),
         BinaryCtlCommand::DisplayWait {
             last_seq,
@@ -369,6 +318,17 @@ fn payload_of(cmd: &BinaryCtlCommand) -> Vec<u8> {
             out.extend_from_slice(&draw_calls.to_le_bytes());
             out.extend_from_slice(&frost_passes.to_le_bytes());
             out.extend_from_slice(&text_calls.to_le_bytes());
+            out
+        }
+
+        BinaryCtlCommand::FilterChainSet { passes } => {
+            let mut out = Vec::with_capacity(4 + passes.len() * 12);
+            out.extend_from_slice(&(passes.len() as u32).to_le_bytes());
+            for pass in passes {
+                out.extend_from_slice(&1u32.to_le_bytes());
+                out.extend_from_slice(&pass.radius.to_le_bytes());
+                out.extend_from_slice(&pass.sigma.to_bits().to_le_bytes());
+            }
             out
         }
     }
@@ -540,6 +500,9 @@ pub fn format_response(cmd: &BinaryCtlCommand, resp: &BinaryCtlResponse) -> Stri
                 resp.values[0], resp.values[1], resp.values[2], resp.values[3]
             )
         }
+        BinaryCtlCommand::FilterChainSet { .. }
+        | BinaryCtlCommand::FilterClear
+        | BinaryCtlCommand::FilterGet => format!("OK {}", format_filter_info(&resp.values)),
         BinaryCtlCommand::Shutdown => "OK SHUTDOWN".to_string(),
     }
 }

@@ -24,6 +24,8 @@ impl GaussianBlurPass {
     }
 }
 
+pub const FILTER_PASS_KIND_GAUSSIAN: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterPass {
     GaussianBlur(GaussianBlurPass),

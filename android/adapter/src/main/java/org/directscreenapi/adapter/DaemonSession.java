@@ -27,6 +27,10 @@ final class DaemonSession {
     private static final int BIN_OP_PING = 1;
     private static final int BIN_OP_DISPLAY_GET = 4;
     private static final int BIN_OP_DISPLAY_SET = 5;
+    private static final int BIN_OP_FILTER_CHAIN_SET = 12;
+    private static final int BIN_OP_FILTER_CLEAR = 13;
+    private static final int BIN_OP_FILTER_GET = 14;
+    private static final int FILTER_PASS_KIND_GAUSSIAN = 1;
 
     private static final String CMD_BIND_SHM = "RENDER_FRAME_BIND_SHM";
     private static final String CMD_WAIT_SHM = "RENDER_FRAME_WAIT_SHM_PRESENT";
@@ -486,6 +490,51 @@ final class DaemonSession {
             writeLe32(payload, 16, rotation);
             return sendBinaryControl(BIN_OP_DISPLAY_SET, payload);
         }
+        if ("FILTER_SET_GAUSSIAN".equals(cmd)) {
+            if (tokens.length != 3) {
+                throw new IOException("filter_set_gaussian_args_invalid");
+            }
+            int radius = parseU32BitsStrict(tokens[1], "filter_set_gaussian_radius_invalid");
+            float sigma = parseFloatStrict(tokens[2], "filter_set_gaussian_sigma_invalid");
+            return sendBinaryControl(
+                    BIN_OP_FILTER_CHAIN_SET,
+                    buildFilterChainPayload(
+                            new int[]{radius},
+                            new float[]{sigma}
+                    )
+            );
+        }
+        if ("FILTER_CHAIN_SET".equals(cmd)) {
+            if (tokens.length < 2) {
+                throw new IOException("filter_chain_set_args_invalid");
+            }
+            int passCount = parsePassCountStrict(tokens[1], "filter_chain_set_args_invalid");
+            long expectedTokens = 2L + ((long) passCount * 2L);
+            if (tokens.length != expectedTokens) {
+                throw new IOException("filter_chain_set_args_invalid");
+            }
+
+            int[] radii = new int[passCount];
+            float[] sigmas = new float[passCount];
+            for (int i = 0; i < passCount; i++) {
+                int tokenIdx = 2 + (i * 2);
+                radii[i] = parseU32BitsStrict(tokens[tokenIdx], "filter_chain_set_radius_invalid");
+                sigmas[i] = parseFloatStrict(tokens[tokenIdx + 1], "filter_chain_set_sigma_invalid");
+            }
+            return sendBinaryControl(BIN_OP_FILTER_CHAIN_SET, buildFilterChainPayload(radii, sigmas));
+        }
+        if ("FILTER_CLEAR".equals(cmd) || "FILTER_CHAIN_CLEAR".equals(cmd)) {
+            if (tokens.length != 1) {
+                throw new IOException("filter_clear_args_invalid");
+            }
+            return sendBinaryControl(BIN_OP_FILTER_CLEAR, new byte[0]);
+        }
+        if ("FILTER_GET".equals(cmd)) {
+            if (tokens.length != 1) {
+                throw new IOException("filter_get_args_invalid");
+            }
+            return sendBinaryControl(BIN_OP_FILTER_GET, new byte[0]);
+        }
         if ("DISPLAY_GET".equals(cmd)) {
             if (tokens.length != 1) {
                 throw new IOException("display_get_args_invalid");
@@ -518,7 +567,57 @@ final class DaemonSession {
         if ("PING".equals(cmd)) {
             return "OK PONG";
         }
+        if ("FILTER_SET_GAUSSIAN".equals(cmd)
+                || "FILTER_CHAIN_SET".equals(cmd)
+                || "FILTER_CLEAR".equals(cmd)
+                || "FILTER_CHAIN_CLEAR".equals(cmd)
+                || "FILTER_GET".equals(cmd)) {
+            return formatFilterInfo(reply.values);
+        }
         throw new IOException("control_reply_unsupported:" + cmd);
+    }
+
+    private static String formatFilterInfo(long[] values) {
+        String backend = values[0] == 1L ? "vulkan" : "cpu";
+        long gpuActive = values[1];
+        long passCount = values[2];
+        long firstRadius = values[3];
+        float firstSigma = Float.intBitsToFloat((int) values[4]);
+        long secondRadius = values[5];
+        float secondSigma = Float.intBitsToFloat((int) values[6]);
+        return String.format(
+                Locale.US,
+                "OK backend=%s gpu_active=%d pass_count=%d first_gaussian=%d:%.3f second_gaussian=%d:%.3f",
+                backend,
+                gpuActive,
+                passCount,
+                firstRadius,
+                firstSigma,
+                secondRadius,
+                secondSigma
+        );
+    }
+
+    private static byte[] buildFilterChainPayload(int[] radii, float[] sigmas) throws IOException {
+        if (radii == null || sigmas == null || radii.length != sigmas.length) {
+            throw new IOException("filter_chain_payload_invalid");
+        }
+        int passCount = radii.length;
+        long payloadLen = 4L + (12L * (long) passCount);
+        if (payloadLen <= 0L || payloadLen > Integer.MAX_VALUE) {
+            throw new IOException("filter_chain_payload_len_invalid");
+        }
+
+        byte[] payload = new byte[(int) payloadLen];
+        writeLe32(payload, 0, passCount);
+        int cursor = 4;
+        for (int i = 0; i < passCount; i++) {
+            writeLe32(payload, cursor, FILTER_PASS_KIND_GAUSSIAN);
+            writeLe32(payload, cursor + 4, radii[i]);
+            writeLe32(payload, cursor + 8, Float.floatToIntBits(sigmas[i]));
+            cursor += 12;
+        }
+        return payload;
     }
 
     private BinaryReply sendBinaryControl(int opcode, byte[] payload) throws Exception {
@@ -711,6 +810,30 @@ final class DaemonSession {
     private static int parseIntStrict(String s, String err) throws IOException {
         try {
             return Integer.parseInt(s);
+        } catch (Throwable t) {
+            throw new IOException(err, t);
+        }
+    }
+
+    private static int parseU32BitsStrict(String s, String err) throws IOException {
+        try {
+            long parsed = Long.parseLong(s);
+            if (parsed < 0L || parsed > 0xffff_ffffL) {
+                throw new NumberFormatException("u32_out_of_range");
+            }
+            return (int) parsed;
+        } catch (Throwable t) {
+            throw new IOException(err, t);
+        }
+    }
+
+    private static int parsePassCountStrict(String s, String err) throws IOException {
+        try {
+            long parsed = Long.parseLong(s);
+            if (parsed < 0L || parsed > Integer.MAX_VALUE) {
+                throw new NumberFormatException("pass_count_out_of_range");
+            }
+            return (int) parsed;
         } catch (Throwable t) {
             throw new IOException(err, t);
         }

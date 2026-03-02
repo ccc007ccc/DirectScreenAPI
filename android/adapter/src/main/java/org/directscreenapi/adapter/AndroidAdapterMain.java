@@ -11,6 +11,14 @@ public final class AndroidAdapterMain {
         }
     }
 
+    private static float parseFloat(String s, float fallback) {
+        try {
+            return Float.parseFloat(s);
+        } catch (Throwable ignored) {
+            return fallback;
+        }
+    }
+
     private static boolean looksLikeInt(String s) {
         if (s == null || s.isEmpty()) return false;
         int start = (s.charAt(0) == '-') ? 1 : 0;
@@ -33,7 +41,7 @@ public final class AndroidAdapterMain {
         System.out.println("usage:");
         System.out.println("  AndroidAdapterMain display-kv");
         System.out.println("  AndroidAdapterMain display-line");
-        System.out.println("  AndroidAdapterMain present-loop [control_socket_path] [data_socket_path] [poll_ms] [z_layer] [layer_name]");
+        System.out.println("  AndroidAdapterMain present-loop [control_socket_path] [data_socket_path] [poll_ms] [z_layer] [layer_name] [blur_radius] [blur_sigma] [filter_chain]");
         System.out.println("  AndroidAdapterMain screen-stream [control_socket_path] [data_socket_path] [target_fps]");
     }
 
@@ -86,13 +94,19 @@ public final class AndroidAdapterMain {
             int pollMs = args.length > baseIdx ? parseInt(args[baseIdx], 2) : 2;
             int zLayer = args.length > (baseIdx + 1) ? parseInt(args[baseIdx + 1], 1_000_000) : 1_000_000;
             String layerName = args.length > (baseIdx + 2) ? args[baseIdx + 2] : "DirectScreenAPI";
+            int blurRadius = args.length > (baseIdx + 3) ? parseInt(args[baseIdx + 3], 0) : 0;
+            float blurSigma = args.length > (baseIdx + 4) ? parseFloat(args[baseIdx + 4], 0.0f) : 0.0f;
+            String filterChain = args.length > (baseIdx + 5) ? args[baseIdx + 5] : "";
             try {
                 RgbaFramePresenter presenter = new RgbaFramePresenter(
                         controlSocketPath,
                         dataSocketPath,
                         pollMs,
                         zLayer,
-                        layerName
+                        layerName,
+                        blurRadius,
+                        blurSigma,
+                        filterChain
                 );
                 presenter.runLoop();
                 return;

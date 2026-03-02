@@ -18,6 +18,10 @@ fn usage() {
     println!("  TOUCH_MOVE <pointer_id> <x> <y>");
     println!("  RENDER_SUBMIT <draw_calls> <frost_passes> <text_calls>");
     println!("  RENDER_GET");
+    println!("  FILTER_SET_GAUSSIAN <radius> <sigma>");
+    println!("  FILTER_CHAIN_SET <count> <radius1> <sigma1> ...");
+    println!("  FILTER_CLEAR");
+    println!("  FILTER_GET");
     println!("  SHUTDOWN");
 }
 

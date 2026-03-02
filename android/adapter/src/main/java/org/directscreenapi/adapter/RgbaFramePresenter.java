@@ -46,6 +46,7 @@ final class RgbaFramePresenter {
     private final int displaySyncFallbackIntervalMs;
     private final int zLayer;
     private final String layerName;
+    private final String startupFilterCommand;
     private final AtomicBoolean shutdownOnce = new AtomicBoolean(false);
 
     private volatile boolean running = true;
@@ -84,13 +85,29 @@ final class RgbaFramePresenter {
     private final Object xferSrc;
     private final Object paint;
 
-    RgbaFramePresenter(String controlSocketPath, String dataSocketPath, int pollMs, int zLayer, String layerName) throws Exception {
+    RgbaFramePresenter(
+            String controlSocketPath,
+            String dataSocketPath,
+            int pollMs,
+            int zLayer,
+            String layerName,
+            int blurRadius,
+            float blurSigma,
+            String filterChainSpec
+    ) throws Exception {
         this.daemon = new DaemonSession(controlSocketPath, dataSocketPath);
         this.displayAdapter = new AndroidDisplayAdapter();
         this.pollMs = Math.max(1, pollMs);
         this.displaySyncFallbackIntervalMs = resolveDisplaySyncFallbackIntervalMs();
         this.zLayer = zLayer;
         this.layerName = layerName;
+        int safeBlurRadius = Math.max(0, blurRadius);
+        String safeFilterChainSpec = filterChainSpec == null ? "" : filterChainSpec.trim();
+        this.startupFilterCommand = resolveStartupFilterCommand(
+                safeBlurRadius,
+                blurSigma,
+                safeFilterChainSpec
+        );
 
         this.bitmapClass = Class.forName("android.graphics.Bitmap");
         this.bitmapConfigClass = Class.forName("android.graphics.Bitmap$Config");
@@ -107,11 +124,13 @@ final class RgbaFramePresenter {
         ReflectBridge.invoke(this.paint, "setXfermode", xferSrc);
 
         initDisplayListener();
+        applyStartupFilter("constructor");
     }
 
     void runLoop() throws Exception {
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "dsapi-presenter-shutdown"));
         try {
+            applyStartupFilter("run_loop_start");
             syncDisplayAndEnsureSurface();
             log("presenter_status=started poll_ms=" + pollMs + " z_layer=" + zLayer + " layer=" + layerName);
 
@@ -216,6 +235,23 @@ final class RgbaFramePresenter {
         }
         daemon.closeQuietly();
         log("presenter_status=stopped");
+    }
+
+    private void applyStartupFilter(String stage) {
+        if (startupFilterCommand == null || startupFilterCommand.isEmpty()) {
+            return;
+        }
+        try {
+            String reply = daemon.command(startupFilterCommand);
+            log("presenter_filter=applied stage=" + stage + " cmd=" + startupFilterCommand + " reply=" + reply);
+        } catch (Throwable t) {
+            log("presenter_warn=filter_apply_failed stage="
+                    + stage
+                    + " cmd="
+                    + startupFilterCommand
+                    + " err="
+                    + describeThrowable(t));
+        }
     }
 
     private void syncDisplayAndEnsureSurface() throws Exception {
@@ -422,6 +458,104 @@ final class RgbaFramePresenter {
             return 5000;
         }
         return value;
+    }
+
+    private static String resolveStartupFilterCommand(int blurRadius, float blurSigma, String filterChainSpec) {
+        String filterChainCmd = buildFilterChainSetCommand(filterChainSpec);
+        if (filterChainCmd != null) {
+            return filterChainCmd;
+        }
+
+        if (blurRadius > 0) {
+            float sigma = blurSigma;
+            if (!Float.isFinite(sigma) || sigma <= 0f) {
+                sigma = Math.max(0.001f, blurRadius / 3.0f);
+            }
+            return "FILTER_SET_GAUSSIAN " + blurRadius + " " + String.format(Locale.US, "%.3f", sigma);
+        }
+        return "FILTER_CLEAR";
+    }
+
+    private static String buildFilterChainSetCommand(String filterChainSpec) {
+        if (filterChainSpec == null) {
+            return null;
+        }
+        String trimmed = filterChainSpec.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+
+        String[] parts = trimmed.split(",");
+        if (parts.length < 1) {
+            log("presenter_warn=filter_chain_invalid reason=empty");
+            return null;
+        }
+
+        int passCount;
+        try {
+            passCount = Integer.parseInt(parts[0].trim());
+        } catch (Throwable t) {
+            log("presenter_warn=filter_chain_invalid reason=pass_count_parse spec=" + trimmed);
+            return null;
+        }
+        if (passCount < 0) {
+            log("presenter_warn=filter_chain_invalid reason=pass_count_negative spec=" + trimmed);
+            return null;
+        }
+
+        long expectedParts = 1L + (2L * (long) passCount);
+        if (parts.length != expectedParts) {
+            log("presenter_warn=filter_chain_invalid reason=parts_mismatch spec=" + trimmed);
+            return null;
+        }
+
+        StringBuilder cmd = new StringBuilder(32 + parts.length * 8);
+        cmd.append("FILTER_CHAIN_SET ").append(passCount);
+
+        for (int i = 0; i < passCount; i++) {
+            String radiusToken = parts[1 + (i * 2)].trim();
+            String sigmaToken = parts[2 + (i * 2)].trim();
+
+            long radius;
+            float sigma;
+            try {
+                radius = Long.parseLong(radiusToken);
+                sigma = Float.parseFloat(sigmaToken);
+            } catch (Throwable t) {
+                log("presenter_warn=filter_chain_invalid reason=pass_parse spec=" + trimmed);
+                return null;
+            }
+            if (radius < 0L || radius > 0xffff_ffffL || !Float.isFinite(sigma)) {
+                log("presenter_warn=filter_chain_invalid reason=pass_value spec=" + trimmed);
+                return null;
+            }
+
+            cmd.append(' ')
+                    .append(radius)
+                    .append(' ')
+                    .append(String.format(Locale.US, "%.3f", sigma));
+        }
+
+        return cmd.toString();
+    }
+
+    private static String describeThrowable(Throwable t) {
+        if (t == null) {
+            return "Unknown";
+        }
+        Throwable root = t;
+        for (int i = 0; i < 16; i++) {
+            Throwable cause = root.getCause();
+            if (cause == null || cause == root) {
+                break;
+            }
+            root = cause;
+        }
+        String msg = root.getMessage();
+        if (msg == null || msg.isEmpty()) {
+            return root.getClass().getSimpleName();
+        }
+        return root.getClass().getSimpleName() + ":" + msg.replace('\n', ' ').replace('\r', ' ');
     }
 
     private Object resolveDisplayManager() {

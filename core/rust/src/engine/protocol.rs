@@ -1,4 +1,7 @@
 use crate::api::{DisplayState, RenderStats, RouteResult, Status, TouchEvent};
+use crate::backend::filter::{
+    FilterPass, FilterPipeline, GaussianBlurPass, FILTER_PASS_KIND_GAUSSIAN,
+};
 use crate::engine::RuntimeEngine;
 use crate::DIRECTSCREEN_CORE_VERSION;
 
@@ -31,6 +34,9 @@ pub enum BinaryOpcode {
     RenderSubmit = 9,
     RenderGet = 10,
     DisplayWait = 11,
+    FilterChainSet = 12,
+    FilterClear = 13,
+    FilterGet = 14,
 }
 
 impl BinaryOpcode {
@@ -47,6 +53,9 @@ impl BinaryOpcode {
             9 => Some(Self::RenderSubmit),
             10 => Some(Self::RenderGet),
             11 => Some(Self::DisplayWait),
+            12 => Some(Self::FilterChainSet),
+            13 => Some(Self::FilterClear),
+            14 => Some(Self::FilterGet),
             _ => None,
         }
     }
@@ -81,7 +90,19 @@ pub struct BinaryRenderSubmitPayload {
     pub text_calls: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BinaryFilterPassPayload {
+    pub kind: u32,
+    pub radius: u32,
+    pub sigma: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinaryFilterChainSetPayload {
+    pub passes: Vec<BinaryFilterPassPayload>,
+}
+
+#[derive(Debug, Clone)]
 pub enum BinaryCommand {
     Ping {
         seq: u64,
@@ -118,6 +139,16 @@ pub enum BinaryCommand {
         payload: BinaryRenderSubmitPayload,
     },
     RenderGet {
+        seq: u64,
+    },
+    FilterChainSet {
+        seq: u64,
+        payload: BinaryFilterChainSetPayload,
+    },
+    FilterClear {
+        seq: u64,
+    },
+    FilterGet {
         seq: u64,
     },
 }
@@ -167,6 +198,35 @@ fn read_i32_le(bytes: &[u8], off: usize) -> Result<i32, Status> {
 
 fn read_f32_le(bytes: &[u8], off: usize) -> Result<f32, Status> {
     Ok(f32::from_bits(read_u32_le(bytes, off)?))
+}
+
+fn parse_filter_chain_payload(payload: &[u8]) -> Result<BinaryFilterChainSetPayload, Status> {
+    if payload.len() < 4 {
+        return Err(Status::InvalidArgument);
+    }
+    if !(payload.len() - 4).is_multiple_of(12) {
+        return Err(Status::InvalidArgument);
+    }
+
+    let count = read_u32_le(payload, 0)? as usize;
+    let expected_len = 4usize
+        .checked_add(count.checked_mul(12).ok_or(Status::OutOfRange)?)
+        .ok_or(Status::OutOfRange)?;
+    if expected_len != payload.len() {
+        return Err(Status::InvalidArgument);
+    }
+
+    let mut passes = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 4 + i * 12;
+        passes.push(BinaryFilterPassPayload {
+            kind: read_u32_le(payload, off)?,
+            radius: read_u32_le(payload, off + 4)?,
+            sigma: read_f32_le(payload, off + 8)?,
+        });
+    }
+
+    Ok(BinaryFilterChainSetPayload { passes })
 }
 
 pub fn parse_binary_header(frame: &[u8]) -> Result<BinaryCommandHeader, Status> {
@@ -300,6 +360,22 @@ pub fn parse_binary_command(frame: &[u8]) -> Result<BinaryCommand, Status> {
             }
             Ok(BinaryCommand::RenderGet { seq: header.seq })
         }
+        BinaryOpcode::FilterChainSet => Ok(BinaryCommand::FilterChainSet {
+            seq: header.seq,
+            payload: parse_filter_chain_payload(payload)?,
+        }),
+        BinaryOpcode::FilterClear => {
+            if !payload.is_empty() {
+                return Err(Status::InvalidArgument);
+            }
+            Ok(BinaryCommand::FilterClear { seq: header.seq })
+        }
+        BinaryOpcode::FilterGet => {
+            if !payload.is_empty() {
+                return Err(Status::InvalidArgument);
+            }
+            Ok(BinaryCommand::FilterGet { seq: header.seq })
+        }
     }
 }
 
@@ -324,6 +400,63 @@ fn parse_version_triplet() -> [u64; 3] {
         *slot = parse_version_token_prefix(token);
     }
     out
+}
+
+fn build_filter_pipeline(payload: &BinaryFilterChainSetPayload) -> Result<FilterPipeline, Status> {
+    let mut passes = Vec::with_capacity(payload.passes.len());
+    for pass in &payload.passes {
+        match pass.kind {
+            FILTER_PASS_KIND_GAUSSIAN => {
+                passes.push(FilterPass::GaussianBlur(GaussianBlurPass {
+                    radius: pass.radius,
+                    sigma: pass.sigma,
+                }));
+            }
+            _ => return Err(Status::InvalidArgument),
+        }
+    }
+    Ok(FilterPipeline { passes })
+}
+
+fn write_filter_snapshot(
+    resp: &mut BinaryResponse,
+    pipeline: &FilterPipeline,
+    backend_kind: u32,
+    gpu_active: bool,
+) {
+    resp.values[0] = backend_kind as u64;
+    resp.values[1] = if gpu_active { 1 } else { 0 };
+    resp.values[2] = pipeline.passes.len() as u64;
+
+    let mut gaussian_slot = 0usize;
+    for pass in &pipeline.passes {
+        match pass {
+            FilterPass::GaussianBlur(cfg) => {
+                let (radius_idx, sigma_idx) = if gaussian_slot == 0 {
+                    (3usize, 4usize)
+                } else {
+                    (5usize, 6usize)
+                };
+                resp.values[radius_idx] = cfg.radius as u64;
+                resp.values[sigma_idx] = cfg.sigma.to_bits() as u64;
+                gaussian_slot += 1;
+                if gaussian_slot >= 2 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn fill_filter_state_response(engine: &RuntimeEngine, resp: &mut BinaryResponse) {
+    match engine.filter_state_snapshot() {
+        Ok((info, pipeline)) => {
+            write_filter_snapshot(resp, &pipeline, info.backend_kind, info.gpu_active);
+        }
+        Err(status) => {
+            resp.status = status;
+        }
+    }
 }
 
 pub fn execute_binary_command(engine: &RuntimeEngine, frame: &[u8]) -> BinaryResponse {
@@ -457,6 +590,32 @@ pub fn execute_binary_command(engine: &RuntimeEngine, frame: &[u8]) -> BinaryRes
             resp.values[3] = stats.text_calls as u64;
             resp
         }
+        BinaryCommand::FilterChainSet { seq, payload } => {
+            let mut resp =
+                BinaryResponse::with_status(seq, BinaryOpcode::FilterChainSet as u16, Status::Ok);
+            match build_filter_pipeline(&payload)
+                .and_then(|pipeline| engine.set_filter_pipeline(pipeline))
+            {
+                Ok(()) => fill_filter_state_response(engine, &mut resp),
+                Err(status) => resp.status = status,
+            }
+            resp
+        }
+        BinaryCommand::FilterClear { seq } => {
+            let mut resp =
+                BinaryResponse::with_status(seq, BinaryOpcode::FilterClear as u16, Status::Ok);
+            match engine.clear_filter_pipeline() {
+                Ok(()) => fill_filter_state_response(engine, &mut resp),
+                Err(status) => resp.status = status,
+            }
+            resp
+        }
+        BinaryCommand::FilterGet { seq } => {
+            let mut resp =
+                BinaryResponse::with_status(seq, BinaryOpcode::FilterGet as u16, Status::Ok);
+            fill_filter_state_response(engine, &mut resp);
+            resp
+        }
     }
 }
 
@@ -583,5 +742,70 @@ mod tests {
         assert_eq!(get_resp.values[1], 8);
         assert_eq!(get_resp.values[2], 2);
         assert_eq!(get_resp.values[3], 3);
+    }
+
+    #[test]
+    fn parse_filter_chain_set_payload() {
+        let payload = [
+            2u32.to_le_bytes(),
+            FILTER_PASS_KIND_GAUSSIAN.to_le_bytes(),
+            6u32.to_le_bytes(),
+            2.5f32.to_bits().to_le_bytes(),
+            FILTER_PASS_KIND_GAUSSIAN.to_le_bytes(),
+            4u32.to_le_bytes(),
+            1.25f32.to_bits().to_le_bytes(),
+        ]
+        .concat();
+
+        let frame = build_frame(30, BinaryOpcode::FilterChainSet, &payload);
+        let parsed = parse_binary_command(&frame).expect("parse filter chain");
+        match parsed {
+            BinaryCommand::FilterChainSet { seq, payload } => {
+                assert_eq!(seq, 30);
+                assert_eq!(payload.passes.len(), 2);
+                assert_eq!(payload.passes[0].kind, FILTER_PASS_KIND_GAUSSIAN);
+                assert_eq!(payload.passes[0].radius, 6);
+                assert_eq!(payload.passes[0].sigma, 2.5);
+                assert_eq!(payload.passes[1].radius, 4);
+                assert_eq!(payload.passes[1].sigma, 1.25);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn filter_chain_set_get_clear_binary_commands() {
+        let engine = RuntimeEngine::default();
+        let set_payload = [
+            2u32.to_le_bytes(),
+            FILTER_PASS_KIND_GAUSSIAN.to_le_bytes(),
+            8u32.to_le_bytes(),
+            3.0f32.to_bits().to_le_bytes(),
+            FILTER_PASS_KIND_GAUSSIAN.to_le_bytes(),
+            4u32.to_le_bytes(),
+            1.5f32.to_bits().to_le_bytes(),
+        ]
+        .concat();
+
+        let set_resp = execute_binary_command(
+            &engine,
+            &build_frame(31, BinaryOpcode::FilterChainSet, &set_payload),
+        );
+        assert_eq!(set_resp.status, Status::Ok);
+        assert_eq!(set_resp.values[2], 2);
+        assert_eq!(set_resp.values[3], 8);
+        assert_eq!(set_resp.values[4], 3.0f32.to_bits() as u64);
+        assert_eq!(set_resp.values[5], 4);
+        assert_eq!(set_resp.values[6], 1.5f32.to_bits() as u64);
+
+        let get_resp =
+            execute_binary_command(&engine, &build_frame(32, BinaryOpcode::FilterGet, &[]));
+        assert_eq!(get_resp.status, Status::Ok);
+        assert_eq!(get_resp.values[2], 2);
+
+        let clear_resp =
+            execute_binary_command(&engine, &build_frame(33, BinaryOpcode::FilterClear, &[]));
+        assert_eq!(clear_resp.status, Status::Ok);
+        assert_eq!(clear_resp.values[2], 0);
     }
 }

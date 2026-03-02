@@ -4,6 +4,7 @@ use crate::api::{
     TOUCH_MAX_POINTERS,
 };
 use crate::backend::filter::{apply_filter_pipeline_rgba, FilterPipeline};
+use crate::backend::vulkan::VulkanBackend;
 use std::collections::HashMap;
 use std::fs::{create_dir_all, File};
 use std::io::Write;
@@ -74,6 +75,15 @@ struct TouchState {
     active_touches: HashMap<i32, ActiveTouch>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilterRuntimeInfo {
+    pub backend_kind: u32,
+    pub gpu_active: bool,
+}
+
+const FILTER_BACKEND_CPU: u32 = 0;
+const FILTER_BACKEND_VULKAN: u32 = 1;
+
 #[derive(Debug, Default)]
 struct RenderState {
     render: RenderStats,
@@ -95,6 +105,7 @@ pub struct RuntimeEngine {
     frame_signal_seq: Mutex<u64>,
     frame_signal_cv: Condvar,
     filter_pipeline: RwLock<FilterPipeline>,
+    vulkan_backend: Mutex<Option<VulkanBackend>>,
     render_output_dir: PathBuf,
 }
 
@@ -116,6 +127,7 @@ impl RuntimeEngine {
             frame_signal_seq: Mutex::new(0),
             frame_signal_cv: Condvar::new(),
             filter_pipeline: RwLock::new(FilterPipeline::default()),
+            vulkan_backend: Mutex::new(init_vulkan_backend()),
             render_output_dir: render_output_dir.into(),
         }
     }
@@ -312,6 +324,38 @@ impl RuntimeEngine {
 
     pub fn clear_filter_pipeline(&self) -> Result<(), Status> {
         self.set_filter_pipeline(FilterPipeline::default())
+    }
+
+    pub fn filter_state_snapshot(&self) -> Result<(FilterRuntimeInfo, FilterPipeline), Status> {
+        let pipeline = self
+            .filter_pipeline
+            .read()
+            .map_err(|_| Status::InternalError)?
+            .clone();
+        let info = self.filter_runtime_info();
+        Ok((info, pipeline))
+    }
+
+    pub fn filter_runtime_info(&self) -> FilterRuntimeInfo {
+        match self.vulkan_backend.lock() {
+            Ok(guard) => {
+                if let Some(vk) = guard.as_ref() {
+                    FilterRuntimeInfo {
+                        backend_kind: FILTER_BACKEND_VULKAN,
+                        gpu_active: vk.gpu_path_active(),
+                    }
+                } else {
+                    FilterRuntimeInfo {
+                        backend_kind: FILTER_BACKEND_CPU,
+                        gpu_active: false,
+                    }
+                }
+            }
+            Err(_) => FilterRuntimeInfo {
+                backend_kind: FILTER_BACKEND_CPU,
+                gpu_active: false,
+            },
+        }
     }
 
     pub fn submit_render_frame_rgba(
@@ -535,10 +579,25 @@ impl RuntimeEngine {
         let pipeline = self
             .filter_pipeline
             .read()
-            .map_err(|_| Status::InternalError)?;
+            .map_err(|_| Status::InternalError)?
+            .clone();
         if pipeline.passes.is_empty() {
             return Ok(());
         }
+
+        let mut backend = self
+            .vulkan_backend
+            .lock()
+            .map_err(|_| Status::InternalError)?;
+        if let Some(vk) = backend.as_mut() {
+            vk.set_filter_pipeline(pipeline.clone());
+            if vk.process_frame_rgba(width, height, pixels_rgba8).is_ok() {
+                return Ok(());
+            }
+            // Vulkan 后端异常时回退 CPU 路径，避免影响主渲染链路稳定性。
+            *backend = None;
+        }
+
         let _report = apply_filter_pipeline_rgba(&pipeline, width, height, pixels_rgba8)?;
         Ok(())
     }
@@ -583,6 +642,14 @@ impl RuntimeEngine {
             self.display_signal_cv.notify_all();
         }
     }
+}
+
+fn init_vulkan_backend() -> Option<VulkanBackend> {
+    let mode = std::env::var("DSAPI_FILTER_BACKEND").unwrap_or_else(|_| "auto".to_string());
+    if mode.eq_ignore_ascii_case("cpu") {
+        return None;
+    }
+    VulkanBackend::new().ok()
 }
 
 fn write_ppm_rgba(path: &Path, width: u32, height: u32, rgba8: &[u8]) -> std::io::Result<()> {
