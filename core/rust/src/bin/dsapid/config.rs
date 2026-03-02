@@ -248,6 +248,7 @@ fn parse_allowed_uids_from_env() -> Result<HashSet<u32>, String> {
     Ok(out)
 }
 
+#[cfg(target_os = "android")]
 fn parse_uid_from_env(key: &str) -> Option<u32> {
     let raw = std::env::var(key).ok()?;
     let trimmed = raw.trim();
