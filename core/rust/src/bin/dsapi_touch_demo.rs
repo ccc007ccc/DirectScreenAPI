@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_arguments)]
 use std::fs;
 use std::io::{self, IoSliceMut, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -1278,7 +1279,10 @@ fn render_scene(
             "Window: x={:.0} y={:.0} w={:.0} h={:.0}",
             state.window.x, state.window.y, state.window.w, state.window.h
         ),
-        format!("Display: {}x{} dpi={}", display.width, display.height, display.density_dpi),
+        format!(
+            "Display: {}x{} dpi={}",
+            display.width, display.height, display.density_dpi
+        ),
         format!("Touch block downs: {}", blocked_down),
         format!("Touch passthrough downs: {}", passed_down),
         format!(

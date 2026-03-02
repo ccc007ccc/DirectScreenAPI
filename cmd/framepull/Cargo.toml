@@ -2,7 +2,7 @@
 name = "dsapi-framepull"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT"
 description = "Lightweight one-shot frame pull helper for DirectScreenAPI"
 
 [[bin]]

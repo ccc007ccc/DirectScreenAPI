@@ -65,7 +65,7 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
-                .map(|v| v.get().min(8).max(4))
+                .map(|v| v.get().clamp(4, 8))
                 .unwrap_or(4)
         });
     let mut socket_rw_timeout_ms = std::env::var("DSAPI_SOCKET_RW_TIMEOUT_MS")
