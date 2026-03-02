@@ -453,6 +453,7 @@ struct Args {
     device_path: Option<String>,
     route_name: String,
     fps: f32,
+    render_scale: f32,
     run_seconds: Option<f32>,
     no_touch_router: bool,
     quiet: bool,
@@ -471,6 +472,7 @@ fn usage() {
     eprintln!("  --device <event_path>     touch input device path");
     eprintln!("  --route-name <name>       touch route name (default: demo-window)");
     eprintln!("  --fps <n>                 render fps cap, 0 means auto by refresh rate");
+    eprintln!("  --render-scale <n>        render resolution scale in (0,1], default: 1.0");
     eprintln!("  --run-seconds <n>         auto stop after n seconds");
     eprintln!("  --window-x <n>            initial window x");
     eprintln!("  --window-y <n>            initial window y");
@@ -505,6 +507,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut device_path: Option<String> = None;
     let mut route_name = "demo-window".to_string();
     let mut fps = 0.0f32;
+    let mut render_scale = 1.0f32;
     let mut run_seconds: Option<f32> = None;
     let mut no_touch_router = false;
     let mut quiet = false;
@@ -512,6 +515,10 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut window_y: Option<f32> = None;
     let mut window_w = 520.0f32;
     let mut window_h = 360.0f32;
+
+    if let Some(v) = env_non_empty("DSAPI_DEMO_RENDER_SCALE") {
+        render_scale = parse_f32("render_scale", &v)?;
+    }
 
     let mut i = 1usize;
     while i < args.len() {
@@ -549,6 +556,13 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                     return Err("missing_fps".to_string());
                 }
                 fps = parse_f32("fps", &args[i + 1])?;
+                i += 2;
+            }
+            "--render-scale" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_render_scale".to_string());
+                }
+                render_scale = parse_f32("render_scale", &args[i + 1])?;
                 i += 2;
             }
             "--run-seconds" => {
@@ -609,6 +623,9 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     if !fps.is_finite() || fps < 0.0 || (fps > 0.0 && fps <= 1.0) {
         return Err("fps_must_be_zero_or_gt_1".to_string());
     }
+    if !render_scale.is_finite() || render_scale <= 0.0 || render_scale > 1.0 {
+        return Err("render_scale_must_be_in_0_1".to_string());
+    }
     if let Some(v) = run_seconds {
         if !v.is_finite() || v <= 0.0 {
             return Err("run_seconds_must_be_gt_0".to_string());
@@ -628,6 +645,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         device_path,
         route_name,
         fps,
+        render_scale,
         run_seconds,
         no_touch_router,
         quiet,
@@ -688,6 +706,8 @@ impl WindowState {
 #[derive(Debug, Clone, Copy)]
 struct RouteSnapshot {
     window: WindowState,
+    scale_x: f32,
+    scale_y: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -930,6 +950,10 @@ impl BlurScratch {
         self.cached_h = h;
         self.cache_valid = true;
     }
+
+    fn invalidate_cache(&mut self) {
+        self.cache_valid = false;
+    }
 }
 
 fn resolve_target_fps(user_fps: f32, refresh_hz: f32) -> f32 {
@@ -944,6 +968,49 @@ fn resolve_target_fps(user_fps: f32, refresh_hz: f32) -> f32 {
 
 fn frame_interval_from_fps(fps: f32) -> Duration {
     Duration::from_secs_f64((1.0f32 / fps.max(1.0)) as f64)
+}
+
+fn build_render_display(display: DisplayInfo, scale: f32) -> DisplayInfo {
+    if (scale - 1.0).abs() < f32::EPSILON {
+        return display;
+    }
+    let scaled_w = ((display.width as f32) * scale).round().max(1.0) as u32;
+    let scaled_h = ((display.height as f32) * scale).round().max(1.0) as u32;
+    let scaled_dpi = if display.density_dpi == 0 {
+        0
+    } else {
+        ((display.density_dpi as f32) * scale).round().max(1.0) as u32
+    };
+    DisplayInfo {
+        width: scaled_w,
+        height: scaled_h,
+        refresh_hz: display.refresh_hz,
+        density_dpi: scaled_dpi,
+        rotation: display.rotation,
+    }
+}
+
+fn touch_scale(physical: DisplayInfo, render: DisplayInfo) -> (f32, f32) {
+    let sx = render.width as f32 / (physical.width.max(1) as f32);
+    let sy = render.height as f32 / (physical.height.max(1) as f32);
+    (sx, sy)
+}
+
+fn map_touch_to_render(
+    msg: TouchMessage,
+    physical: DisplayInfo,
+    render: DisplayInfo,
+) -> TouchMessage {
+    let (sx, sy) = touch_scale(physical, render);
+    let max_x = (render.width.saturating_sub(1)) as f32;
+    let max_y = (render.height.saturating_sub(1)) as f32;
+    TouchMessage {
+        phase: msg.phase,
+        pointer_id: msg.pointer_id,
+        x: (msg.x * sx).clamp(0.0, max_x),
+        y: (msg.y * sy).clamp(0.0, max_y),
+        latency_ms: msg.latency_ms,
+    }
 }
 
 fn spawn_display_watch(
@@ -1033,24 +1100,34 @@ fn main() {
         );
         std::process::exit(4);
     }
+    let mut render_display = build_render_display(display, cfg.render_scale);
+    let (mut route_scale_x, mut route_scale_y) = touch_scale(display, render_display);
+    let init_window_w = (cfg.window_w * route_scale_x).max(WINDOW_ARG_MIN_W * route_scale_x);
+    let init_window_h = (cfg.window_h * route_scale_y).max(WINDOW_ARG_MIN_H * route_scale_y);
 
     let init_x = cfg
         .window_x
-        .unwrap_or_else(|| ((display.width as f32 - cfg.window_w) * 0.5).max(0.0));
+        .map(|v| v * route_scale_x)
+        .unwrap_or_else(|| ((render_display.width as f32 - init_window_w) * 0.5).max(0.0));
     let init_y = cfg
         .window_y
-        .unwrap_or_else(|| ((display.height as f32 - cfg.window_h) * 0.35).max(0.0));
+        .map(|v| v * route_scale_y)
+        .unwrap_or_else(|| ((render_display.height as f32 - init_window_h) * 0.35).max(0.0));
     let mut state = DemoState::new(WindowState {
         x: init_x,
         y: init_y,
-        w: cfg.window_w,
-        h: cfg.window_h,
+        w: init_window_w,
+        h: init_window_h,
         visible: true,
     });
-    state.window.clamp_to_display(display, ui_metrics(display));
+    state
+        .window
+        .clamp_to_display(render_display, ui_metrics(render_display));
 
     let route_state = Arc::new(Mutex::new(RouteSnapshot {
         window: state.window,
+        scale_x: route_scale_x,
+        scale_y: route_scale_y,
     }));
     let route_blocked_down = Arc::new(AtomicU64::new(0));
     let route_passed_down = Arc::new(AtomicU64::new(0));
@@ -1102,7 +1179,9 @@ fn main() {
             router_cfg,
             Arc::clone(&route_state),
             move |snapshot: RouteSnapshot, x: f32, y: f32| {
-                let blocked = snapshot.window.contains(x, y);
+                let mapped_x = x * snapshot.scale_x;
+                let mapped_y = y * snapshot.scale_y;
+                let blocked = snapshot.window.contains(mapped_x, mapped_y);
                 if blocked {
                     route_blocked_ref.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -1148,9 +1227,12 @@ fn main() {
     let mut target_fps = resolve_target_fps(cfg.fps, display.refresh_hz);
     if !cfg.quiet {
         eprintln!(
-            "touch_demo_status=running display={}x{}@{:.2} dpi={} rotation={} target_fps={:.1}",
+            "touch_demo_status=running display={}x{} render={}x{} scale={:.2} @ {:.2}Hz dpi={} rotation={} target_fps={:.1}",
             display.width,
             display.height,
+            render_display.width,
+            render_display.height,
+            cfg.render_scale,
             display.refresh_hz,
             display.density_dpi,
             display.rotation,
@@ -1174,7 +1256,8 @@ fn main() {
         let frame_started = Instant::now();
 
         while let Ok(msg) = touch_rx.try_recv() {
-            state.apply_touch(msg, display);
+            let mapped = map_touch_to_render(msg, display, render_display);
+            state.apply_touch(mapped, render_display);
         }
         while let Ok(next) = display_rx.try_recv() {
             if next.width == 0 || next.height == 0 {
@@ -1186,7 +1269,12 @@ fn main() {
                 || next.rotation != display.rotation
             {
                 display = next;
-                state.window.clamp_to_display(display, ui_metrics(display));
+                render_display = build_render_display(display, cfg.render_scale);
+                (route_scale_x, route_scale_y) = touch_scale(display, render_display);
+                state
+                    .window
+                    .clamp_to_display(render_display, ui_metrics(render_display));
+                blur_scratch.invalidate_cache();
                 if cfg.fps <= 1.0 {
                     target_fps = resolve_target_fps(cfg.fps, display.refresh_hz);
                     frame_interval = frame_interval_from_fps(target_fps);
@@ -1200,8 +1288,13 @@ fn main() {
                 }
                 if !cfg.quiet {
                     eprintln!(
-                        "touch_demo_status=display_changed size={}x{} dpi={} rotation={}",
-                        display.width, display.height, display.density_dpi, display.rotation
+                        "touch_demo_status=display_changed size={}x{} render={}x{} dpi={} rotation={}",
+                        display.width,
+                        display.height,
+                        render_display.width,
+                        render_display.height,
+                        display.density_dpi,
+                        display.rotation
                     );
                 }
             }
@@ -1209,28 +1302,31 @@ fn main() {
 
         if let Ok(mut route) = route_state.lock() {
             route.window = state.window;
+            route.scale_x = route_scale_x;
+            route.scale_y = route_scale_y;
         }
 
         let fps = fps_counter.on_frame();
         let blocked = route_blocked_down.load(Ordering::Relaxed);
         let passed = route_passed_down.load(Ordering::Relaxed);
-        let frame_len = match frame_byte_len(display.width, display.height) {
+        let frame_len = match frame_byte_len(render_display.width, render_display.height) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("touch_demo_error=frame_size_invalid err={}", e);
                 break;
             }
         };
-        let frame_buf = match submitter.frame_buffer_mut(display.width, display.height) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("touch_demo_error=frame_buffer_failed err={}", e);
-                break;
-            }
-        };
+        let frame_buf =
+            match submitter.frame_buffer_mut(render_display.width, render_display.height) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("touch_demo_error=frame_buffer_failed err={}", e);
+                    break;
+                }
+            };
         render_scene(
             frame_buf,
-            display,
+            render_display,
             &state,
             fps,
             blocked,
@@ -1238,7 +1334,9 @@ fn main() {
             &mut blur_scratch,
         );
 
-        if let Err(e) = submitter.submit_rendered_frame(display.width, display.height, frame_len) {
+        if let Err(e) =
+            submitter.submit_rendered_frame(render_display.width, render_display.height, frame_len)
+        {
             eprintln!("touch_demo_error=submit_frame_failed err={}", e);
             break;
         }

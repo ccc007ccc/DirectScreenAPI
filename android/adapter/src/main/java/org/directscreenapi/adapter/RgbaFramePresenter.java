@@ -155,13 +155,6 @@ final class RgbaFramePresenter {
 
                 try {
                     maybeSwitchSurfaceForFrame(mappedFrame.width, mappedFrame.height);
-                    if (mappedFrame.width == surfaceWidth && mappedFrame.height == surfaceHeight) {
-                        drawFrame(mappedFrame.width, mappedFrame.height, mappedFrame.rgba8);
-                        lastFrameSeq = mappedFrame.frameSeq;
-                        markFramePresented(mappedFrame.byteLen);
-                        continue;
-                    }
-
                     if (pendingSurfaceSession != null
                             && mappedFrame.width == pendingSurfaceWidth
                             && mappedFrame.height == pendingSurfaceHeight) {
@@ -178,13 +171,15 @@ final class RgbaFramePresenter {
                         continue;
                     }
 
-                    // 仅丢弃既不匹配当前 surface、也不匹配待切换尺寸的异常帧。
-                    log("presenter_warn=drop_mismatched_frame frame="
-                            + mappedFrame.width + "x" + mappedFrame.height
-                            + " surface=" + surfaceWidth + "x" + surfaceHeight
-                            + " pending=" + pendingSurfaceWidth + "x" + pendingSurfaceHeight
-                            + " seq=" + mappedFrame.frameSeq);
-                    lastFrameSeq = mappedFrame.frameSeq;
+                    // 允许帧尺寸与 surface 不同，按目标层全屏缩放，支持低分辨率高帧率渲染。
+                    if (surfaceSession != null && destRect != null) {
+                        drawFrame(mappedFrame.width, mappedFrame.height, mappedFrame.rgba8);
+                        lastFrameSeq = mappedFrame.frameSeq;
+                        markFramePresented(mappedFrame.byteLen);
+                        continue;
+                    }
+
+                    log("presenter_warn=drop_frame_no_surface seq=" + mappedFrame.frameSeq);
                 } finally {
                     mappedFrame.closeQuietly();
                 }

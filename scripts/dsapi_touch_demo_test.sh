@@ -19,6 +19,7 @@ env:
   DSAPI_DEMO_KEEP_SERVICES=1|0    keep daemon/presenter after demo exits (default: 0)
   DSAPI_DEMO_RUN_SECONDS=<n>      auto stop seconds if --run-seconds not provided (default: 12)
   DSAPI_DEMO_FPS=<n>              auto append --fps when caller not set (default: 0, auto)
+  DSAPI_DEMO_RENDER_SCALE=<n>     auto append --render-scale when caller not set (default: 0.67)
   DSAPI_DEMO_FILTER_CHAIN=<spec>  presenter filter chain (default: empty, disabled)
   DSAPI_DEMO_BLUR_RADIUS=<n>      fallback gaussian radius when chain empty (default: 0)
   DSAPI_DEMO_BLUR_SIGMA=<n>       fallback gaussian sigma when chain empty (default: 0)
@@ -104,6 +105,7 @@ APP_PROCESS_BIN="${DSAPI_APP_PROCESS_BIN:-/system/bin/app_process64}"
 ANDROID_OUT_DIR="${DSAPI_ANDROID_OUT_DIR:-artifacts/android_user}"
 DEMO_RUN_SECONDS="${DSAPI_DEMO_RUN_SECONDS:-12}"
 DEMO_FPS="${DSAPI_DEMO_FPS:-0}"
+DEMO_RENDER_SCALE="${DSAPI_DEMO_RENDER_SCALE:-0.67}"
 DEMO_FILTER_CHAIN="${DSAPI_DEMO_FILTER_CHAIN:-}"
 DEMO_BLUR_RADIUS="${DSAPI_DEMO_BLUR_RADIUS:-0}"
 DEMO_BLUR_SIGMA="${DSAPI_DEMO_BLUR_SIGMA:-0}"
@@ -186,6 +188,7 @@ fi
 
 user_has_run_seconds=0
 user_has_fps=0
+user_has_render_scale=0
 for token in "$@"
 do
   if [ "$token" = "--run-seconds" ]; then
@@ -194,12 +197,18 @@ do
   if [ "$token" = "--fps" ]; then
     user_has_fps=1
   fi
+  if [ "$token" = "--render-scale" ]; then
+    user_has_render_scale=1
+  fi
 done
 if [ "$user_has_run_seconds" = "0" ] && [ "$DEMO_RUN_SECONDS" != "0" ]; then
   set -- "$@" --run-seconds "$DEMO_RUN_SECONDS"
 fi
 if [ "$user_has_fps" = "0" ] && [ -n "$DEMO_FPS" ]; then
   set -- "$@" --fps "$DEMO_FPS"
+fi
+if [ "$user_has_render_scale" = "0" ] && [ -n "$DEMO_RENDER_SCALE" ]; then
+  set -- "$@" --render-scale "$DEMO_RENDER_SCALE"
 fi
 
 set -- "$demo_bin" \
