@@ -845,6 +845,93 @@ impl FpsCounter {
     }
 }
 
+struct BlurScratch {
+    src: Vec<u8>,
+    tmp: Vec<u8>,
+    kernel: Vec<f32>,
+    radius: i32,
+    cached_patch: Vec<u8>,
+    cached_x: i32,
+    cached_y: i32,
+    cached_w: usize,
+    cached_h: usize,
+    cache_valid: bool,
+}
+
+impl BlurScratch {
+    fn new(radius: u32, sigma: f32) -> Self {
+        Self {
+            src: Vec::new(),
+            tmp: Vec::new(),
+            kernel: build_gaussian_kernel(radius as usize, sigma),
+            radius: radius as i32,
+            cached_patch: Vec::new(),
+            cached_x: 0,
+            cached_y: 0,
+            cached_w: 0,
+            cached_h: 0,
+            cache_valid: false,
+        }
+    }
+
+    fn ensure_len(&mut self, len: usize) {
+        if self.src.len() != len {
+            self.src.resize(len, 0);
+        }
+        if self.tmp.len() != len {
+            self.tmp.resize(len, 0);
+        }
+    }
+
+    fn cache_matches(&self, x: i32, y: i32, w: usize, h: usize) -> bool {
+        self.cache_valid
+            && self.cached_x == x
+            && self.cached_y == y
+            && self.cached_w == w
+            && self.cached_h == h
+            && self.cached_patch.len() == w.saturating_mul(h).saturating_mul(4)
+    }
+
+    fn write_cached(&self, frame: &mut [u8], fb_width: u32) {
+        if !self.cache_valid || self.cached_w == 0 || self.cached_h == 0 {
+            return;
+        }
+        for ry in 0..self.cached_h {
+            let dst_row =
+                ((self.cached_y as usize + ry) * fb_width as usize + self.cached_x as usize) * 4;
+            let src_row = ry * self.cached_w * 4;
+            frame[dst_row..dst_row + self.cached_w * 4]
+                .copy_from_slice(&self.cached_patch[src_row..src_row + self.cached_w * 4]);
+        }
+    }
+
+    fn update_cache_from_frame(
+        &mut self,
+        frame: &[u8],
+        fb_width: u32,
+        x: i32,
+        y: i32,
+        w: usize,
+        h: usize,
+    ) {
+        let len = w.saturating_mul(h).saturating_mul(4);
+        if self.cached_patch.len() != len {
+            self.cached_patch.resize(len, 0);
+        }
+        for ry in 0..h {
+            let src_row = ((y as usize + ry) * fb_width as usize + x as usize) * 4;
+            let dst_row = ry * w * 4;
+            self.cached_patch[dst_row..dst_row + w * 4]
+                .copy_from_slice(&frame[src_row..src_row + w * 4]);
+        }
+        self.cached_x = x;
+        self.cached_y = y;
+        self.cached_w = w;
+        self.cached_h = h;
+        self.cache_valid = true;
+    }
+}
+
 fn resolve_target_fps(user_fps: f32, refresh_hz: f32) -> f32 {
     if user_fps > 1.0 {
         return user_fps;
@@ -1073,6 +1160,7 @@ fn main() {
     }
 
     let mut fps_counter = FpsCounter::new();
+    let mut blur_scratch = BlurScratch::new(6, 2.4);
     let mut frame_interval = frame_interval_from_fps(target_fps);
     let started_at = Instant::now();
     let mut last_perf_log = Instant::now();
@@ -1140,13 +1228,20 @@ fn main() {
                 break;
             }
         };
-        render_scene(frame_buf, display, &state, fps, blocked, passed);
+        render_scene(
+            frame_buf,
+            display,
+            &state,
+            fps,
+            blocked,
+            passed,
+            &mut blur_scratch,
+        );
 
         if let Err(e) = submitter.submit_rendered_frame(display.width, display.height, frame_len) {
             eprintln!("touch_demo_error=submit_frame_failed err={}", e);
             break;
         }
-
         let elapsed = frame_started.elapsed();
         if !cfg.quiet && last_perf_log.elapsed() >= Duration::from_secs(1) {
             let frame_ms = elapsed.as_secs_f64() * 1000.0;
@@ -1216,6 +1311,7 @@ fn render_scene(
     fps: f32,
     blocked_down: u64,
     passed_down: u64,
+    blur_scratch: &mut BlurScratch,
 ) {
     frame.fill(0);
     let metrics = ui_metrics(display);
@@ -1230,7 +1326,8 @@ fn render_scene(
     let close_margin = metrics.close_margin.round().max(2.0) as i32;
     let close_top = metrics.close_top.round().max(2.0) as i32;
 
-    fill_rect(
+    draw_backdrop_pattern(frame, display.width, display.height, wx, wy, ww, wh);
+    blur_region_gaussian(
         frame,
         display.width,
         display.height,
@@ -1238,8 +1335,20 @@ fn render_scene(
         wy,
         ww,
         wh,
-        [21, 28, 37, 208],
+        blur_scratch,
     );
+    blend_rect(
+        frame,
+        display.width,
+        display.height,
+        wx,
+        wy,
+        ww,
+        wh,
+        [26, 34, 48, 255],
+        76,
+    );
+
     fill_rect(
         frame,
         display.width,
@@ -1398,6 +1507,201 @@ fn fill_rect(
             frame[idx + 3] = color[3];
         }
     }
+}
+
+fn blend_rect(
+    frame: &mut [u8],
+    fb_width: u32,
+    fb_height: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    color: [u8; 4],
+    alpha: u8,
+) {
+    if w <= 0 || h <= 0 || alpha == 0 {
+        return;
+    }
+    let start_x = x.max(0);
+    let start_y = y.max(0);
+    let end_x = (x + w).min(fb_width as i32);
+    let end_y = (y + h).min(fb_height as i32);
+    if start_x >= end_x || start_y >= end_y {
+        return;
+    }
+
+    let a = alpha as u16;
+    let inv_a = 255u16.saturating_sub(a);
+    let fb_w = fb_width as usize;
+    for py in start_y..end_y {
+        let row = py as usize * fb_w * 4;
+        for px in start_x..end_x {
+            let idx = row + px as usize * 4;
+            for c in 0..3 {
+                let dst = frame[idx + c] as u16;
+                let src = color[c] as u16;
+                frame[idx + c] = (((dst * inv_a) + (src * a)) / 255) as u8;
+            }
+            frame[idx + 3] = 255;
+        }
+    }
+}
+
+fn draw_backdrop_pattern(
+    frame: &mut [u8],
+    fb_width: u32,
+    fb_height: u32,
+    wx: i32,
+    wy: i32,
+    ww: i32,
+    wh: i32,
+) {
+    let pad = 96i32;
+    let start_x = (wx - pad).max(0);
+    let start_y = (wy - pad).max(0);
+    let end_x = (wx + ww + pad).min(fb_width as i32);
+    let end_y = (wy + wh + pad).min(fb_height as i32);
+    if start_x >= end_x || start_y >= end_y {
+        return;
+    }
+
+    let phase = 0i32;
+    let cell = 28i32;
+    let fb_w = fb_width as usize;
+    for py in start_y..end_y {
+        let row = py as usize * fb_w * 4;
+        for px in start_x..end_x {
+            let cx = (px + phase) / cell;
+            let cy = (py - phase) / cell;
+            let checker = (cx + cy) & 1;
+            let idx = row + px as usize * 4;
+            if checker == 0 {
+                frame[idx] = 44;
+                frame[idx + 1] = 72;
+                frame[idx + 2] = 116;
+            } else {
+                frame[idx] = 26;
+                frame[idx + 1] = 46;
+                frame[idx + 2] = 82;
+            }
+            frame[idx + 3] = 255;
+        }
+    }
+}
+
+fn blur_region_gaussian(
+    frame: &mut [u8],
+    fb_width: u32,
+    fb_height: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    scratch: &mut BlurScratch,
+) {
+    if w <= 0 || h <= 0 || scratch.radius <= 0 || scratch.kernel.is_empty() {
+        return;
+    }
+    let sx = x.max(0);
+    let sy = y.max(0);
+    let ex = (x + w).min(fb_width as i32);
+    let ey = (y + h).min(fb_height as i32);
+    if sx >= ex || sy >= ey {
+        return;
+    }
+    let rw = (ex - sx) as usize;
+    let rh = (ey - sy) as usize;
+    if scratch.cache_matches(sx, sy, rw, rh) {
+        scratch.write_cached(frame, fb_width);
+        return;
+    }
+    let len = rw
+        .checked_mul(rh)
+        .and_then(|v| v.checked_mul(4))
+        .unwrap_or(0usize);
+    if len == 0 {
+        return;
+    }
+    scratch.ensure_len(len);
+
+    for ry in 0..rh {
+        let src_row = ((sy as usize + ry) * fb_width as usize + sx as usize) * 4;
+        let dst_row = ry * rw * 4;
+        scratch.src[dst_row..dst_row + rw * 4].copy_from_slice(&frame[src_row..src_row + rw * 4]);
+    }
+
+    let radius = scratch.radius;
+    let kernel = &scratch.kernel;
+
+    for ry in 0..rh {
+        for rx in 0..rw {
+            let mut acc = [0.0f32; 4];
+            let mut wsum = 0.0f32;
+            for k in -radius..=radius {
+                let sx2 = (rx as i32 + k).clamp(0, rw as i32 - 1) as usize;
+                let weight = kernel[(k + radius) as usize];
+                wsum += weight;
+                let idx = (ry * rw + sx2) * 4;
+                for (c, acc_slot) in acc.iter_mut().enumerate() {
+                    *acc_slot += scratch.src[idx + c] as f32 * weight;
+                }
+            }
+            let out_idx = (ry * rw + rx) * 4;
+            for (c, acc_value) in acc.iter().enumerate() {
+                scratch.tmp[out_idx + c] =
+                    (acc_value / wsum.max(0.0001)).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    for ry in 0..rh {
+        for rx in 0..rw {
+            let mut acc = [0.0f32; 4];
+            let mut wsum = 0.0f32;
+            for k in -radius..=radius {
+                let sy2 = (ry as i32 + k).clamp(0, rh as i32 - 1) as usize;
+                let weight = kernel[(k + radius) as usize];
+                wsum += weight;
+                let idx = (sy2 * rw + rx) * 4;
+                for (c, acc_slot) in acc.iter_mut().enumerate() {
+                    *acc_slot += scratch.tmp[idx + c] as f32 * weight;
+                }
+            }
+            let out_idx = ((sy as usize + ry) * fb_width as usize + (sx as usize + rx)) * 4;
+            for c in 0..3usize {
+                frame[out_idx + c] = (acc[c] / wsum.max(0.0001)).round().clamp(0.0, 255.0) as u8;
+            }
+            frame[out_idx + 3] = 255;
+        }
+    }
+    scratch.update_cache_from_frame(frame, fb_width, sx, sy, rw, rh);
+}
+
+fn build_gaussian_kernel(radius: usize, sigma: f32) -> Vec<f32> {
+    if radius == 0 {
+        return vec![1.0];
+    }
+    let sigma = if sigma.is_finite() && sigma > 0.01 {
+        sigma
+    } else {
+        (radius as f32) * 0.45
+    };
+    let mut kernel = Vec::with_capacity(radius * 2 + 1);
+    let denom = 2.0 * sigma * sigma;
+    let mut sum = 0.0f32;
+    for i in 0..=(radius * 2) {
+        let x = i as i32 - radius as i32;
+        let v = (-(x * x) as f32 / denom).exp();
+        kernel.push(v);
+        sum += v;
+    }
+    if sum > 0.0 {
+        for v in &mut kernel {
+            *v /= sum;
+        }
+    }
+    kernel
 }
 
 fn draw_rect_border(

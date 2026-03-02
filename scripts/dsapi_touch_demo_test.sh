@@ -19,6 +19,9 @@ env:
   DSAPI_DEMO_KEEP_SERVICES=1|0    keep daemon/presenter after demo exits (default: 0)
   DSAPI_DEMO_RUN_SECONDS=<n>      auto stop seconds if --run-seconds not provided (default: 12)
   DSAPI_DEMO_FPS=<n>              auto append --fps when caller not set (default: 0, auto)
+  DSAPI_DEMO_FILTER_CHAIN=<spec>  presenter filter chain (default: empty, disabled)
+  DSAPI_DEMO_BLUR_RADIUS=<n>      fallback gaussian radius when chain empty (default: 0)
+  DSAPI_DEMO_BLUR_SIGMA=<n>       fallback gaussian sigma when chain empty (default: 0)
   DSAPI_DEMO_RENDER_CHECKSUM=1|0  daemon frame checksum (default: 0 for higher fps)
   DSAPI_DISPATCH_WORKERS=<n>      daemon dispatch workers (default: 8)
   DSAPI_PRESENTER_LOG_FILE=<path> presenter log file (default: artifacts/run/dsapi_presenter_user.log)
@@ -101,6 +104,9 @@ APP_PROCESS_BIN="${DSAPI_APP_PROCESS_BIN:-/system/bin/app_process64}"
 ANDROID_OUT_DIR="${DSAPI_ANDROID_OUT_DIR:-artifacts/android_user}"
 DEMO_RUN_SECONDS="${DSAPI_DEMO_RUN_SECONDS:-12}"
 DEMO_FPS="${DSAPI_DEMO_FPS:-0}"
+DEMO_FILTER_CHAIN="${DSAPI_DEMO_FILTER_CHAIN:-}"
+DEMO_BLUR_RADIUS="${DSAPI_DEMO_BLUR_RADIUS:-0}"
+DEMO_BLUR_SIGMA="${DSAPI_DEMO_BLUR_SIGMA:-0}"
 DEMO_RENDER_CHECKSUM="${DSAPI_DEMO_RENDER_CHECKSUM:-0}"
 DAEMON_DISPATCH_WORKERS="${DSAPI_DISPATCH_WORKERS:-8}"
 
@@ -139,9 +145,38 @@ DSAPI_RUN_AS_ROOT="$PRESENTER_RUN_AS_ROOT" \
 DSAPI_PRESENTER_PRECHECK=0 \
 DSAPI_ANDROID_OUT_DIR="$ANDROID_OUT_DIR" \
 DSAPI_APP_PROCESS_BIN="$APP_PROCESS_BIN" \
+DSAPI_PRESENTER_FILTER_CHAIN="$DEMO_FILTER_CHAIN" \
+DSAPI_PRESENTER_BLUR_RADIUS="$DEMO_BLUR_RADIUS" \
+DSAPI_PRESENTER_BLUR_SIGMA="$DEMO_BLUR_SIGMA" \
 DSAPI_PRESENTER_LOG_FILE="$PRESENTER_LOG_FILE" \
 ./scripts/dsapi.sh presenter start
 ./scripts/dsapi.sh presenter status
+
+filter_state=""
+if [ -n "$DEMO_FILTER_CHAIN" ]; then
+  i=0
+  while [ "$i" -lt 30 ]
+  do
+    filter_state="$(./scripts/dsapi.sh daemon cmd FILTER_GET || true)"
+    if printf '%s\n' "$filter_state" | grep -q 'pass_count=[1-9]'; then
+      break
+    fi
+    i=$((i + 1))
+    sleep 0.2
+  done
+else
+  filter_state="$(./scripts/dsapi.sh daemon cmd FILTER_GET || true)"
+fi
+
+echo "touch_demo_test_status=filter_state $filter_state"
+if ! printf '%s\n' "$filter_state" | grep -q 'pass_count='; then
+  echo "touch_demo_test_error=filter_get_failed"
+  exit 5
+fi
+if [ -n "$DEMO_FILTER_CHAIN" ] && ! printf '%s\n' "$filter_state" | grep -q 'pass_count=[1-9]'; then
+  echo "touch_demo_test_error=filter_not_applied chain=$DEMO_FILTER_CHAIN"
+  exit 5
+fi
 
 demo_bin="$ROOT_DIR/target/release/dsapi_touch_demo"
 if [ ! -x "$demo_bin" ]; then
