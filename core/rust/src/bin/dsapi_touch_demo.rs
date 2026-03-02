@@ -143,6 +143,10 @@ struct ShmSubmitClient {
     data_socket_path: String,
     stream: UnixStream,
     mapping: BoundMapping,
+    submit_cmd_cache: Vec<u8>,
+    submit_cmd_width: u32,
+    submit_cmd_height: u32,
+    submit_cmd_len: usize,
 }
 
 impl ShmSubmitClient {
@@ -157,56 +161,52 @@ impl ShmSubmitClient {
             data_socket_path: data_socket_path.to_string(),
             stream,
             mapping,
+            submit_cmd_cache: Vec::new(),
+            submit_cmd_width: 0,
+            submit_cmd_height: 0,
+            submit_cmd_len: 0,
         })
     }
 
-    fn submit_frame(&mut self, width: u32, height: u32, rgba: &[u8]) -> io::Result<()> {
+    fn frame_buffer_mut(&mut self, width: u32, height: u32) -> io::Result<&mut [u8]> {
         let expected_len = frame_byte_len(width, height)?;
-        if expected_len != rgba.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "rgba_length_mismatch expected={} actual={}",
-                    expected_len,
-                    rgba.len()
-                ),
-            ));
-        }
-
-        if rgba.len() > self.mapping.capacity {
-            // 旧连接可能绑定了历史尺寸的 SHM，重连后重新绑定一次。
-            self.reconnect()?;
-        }
-        if rgba.len() > self.mapping.capacity {
-            return Err(io::Error::other(format!(
-                "bound_shm_capacity_too_small capacity={} frame_len={} reconnect=1",
-                self.mapping.capacity,
-                rgba.len()
-            )));
-        }
-
+        self.ensure_mapping_capacity(expected_len)?;
         let begin = self.mapping.data_offset;
         let end = begin
-            .checked_add(rgba.len())
+            .checked_add(expected_len)
             .ok_or_else(|| io::Error::other("submit_offset_overflow"))?;
         if end > self.mapping.len {
             return Err(io::Error::other("submit_out_of_bound_mapping"));
         }
+        Ok(&mut self.mapping.as_mut_slice()[begin..end])
+    }
 
-        self.mapping.as_mut_slice()[begin..end].copy_from_slice(rgba);
-
-        let cmd = format!(
-            "RENDER_FRAME_SUBMIT_SHM {} {} {} {}\n",
-            width,
-            height,
-            rgba.len(),
-            self.mapping.data_offset
-        );
-        self.stream.write_all(cmd.as_bytes())?;
-        self.stream.flush()?;
-        let line = read_line(&mut self.stream, 4096)?;
+    fn submit_rendered_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        byte_len: usize,
+    ) -> io::Result<()> {
+        self.ensure_mapping_capacity(byte_len)?;
+        self.ensure_submit_cmd(width, height, byte_len);
+        self.stream.write_all(&self.submit_cmd_cache)?;
+        let line = read_line_fast(&mut self.stream, 4096)?;
         if !line.starts_with("OK") {
             return Err(io::Error::other(format!("submit_failed response={}", line)));
+        }
+        Ok(())
+    }
+
+    fn ensure_mapping_capacity(&mut self, byte_len: usize) -> io::Result<()> {
+        if byte_len > self.mapping.capacity {
+            // 旧连接可能绑定了历史尺寸的 SHM，重连后重新绑定一次。
+            self.reconnect()?;
+        }
+        if byte_len > self.mapping.capacity {
+            return Err(io::Error::other(format!(
+                "bound_shm_capacity_too_small capacity={} frame_len={} reconnect=1",
+                self.mapping.capacity, byte_len
+            )));
         }
         Ok(())
     }
@@ -220,7 +220,30 @@ impl ShmSubmitClient {
         let mapping = bind_mapping(&new_stream)?;
         self.stream = new_stream;
         self.mapping = mapping;
+        self.submit_cmd_cache.clear();
+        self.submit_cmd_width = 0;
+        self.submit_cmd_height = 0;
+        self.submit_cmd_len = 0;
         Ok(())
+    }
+
+    fn ensure_submit_cmd(&mut self, width: u32, height: u32, byte_len: usize) {
+        if self.submit_cmd_width == width
+            && self.submit_cmd_height == height
+            && self.submit_cmd_len == byte_len
+            && !self.submit_cmd_cache.is_empty()
+        {
+            return;
+        }
+
+        self.submit_cmd_cache = format!(
+            "RENDER_FRAME_SUBMIT_SHM {} {} {} {}\n",
+            width, height, byte_len, self.mapping.data_offset
+        )
+        .into_bytes();
+        self.submit_cmd_width = width;
+        self.submit_cmd_height = height;
+        self.submit_cmd_len = byte_len;
     }
 }
 
@@ -344,11 +367,11 @@ fn recv_line_with_optional_fd(
     }
 }
 
-fn read_line(stream: &mut UnixStream, max_len: usize) -> io::Result<String> {
+fn read_line_fast(stream: &mut UnixStream, max_len: usize) -> io::Result<String> {
     let mut out: Vec<u8> = Vec::with_capacity(128);
-    let mut byte = [0u8; 1];
+    let mut chunk = [0u8; 256];
     loop {
-        let n = stream.read(&mut byte)?;
+        let n = stream.read(&mut chunk)?;
         if n == 0 {
             if out.is_empty() {
                 return Err(io::Error::new(
@@ -358,14 +381,16 @@ fn read_line(stream: &mut UnixStream, max_len: usize) -> io::Result<String> {
             }
             break;
         }
-        if byte[0] == b'\n' {
-            break;
-        }
-        if byte[0] != b'\r' {
-            out.push(byte[0]);
-        }
-        if out.len() > max_len {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "line_too_long"));
+        for b in &chunk[..n] {
+            if *b == b'\n' {
+                return Ok(String::from_utf8_lossy(&out).trim().to_string());
+            }
+            if *b != b'\r' {
+                out.push(*b);
+            }
+            if out.len() > max_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "line_too_long"));
+            }
         }
     }
     Ok(String::from_utf8_lossy(&out).trim().to_string())
@@ -445,7 +470,7 @@ fn usage() {
     eprintln!("  --data-socket <path>      daemon data socket");
     eprintln!("  --device <event_path>     touch input device path");
     eprintln!("  --route-name <name>       touch route name (default: demo-window)");
-    eprintln!("  --fps <n>                 render fps cap (default: 60)");
+    eprintln!("  --fps <n>                 render fps cap, 0 means auto by refresh rate");
     eprintln!("  --run-seconds <n>         auto stop after n seconds");
     eprintln!("  --window-x <n>            initial window x");
     eprintln!("  --window-y <n>            initial window y");
@@ -479,7 +504,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut data_socket: Option<String> = env_non_empty("DSAPI_DATA_SOCKET_PATH");
     let mut device_path: Option<String> = None;
     let mut route_name = "demo-window".to_string();
-    let mut fps = 60.0f32;
+    let mut fps = 0.0f32;
     let mut run_seconds: Option<f32> = None;
     let mut no_touch_router = false;
     let mut quiet = false;
@@ -581,8 +606,8 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     if route_name.trim().is_empty() {
         return Err("route_name_empty".to_string());
     }
-    if !fps.is_finite() || fps <= 1.0 {
-        return Err("fps_must_be_gt_1".to_string());
+    if !fps.is_finite() || fps < 0.0 || (fps > 0.0 && fps <= 1.0) {
+        return Err("fps_must_be_zero_or_gt_1".to_string());
     }
     if let Some(v) = run_seconds {
         if !v.is_finite() || v <= 0.0 {
@@ -820,6 +845,20 @@ impl FpsCounter {
     }
 }
 
+fn resolve_target_fps(user_fps: f32, refresh_hz: f32) -> f32 {
+    if user_fps > 1.0 {
+        return user_fps;
+    }
+    if refresh_hz.is_finite() && refresh_hz > 1.0 {
+        return refresh_hz.clamp(30.0, 144.0);
+    }
+    60.0
+}
+
+fn frame_interval_from_fps(fps: f32) -> Duration {
+    Duration::from_secs_f64((1.0f32 / fps.max(1.0)) as f64)
+}
+
 fn spawn_display_watch(
     control_socket: String,
     quiet: bool,
@@ -1019,12 +1058,7 @@ fn main() {
         }
     };
 
-    let mut frame = vec![0u8; frame_byte_len(display.width, display.height).unwrap_or(0)];
-    if frame.is_empty() {
-        eprintln!("touch_demo_error=frame_allocation_failed");
-        std::process::exit(8);
-    }
-
+    let mut target_fps = resolve_target_fps(cfg.fps, display.refresh_hz);
     if !cfg.quiet {
         eprintln!(
             "touch_demo_status=running display={}x{}@{:.2} dpi={} rotation={} target_fps={:.1}",
@@ -1033,14 +1067,15 @@ fn main() {
             display.refresh_hz,
             display.density_dpi,
             display.rotation,
-            cfg.fps
+            target_fps
         );
         eprintln!("touch_demo_hint=drag_title resize_bottom_right tap_close_button");
     }
 
     let mut fps_counter = FpsCounter::new();
-    let frame_interval = Duration::from_secs_f64((1.0f32 / cfg.fps.max(1.0)) as f64);
+    let mut frame_interval = frame_interval_from_fps(target_fps);
     let started_at = Instant::now();
+    let mut last_perf_log = Instant::now();
 
     while state.running {
         if let Some(limit_s) = cfg.run_seconds {
@@ -1064,8 +1099,9 @@ fn main() {
             {
                 display = next;
                 state.window.clamp_to_display(display, ui_metrics(display));
-                if let Ok(new_len) = frame_byte_len(display.width, display.height) {
-                    frame.resize(new_len, 0);
+                if cfg.fps <= 1.0 {
+                    target_fps = resolve_target_fps(cfg.fps, display.refresh_hz);
+                    frame_interval = frame_interval_from_fps(target_fps);
                 }
                 if let Some(handle) = touch_handle.as_ref() {
                     let _ = handle.update_display_transform(
@@ -1090,14 +1126,36 @@ fn main() {
         let fps = fps_counter.on_frame();
         let blocked = route_blocked_down.load(Ordering::Relaxed);
         let passed = route_passed_down.load(Ordering::Relaxed);
-        render_scene(&mut frame, display, &state, fps, blocked, passed);
+        let frame_len = match frame_byte_len(display.width, display.height) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("touch_demo_error=frame_size_invalid err={}", e);
+                break;
+            }
+        };
+        let frame_buf = match submitter.frame_buffer_mut(display.width, display.height) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("touch_demo_error=frame_buffer_failed err={}", e);
+                break;
+            }
+        };
+        render_scene(frame_buf, display, &state, fps, blocked, passed);
 
-        if let Err(e) = submitter.submit_frame(display.width, display.height, &frame) {
+        if let Err(e) = submitter.submit_rendered_frame(display.width, display.height, frame_len) {
             eprintln!("touch_demo_error=submit_frame_failed err={}", e);
             break;
         }
 
         let elapsed = frame_started.elapsed();
+        if !cfg.quiet && last_perf_log.elapsed() >= Duration::from_secs(1) {
+            let frame_ms = elapsed.as_secs_f64() * 1000.0;
+            eprintln!(
+                "touch_demo_perf fps={:.1} target_fps={:.1} frame_ms={:.2} blocked={} passed={}",
+                fps, target_fps, frame_ms, blocked, passed
+            );
+            last_perf_log = Instant::now();
+        }
         if elapsed < frame_interval {
             thread::sleep(frame_interval - elapsed);
         }

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs::{create_dir_all, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,7 +381,7 @@ impl RuntimeEngine {
 
         self.apply_filter_pipeline(width, height, &mut pixels_rgba8)?;
 
-        let checksum = fnv1a32(&pixels_rgba8);
+        let checksum = compute_render_checksum(&pixels_rgba8);
         let pixels_rgba8: Arc<[u8]> = pixels_rgba8.into();
 
         let info = {
@@ -685,6 +685,25 @@ fn fnv1a32(data: &[u8]) -> u32 {
         hash = hash.wrapping_mul(0x01000193u32);
     }
     hash
+}
+
+fn render_checksum_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let raw = std::env::var("DSAPI_RENDER_FRAME_CHECKSUM").unwrap_or_else(|_| "1".to_string());
+        !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+fn compute_render_checksum(data: &[u8]) -> u32 {
+    if render_checksum_enabled() {
+        fnv1a32(data)
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
