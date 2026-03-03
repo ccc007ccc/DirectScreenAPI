@@ -41,6 +41,7 @@ public final class AndroidAdapterMain {
         System.out.println("usage:");
         System.out.println("  AndroidAdapterMain display-kv");
         System.out.println("  AndroidAdapterMain display-line");
+        System.out.println("  AndroidAdapterMain blur-probe");
         System.out.println("  AndroidAdapterMain present-loop [control_socket_path] [data_socket_path] [poll_ms] [z_layer] [layer_name] [blur_radius] [blur_sigma] [filter_chain] [frame_rate]");
         System.out.println("  AndroidAdapterMain screen-stream [control_socket_path] [data_socket_path] [target_fps]");
     }
@@ -67,6 +68,143 @@ public final class AndroidAdapterMain {
         ));
     }
 
+    private static boolean hasMethodByArity(Class<?> clazz, String name, int arity) {
+        try {
+            ReflectBridge.findMethodByArity(clazz, name, arity);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean readSystemPropertyBoolean(String key, boolean fallback) {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            Object v = ReflectBridge.invokeStatic(sp, "getBoolean", key, Boolean.valueOf(fallback));
+            if (v instanceof Boolean) {
+                return ((Boolean) v).booleanValue();
+            }
+        } catch (Throwable ignored) {
+        }
+        return fallback;
+    }
+
+    private static String readSystemPropertyString(String key, String fallback) {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            Object v = ReflectBridge.invokeStatic(sp, "get", key, fallback);
+            if (v instanceof String) {
+                return (String) v;
+            }
+        } catch (Throwable ignored) {
+        }
+        return fallback;
+    }
+
+    private static int readDisableWindowBlursSetting() {
+        try {
+            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
+            Object app = ReflectBridge.invokeStatic(activityThreadClass, "currentApplication");
+            if (app == null) return -1;
+
+            Object resolver = ReflectBridge.invoke(app, "getContentResolver");
+            Class<?> settingsGlobalClass = Class.forName("android.provider.Settings$Global");
+            Object value = ReflectBridge.invokeStatic(
+                    settingsGlobalClass,
+                    "getInt",
+                    resolver,
+                    "disable_window_blurs",
+                    Integer.valueOf(0)
+            );
+            if (value instanceof Integer) {
+                return ((Integer) value).intValue();
+            }
+        } catch (Throwable ignored) {
+        }
+        return -1;
+    }
+
+    private static int readBlurRadiusLimit() {
+        try {
+            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
+            Object app = ReflectBridge.invokeStatic(activityThreadClass, "currentApplication");
+            if (app == null) return -1;
+
+            Object resolver = ReflectBridge.invoke(app, "getContentResolver");
+            Class<?> settingsGlobalClass = Class.forName("android.provider.Settings$Global");
+            Object value = ReflectBridge.invokeStatic(
+                    settingsGlobalClass,
+                    "getInt",
+                    resolver,
+                    "window_blur_radius",
+                    Integer.valueOf(-1)
+            );
+            if (value instanceof Integer) {
+                return ((Integer) value).intValue();
+            }
+        } catch (Throwable ignored) {
+        }
+        return -1;
+    }
+
+    private static int readCrossWindowBlurEnabled() {
+        try {
+            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
+            Object app = ReflectBridge.invokeStatic(activityThreadClass, "currentApplication");
+            if (app == null) return -1;
+
+            Object wm = ReflectBridge.invoke(app, "getSystemService", "window");
+            if (wm == null) return -1;
+            Object enabled = ReflectBridge.invoke(wm, "isCrossWindowBlurEnabled");
+            if (enabled instanceof Boolean) {
+                return ((Boolean) enabled).booleanValue() ? 1 : 0;
+            }
+        } catch (Throwable ignored) {
+        }
+        return -1;
+    }
+
+    private static void printBlurProbe() {
+        boolean txHasBackgroundBlur = false;
+        boolean txHasBlurRegion = false;
+        boolean builderHasEffectLayer = false;
+        boolean builderHasColorLayer = false;
+        try {
+            Class<?> txClass = Class.forName("android.view.SurfaceControl$Transaction");
+            txHasBackgroundBlur = hasMethodByArity(txClass, "setBackgroundBlurRadius", 2);
+            txHasBlurRegion = hasMethodByArity(txClass, "setBlurRegions", 2);
+        } catch (Throwable ignored) {
+        }
+        try {
+            Class<?> builderClass = Class.forName("android.view.SurfaceControl$Builder");
+            builderHasEffectLayer = hasMethodByArity(builderClass, "setEffectLayer", 0);
+            builderHasColorLayer = hasMethodByArity(builderClass, "setColorLayer", 0);
+        } catch (Throwable ignored) {
+        }
+
+        boolean sfSupportsBackgroundBlur = readSystemPropertyBoolean(
+                "ro.surface_flinger.supports_background_blur",
+                false
+        );
+        String sfDisableBlurs = readSystemPropertyString("persist.sys.sf.disable_blurs", "");
+        int disableWindowBlurs = readDisableWindowBlursSetting();
+        int crossWindowBlurEnabled = readCrossWindowBlurEnabled();
+        int windowBlurRadius = readBlurRadiusLimit();
+
+        System.out.println(
+                "blur_probe "
+                        + "tx_background_blur=" + (txHasBackgroundBlur ? 1 : 0)
+                        + " tx_blur_regions=" + (txHasBlurRegion ? 1 : 0)
+                        + " builder_effect_layer=" + (builderHasEffectLayer ? 1 : 0)
+                        + " builder_color_layer=" + (builderHasColorLayer ? 1 : 0)
+                        + " sf_supports_background_blur=" + (sfSupportsBackgroundBlur ? 1 : 0)
+                        + " sf_disable_blurs=" + (sfDisableBlurs.isEmpty() ? "<empty>" : sfDisableBlurs)
+                        + " setting_disable_window_blurs=" + disableWindowBlurs
+                        + " wm_cross_window_blur_enabled=" + crossWindowBlurEnabled
+                        + " setting_window_blur_radius=" + windowBlurRadius
+        );
+    }
+
     public static void main(String[] args) {
         if (args.length < 1) {
             usage();
@@ -83,6 +221,10 @@ public final class AndroidAdapterMain {
         }
         if ("display-line".equals(cmd)) {
             printDisplayLine(snapshot);
+            return;
+        }
+        if ("blur-probe".equals(cmd)) {
+            printBlurProbe();
             return;
         }
         if ("present-loop".equals(cmd)) {

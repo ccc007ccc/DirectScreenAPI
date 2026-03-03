@@ -128,7 +128,7 @@ final class RgbaFramePresenter {
         this.displaySyncFallbackIntervalMs = resolveDisplaySyncFallbackIntervalMs();
         this.zLayer = zLayer;
         this.layerName = layerName;
-        this.layerBlurRadius = 0;
+        this.layerBlurRadius = Math.max(0, blurRadius);
         FrameRatePolicy frameRatePolicy = parseFrameRatePolicy(frameRateSpec);
         this.frameRateModeLabel = frameRatePolicy.modeLabel;
         this.forcedFrameRateHz = frameRatePolicy.forcedHz;
