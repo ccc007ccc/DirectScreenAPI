@@ -7,6 +7,7 @@ final class SurfaceLayerSession {
     private final Object surfaceControl;
     private final Object surface;
     private final Class<?> transactionClass;
+    private final Constructor<?> rectConstructor;
     private final Method lockCanvasMethod;
     private final Method lockHardwareCanvasMethod;
     private final Method unlockCanvasAndPostMethod;
@@ -15,6 +16,7 @@ final class SurfaceLayerSession {
             Object surfaceControl,
             Object surface,
             Class<?> transactionClass,
+            Constructor<?> rectConstructor,
             Method lockCanvasMethod,
             Method lockHardwareCanvasMethod,
             Method unlockCanvasAndPostMethod
@@ -22,13 +24,14 @@ final class SurfaceLayerSession {
         this.surfaceControl = surfaceControl;
         this.surface = surface;
         this.transactionClass = transactionClass;
+        this.rectConstructor = rectConstructor;
         this.lockCanvasMethod = lockCanvasMethod;
         this.lockHardwareCanvasMethod = lockHardwareCanvasMethod;
         this.unlockCanvasAndPostMethod = unlockCanvasAndPostMethod;
     }
 
     static SurfaceLayerSession create(int width, int height, int zLayer, String layerName) throws Exception {
-        return create(width, height, zLayer, layerName, true);
+        return create(width, height, zLayer, layerName, true, 0, 0.0f);
     }
 
     static SurfaceLayerSession create(
@@ -38,11 +41,40 @@ final class SurfaceLayerSession {
             String layerName,
             boolean visible
     ) throws Exception {
+        return create(width, height, zLayer, layerName, visible, 0, 0.0f);
+    }
+
+    static SurfaceLayerSession create(
+            int width,
+            int height,
+            int zLayer,
+            String layerName,
+            boolean visible,
+            int blurRadius
+    ) throws Exception {
+        return create(width, height, zLayer, layerName, visible, blurRadius, 0.0f);
+    }
+
+    static SurfaceLayerSession create(
+            int width,
+            int height,
+            int zLayer,
+            String layerName,
+            boolean visible,
+            int blurRadius,
+            float frameRateHz
+    ) throws Exception {
         Class<?> builderClass = Class.forName("android.view.SurfaceControl$Builder");
         Class<?> transactionClass = Class.forName("android.view.SurfaceControl$Transaction");
         Class<?> rectClass = Class.forName("android.graphics.Rect");
         Class<?> surfaceClass = Class.forName("android.view.Surface");
         Class<?> surfaceControlClass = Class.forName("android.view.SurfaceControl");
+        Constructor<?> rectConstructor = rectClass.getDeclaredConstructor(
+                int.class,
+                int.class,
+                int.class,
+                int.class
+        );
 
         Object sc = null;
         Object txShow = null;
@@ -63,12 +95,18 @@ final class SurfaceLayerSession {
             txShow = transactionClass.getDeclaredConstructor().newInstance();
             ReflectBridge.invoke(txShow, "setLayer", sc, Integer.valueOf(zLayer));
             ReflectBridge.invoke(txShow, "setPosition", sc, Float.valueOf(0f), Float.valueOf(0f));
-            Object fullRect = rectClass.getDeclaredConstructor(int.class, int.class, int.class, int.class)
-                    .newInstance(0, 0, width, height);
+            Object fullRect = rectConstructor.newInstance(0, 0, width, height);
             ReflectBridge.invoke(txShow, "setWindowCrop", sc, fullRect);
+            trySetFrameRate(txShow, sc, frameRateHz);
             try {
                 ReflectBridge.invoke(txShow, "setTrustedOverlay", sc, Boolean.TRUE);
             } catch (Throwable ignored) {
+            }
+            if (blurRadius > 0) {
+                try {
+                    ReflectBridge.invoke(txShow, "setBackgroundBlurRadius", sc, Integer.valueOf(blurRadius));
+                } catch (Throwable ignored) {
+                }
             }
             if (visible) {
                 ReflectBridge.invoke(txShow, "show", sc);
@@ -90,6 +128,7 @@ final class SurfaceLayerSession {
                     sc,
                     surface,
                     transactionClass,
+                    rectConstructor,
                     lockCanvas,
                     lockHardwareCanvas,
                     unlockCanvasAndPost
@@ -110,11 +149,80 @@ final class SurfaceLayerSession {
         ReflectBridge.invoke(tx, "close");
     }
 
+    void setBackgroundBlurRadius(int blurRadius) throws Exception {
+        int safeRadius = Math.max(0, blurRadius);
+        Object tx = transactionClass.getDeclaredConstructor().newInstance();
+        try {
+            ReflectBridge.invoke(tx, "setBackgroundBlurRadius", surfaceControl, Integer.valueOf(safeRadius));
+            ReflectBridge.invoke(tx, "apply");
+        } finally {
+            try {
+                ReflectBridge.invoke(tx, "close");
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    void setWindowCrop(int left, int top, int width, int height) throws Exception {
+        int safeLeft = Math.max(0, left);
+        int safeTop = Math.max(0, top);
+        int safeWidth = Math.max(1, width);
+        int safeHeight = Math.max(1, height);
+        Object crop = rectConstructor.newInstance(
+                safeLeft,
+                safeTop,
+                safeLeft + safeWidth,
+                safeTop + safeHeight
+        );
+        Object tx = transactionClass.getDeclaredConstructor().newInstance();
+        try {
+            ReflectBridge.invoke(tx, "setWindowCrop", surfaceControl, crop);
+            ReflectBridge.invoke(tx, "apply");
+        } finally {
+            try {
+                ReflectBridge.invoke(tx, "close");
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    void setPosition(float x, float y) throws Exception {
+        Object tx = transactionClass.getDeclaredConstructor().newInstance();
+        try {
+            ReflectBridge.invoke(tx, "setPosition", surfaceControl, Float.valueOf(x), Float.valueOf(y));
+            ReflectBridge.invoke(tx, "apply");
+        } finally {
+            try {
+                ReflectBridge.invoke(tx, "close");
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    void setFrameRate(float frameRateHz) throws Exception {
+        Object tx = transactionClass.getDeclaredConstructor().newInstance();
+        try {
+            trySetFrameRate(tx, surfaceControl, frameRateHz);
+            ReflectBridge.invoke(tx, "apply");
+        } finally {
+            try {
+                ReflectBridge.invoke(tx, "close");
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
     Object lockFrame() throws Exception {
+        if (lockCanvasMethod != null) {
+            try {
+                return lockCanvasMethod.invoke(surface, new Object[]{null});
+            } catch (Throwable ignored) {
+            }
+        }
         if (lockHardwareCanvasMethod != null) {
             return lockHardwareCanvasMethod.invoke(surface);
         }
-        return lockCanvasMethod.invoke(surface, new Object[]{null});
+        throw new IllegalStateException("surface_lock_canvas_unavailable");
     }
 
     void unlockFrame(Object canvas) throws Exception {
@@ -200,6 +308,37 @@ final class SurfaceLayerSession {
         }
         try {
             ReflectBridge.invoke(surfaceControl, "release");
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void trySetFrameRate(Object tx, Object surfaceControl, float frameRateHz) {
+        if (tx == null || surfaceControl == null) {
+            return;
+        }
+        if (!Float.isFinite(frameRateHz) || frameRateHz <= 0.0f) {
+            return;
+        }
+        try {
+            ReflectBridge.invoke(
+                    tx,
+                    "setFrameRate",
+                    surfaceControl,
+                    Float.valueOf(frameRateHz),
+                    Integer.valueOf(1),
+                    Integer.valueOf(1)
+            );
+            return;
+        } catch (Throwable ignored) {
+        }
+        try {
+            ReflectBridge.invoke(
+                    tx,
+                    "setFrameRate",
+                    surfaceControl,
+                    Float.valueOf(frameRateHz),
+                    Integer.valueOf(1)
+            );
         } catch (Throwable ignored) {
         }
     }

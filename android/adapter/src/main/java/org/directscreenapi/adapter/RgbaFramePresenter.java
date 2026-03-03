@@ -1,6 +1,7 @@
 package org.directscreenapi.adapter;
 
 import java.nio.ByteBuffer;
+import java.nio.Buffer;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -10,6 +11,18 @@ import java.util.concurrent.atomic.AtomicBoolean;
 final class RgbaFramePresenter {
     private static final int DEFAULT_DISPLAY_SYNC_FALLBACK_INTERVAL_MS = 250;
     private static final String DISPLAY_SYNC_FALLBACK_PROPERTY = "dsapi.display_sync_fallback_ms";
+
+    private static final class FrameRatePolicy {
+        final String modeLabel;
+        final float forcedHz;
+        final boolean autoMax;
+
+        FrameRatePolicy(String modeLabel, float forcedHz, boolean autoMax) {
+            this.modeLabel = modeLabel;
+            this.forcedHz = forcedHz;
+            this.autoMax = autoMax;
+        }
+    }
 
     private static final class DisplayListenerInvocationHandler implements InvocationHandler {
         private final AtomicBoolean dirtyFlag;
@@ -45,6 +58,10 @@ final class RgbaFramePresenter {
     private final int pollMs;
     private final int displaySyncFallbackIntervalMs;
     private final int zLayer;
+    private final int layerBlurRadius;
+    private final String frameRateModeLabel;
+    private final float forcedFrameRateHz;
+    private final boolean autoMaxFrameRate;
     private final String layerName;
     private final String startupFilterCommand;
     private final AtomicBoolean shutdownOnce = new AtomicBoolean(false);
@@ -55,7 +72,12 @@ final class RgbaFramePresenter {
     private long perfWindowStartMs = 0L;
     private int perfFrames = 0;
     private long perfBytes = 0L;
+    private float latestDisplayRefreshHz = 60.0f;
     private final AtomicBoolean displayDirty = new AtomicBoolean(true);
+    private int surfacePosX = Integer.MIN_VALUE;
+    private int surfacePosY = Integer.MIN_VALUE;
+    private int pendingSurfacePosX = Integer.MIN_VALUE;
+    private int pendingSurfacePosY = Integer.MIN_VALUE;
 
     private SurfaceLayerSession surfaceSession;
     private int surfaceWidth = 0;
@@ -81,6 +103,10 @@ final class RgbaFramePresenter {
     private final Class<?> paintClass;
     private final Class<?> porterDuffModeClass;
     private final Class<?> porterDuffXfermodeClass;
+    private final Method bitmapCreateBitmapMethod;
+    private final Method bitmapCopyPixelsFromBufferMethod;
+    private final Method bitmapRecycleMethod;
+    private final Method canvasDrawBitmapMethod;
     private final Object modeSrc;
     private final Object xferSrc;
     private final Object paint;
@@ -93,7 +119,8 @@ final class RgbaFramePresenter {
             String layerName,
             int blurRadius,
             float blurSigma,
-            String filterChainSpec
+            String filterChainSpec,
+            String frameRateSpec
     ) throws Exception {
         this.daemon = new DaemonSession(controlSocketPath, dataSocketPath);
         this.displayAdapter = new AndroidDisplayAdapter();
@@ -101,27 +128,45 @@ final class RgbaFramePresenter {
         this.displaySyncFallbackIntervalMs = resolveDisplaySyncFallbackIntervalMs();
         this.zLayer = zLayer;
         this.layerName = layerName;
-        int safeBlurRadius = Math.max(0, blurRadius);
+        this.layerBlurRadius = 0;
+        FrameRatePolicy frameRatePolicy = parseFrameRatePolicy(frameRateSpec);
+        this.frameRateModeLabel = frameRatePolicy.modeLabel;
+        this.forcedFrameRateHz = frameRatePolicy.forcedHz;
+        this.autoMaxFrameRate = frameRatePolicy.autoMax;
         String safeFilterChainSpec = filterChainSpec == null ? "" : filterChainSpec.trim();
-        this.startupFilterCommand = resolveStartupFilterCommand(
-                safeBlurRadius,
-                blurSigma,
-                safeFilterChainSpec
-        );
+        this.startupFilterCommand = resolveStartupFilterCommand(safeFilterChainSpec);
 
         this.bitmapClass = Class.forName("android.graphics.Bitmap");
         this.bitmapConfigClass = Class.forName("android.graphics.Bitmap$Config");
         this.bitmapArgb8888 = bitmapConfigClass.getField("ARGB_8888").get(null);
         this.rectClass = Class.forName("android.graphics.Rect");
         this.paintClass = Class.forName("android.graphics.Paint");
+        Class<?> canvasClass = Class.forName("android.graphics.Canvas");
+        Class<?> xfermodeClass = Class.forName("android.graphics.Xfermode");
         this.porterDuffModeClass = Class.forName("android.graphics.PorterDuff$Mode");
         this.porterDuffXfermodeClass = Class.forName("android.graphics.PorterDuffXfermode");
+        this.bitmapCreateBitmapMethod = bitmapClass.getMethod(
+                "createBitmap",
+                int.class,
+                int.class,
+                bitmapConfigClass
+        );
+        this.bitmapCopyPixelsFromBufferMethod = bitmapClass.getMethod("copyPixelsFromBuffer", Buffer.class);
+        this.bitmapRecycleMethod = bitmapClass.getMethod("recycle");
+        this.canvasDrawBitmapMethod = canvasClass.getMethod(
+                "drawBitmap",
+                bitmapClass,
+                rectClass,
+                rectClass,
+                paintClass
+        );
         this.modeSrc = porterDuffModeClass.getField("SRC").get(null);
         this.xferSrc = porterDuffXfermodeClass
                 .getDeclaredConstructor(porterDuffModeClass)
                 .newInstance(modeSrc);
         this.paint = paintClass.getDeclaredConstructor().newInstance();
-        ReflectBridge.invoke(this.paint, "setXfermode", xferSrc);
+        Method paintSetXfermodeMethod = paintClass.getMethod("setXfermode", xfermodeClass);
+        paintSetXfermodeMethod.invoke(this.paint, xferSrc);
 
         initDisplayListener();
         applyStartupFilter("constructor");
@@ -132,7 +177,16 @@ final class RgbaFramePresenter {
         try {
             applyStartupFilter("run_loop_start");
             syncDisplayAndEnsureSurface();
-            log("presenter_status=started poll_ms=" + pollMs + " z_layer=" + zLayer + " layer=" + layerName);
+            log("presenter_status=started poll_ms="
+                    + pollMs
+                    + " z_layer="
+                    + zLayer
+                    + " layer="
+                    + layerName
+                    + " frame_rate_mode="
+                    + frameRateModeLabel
+                    + " compositor_blur_radius="
+                    + layerBlurRadius);
 
             while (running && !Thread.currentThread().isInterrupted()) {
                 long now = System.currentTimeMillis();
@@ -163,7 +217,10 @@ final class RgbaFramePresenter {
                                 pendingDestRect,
                                 mappedFrame.rgba8,
                                 mappedFrame.width,
-                                mappedFrame.height
+                                mappedFrame.height,
+                                mappedFrame.originX,
+                                mappedFrame.originY,
+                                true
                         );
                         activatePendingSurface();
                         lastFrameSeq = mappedFrame.frameSeq;
@@ -171,9 +228,17 @@ final class RgbaFramePresenter {
                         continue;
                     }
 
-                    // 允许帧尺寸与 surface 不同，按目标层全屏缩放，支持低分辨率高帧率渲染。
-                    if (surfaceSession != null && destRect != null) {
-                        drawFrame(mappedFrame.width, mappedFrame.height, mappedFrame.rgba8);
+                    if (surfaceSession != null
+                            && destRect != null
+                            && mappedFrame.width == surfaceWidth
+                            && mappedFrame.height == surfaceHeight) {
+                        drawFrame(
+                                mappedFrame.width,
+                                mappedFrame.height,
+                                mappedFrame.rgba8,
+                                mappedFrame.originX,
+                                mappedFrame.originY
+                        );
                         lastFrameSeq = mappedFrame.frameSeq;
                         markFramePresented(mappedFrame.byteLen);
                         continue;
@@ -196,7 +261,7 @@ final class RgbaFramePresenter {
         running = false;
         if (bitmap != null) {
             try {
-                ReflectBridge.invoke(bitmap, "recycle");
+                bitmapRecycleMethod.invoke(bitmap);
             } catch (Throwable ignored) {
             }
             bitmap = null;
@@ -253,83 +318,67 @@ final class RgbaFramePresenter {
         DisplayAdapter.DisplaySnapshot snapshot = displayAdapter.queryDisplaySnapshot();
         int width = Math.max(1, snapshot.width);
         int height = Math.max(1, snapshot.height);
+        latestDisplayRefreshHz = resolveTargetFrameRateHz(snapshot);
         daemon.command(
                 "DISPLAY_SET "
                         + width + " "
                         + height + " "
-                        + String.format(java.util.Locale.US, "%.2f", snapshot.refreshHz) + " "
+                        + String.format(java.util.Locale.US, "%.2f", latestDisplayRefreshHz) + " "
                         + Math.max(1, snapshot.densityDpi) + " "
                         + Math.max(0, snapshot.rotation)
         );
-
-        if (surfaceSession == null) {
-            recreateSurface(width, height, snapshot.rotation);
-            pendingSurfaceWidth = 0;
-            pendingSurfaceHeight = 0;
-            pendingSurfaceRotation = 0;
-            pendingDestRect = null;
-            if (pendingSurfaceSession != null) {
-                pendingSurfaceSession.closeQuietly();
-                pendingSurfaceSession = null;
+        if (surfaceSession != null) {
+            try {
+                surfaceSession.setFrameRate(latestDisplayRefreshHz);
+            } catch (Throwable ignored) {
             }
-            return;
         }
-
-        if (surfaceWidth != width || surfaceHeight != height) {
-            if (pendingSurfaceWidth != width || pendingSurfaceHeight != height) {
-                if (pendingSurfaceSession != null) {
-                    pendingSurfaceSession.closeQuietly();
-                    pendingSurfaceSession = null;
-                }
-                pendingDestRect = null;
-                pendingSurfaceWidth = width;
-                pendingSurfaceHeight = height;
-                pendingSurfaceRotation = snapshot.rotation;
-                log("presenter_surface=pending_resize from="
-                        + surfaceWidth + "x" + surfaceHeight
-                        + " to=" + pendingSurfaceWidth + "x" + pendingSurfaceHeight
-                        + " rotation=" + pendingSurfaceRotation);
+        if (pendingSurfaceSession != null) {
+            try {
+                pendingSurfaceSession.setFrameRate(latestDisplayRefreshHz);
+            } catch (Throwable ignored) {
             }
         }
     }
 
     private void maybeSwitchSurfaceForFrame(int frameWidth, int frameHeight) throws Exception {
-        if (pendingSurfaceWidth <= 0 || pendingSurfaceHeight <= 0) {
+        if (frameWidth <= 0 || frameHeight <= 0) {
             return;
         }
-        if (frameWidth != pendingSurfaceWidth || frameHeight != pendingSurfaceHeight) {
+        if (surfaceSession != null && frameWidth == surfaceWidth && frameHeight == surfaceHeight) {
             return;
         }
-        if (pendingSurfaceSession == null) {
-            pendingSurfaceSession = SurfaceLayerSession.create(
-                    pendingSurfaceWidth,
-                    pendingSurfaceHeight,
-                    zLayer,
-                    layerName,
-                    false
-            );
-            pendingDestRect = rectClass
-                    .getDeclaredConstructor(int.class, int.class, int.class, int.class)
-                    .newInstance(0, 0, pendingSurfaceWidth, pendingSurfaceHeight);
+        if (pendingSurfaceSession != null
+                && frameWidth == pendingSurfaceWidth
+                && frameHeight == pendingSurfaceHeight) {
+            return;
         }
-    }
-
-    private void recreateSurface(int width, int height, int rotation) throws Exception {
-        SurfaceLayerSession newSession = SurfaceLayerSession.create(width, height, zLayer, layerName);
-        Object newRect = rectClass
+        if (pendingSurfaceSession != null) {
+            pendingSurfaceSession.closeQuietly();
+            pendingSurfaceSession = null;
+        }
+        pendingDestRect = null;
+        pendingSurfaceWidth = frameWidth;
+        pendingSurfaceHeight = frameHeight;
+        pendingSurfaceRotation = 0;
+        pendingSurfacePosX = Integer.MIN_VALUE;
+        pendingSurfacePosY = Integer.MIN_VALUE;
+        pendingSurfaceSession = SurfaceLayerSession.create(
+                pendingSurfaceWidth,
+                pendingSurfaceHeight,
+                zLayer,
+                layerName,
+                false,
+                layerBlurRadius,
+                latestDisplayRefreshHz
+        );
+        pendingDestRect = rectClass
                 .getDeclaredConstructor(int.class, int.class, int.class, int.class)
-                .newInstance(0, 0, width, height);
-
-        SurfaceLayerSession oldSession = surfaceSession;
-        surfaceSession = newSession;
-        surfaceWidth = width;
-        surfaceHeight = height;
-        destRect = newRect;
-
-        if (oldSession != null) {
-            oldSession.closeQuietly();
-        }
-        log("presenter_surface=recreated size=" + surfaceWidth + "x" + surfaceHeight + " rotation=" + rotation);
+                .newInstance(0, 0, pendingSurfaceWidth, pendingSurfaceHeight);
+        log("presenter_surface=pending_resize from="
+                + surfaceWidth + "x" + surfaceHeight
+                + " to=" + pendingSurfaceWidth + "x" + pendingSurfaceHeight
+                + " rotation=0");
     }
 
     private void activatePendingSurface() throws Exception {
@@ -343,33 +392,73 @@ final class RgbaFramePresenter {
         surfaceWidth = pendingSurfaceWidth;
         surfaceHeight = pendingSurfaceHeight;
         destRect = pendingDestRect;
+        surfacePosX = pendingSurfacePosX;
+        surfacePosY = pendingSurfacePosY;
 
         pendingSurfaceSession = null;
         pendingDestRect = null;
         pendingSurfaceWidth = 0;
         pendingSurfaceHeight = 0;
         pendingSurfaceRotation = 0;
+        pendingSurfacePosX = Integer.MIN_VALUE;
+        pendingSurfacePosY = Integer.MIN_VALUE;
 
         if (oldSession != null) {
             oldSession.closeQuietly();
         }
     }
 
-    private void drawFrameToTarget(SurfaceLayerSession targetSession, Object targetRect, ByteBuffer rgba, int frameWidth, int frameHeight) throws Exception {
+    private void drawFrameToTarget(
+            SurfaceLayerSession targetSession,
+            Object targetRect,
+            ByteBuffer rgba,
+            int frameWidth,
+            int frameHeight,
+            int originX,
+            int originY,
+            boolean pendingTarget
+    ) throws Exception {
+        updateSurfacePosition(targetSession, originX, originY, pendingTarget);
         ensureBitmap(frameWidth, frameHeight);
         rgba.position(0);
-        ReflectBridge.invoke(bitmap, "copyPixelsFromBuffer", rgba);
+        bitmapCopyPixelsFromBufferMethod.invoke(bitmap, rgba);
 
         Object canvas = targetSession.lockFrame();
         try {
-            ReflectBridge.invoke(canvas, "drawBitmap", bitmap, null, targetRect, paint);
+            canvasDrawBitmapMethod.invoke(canvas, bitmap, null, targetRect, paint);
         } finally {
             targetSession.unlockFrame(canvas);
         }
     }
 
-    private void drawFrame(int frameWidth, int frameHeight, ByteBuffer rgba) throws Exception {
-        drawFrameToTarget(surfaceSession, destRect, rgba, frameWidth, frameHeight);
+    private void drawFrame(int frameWidth, int frameHeight, ByteBuffer rgba, int originX, int originY) throws Exception {
+        drawFrameToTarget(surfaceSession, destRect, rgba, frameWidth, frameHeight, originX, originY, false);
+    }
+
+    private void updateSurfacePosition(
+            SurfaceLayerSession targetSession,
+            int originX,
+            int originY,
+            boolean pendingTarget
+    ) throws Exception {
+        if (targetSession == null) {
+            return;
+        }
+        if (pendingTarget) {
+            if (pendingSurfacePosX == originX && pendingSurfacePosY == originY) {
+                return;
+            }
+            targetSession.setPosition((float) originX, (float) originY);
+            pendingSurfacePosX = originX;
+            pendingSurfacePosY = originY;
+            return;
+        }
+        if (surfacePosX == originX && surfacePosY == originY) {
+            return;
+        }
+        targetSession.setPosition((float) originX, (float) originY);
+        surfacePosX = originX;
+        surfacePosY = originY;
     }
 
     private void initDisplayListener() {
@@ -455,18 +544,75 @@ final class RgbaFramePresenter {
         return value;
     }
 
-    private static String resolveStartupFilterCommand(int blurRadius, float blurSigma, String filterChainSpec) {
+    private static FrameRatePolicy parseFrameRatePolicy(String specRaw) {
+        String spec = specRaw == null ? "" : specRaw.trim();
+        if (spec.isEmpty()) {
+            return new FrameRatePolicy("auto_max", 0.0f, true);
+        }
+
+        String normalized = spec.toLowerCase(Locale.US);
+        if ("auto".equals(normalized)
+                || "max".equals(normalized)
+                || "upper".equals(normalized)
+                || "auto_max".equals(normalized)
+                || "auto-max".equals(normalized)) {
+            return new FrameRatePolicy("auto_max", 0.0f, true);
+        }
+        if ("current".equals(normalized)
+                || "display".equals(normalized)
+                || "display_current".equals(normalized)
+                || "display-current".equals(normalized)) {
+            return new FrameRatePolicy("display_current", 0.0f, false);
+        }
+
+        try {
+            float hz = Float.parseFloat(spec);
+            if (!Float.isFinite(hz) || hz <= 0.0f) {
+                throw new IllegalArgumentException("invalid_hz");
+            }
+            return new FrameRatePolicy(
+                    String.format(Locale.US, "forced_%.2f", hz),
+                    hz,
+                    false
+            );
+        } catch (Throwable t) {
+            log("presenter_warn=frame_rate_spec_invalid spec=" + spec + " fallback=auto_max");
+            return new FrameRatePolicy("auto_max", 0.0f, true);
+        }
+    }
+
+    private float resolveTargetFrameRateHz(DisplayAdapter.DisplaySnapshot snapshot) {
+        float currentHz = snapshot != null ? snapshot.refreshHz : 60.0f;
+        float maxHz = snapshot != null ? snapshot.maxRefreshHz : currentHz;
+
+        if (!Float.isFinite(currentHz) || currentHz <= 0.0f) {
+            currentHz = 60.0f;
+        }
+        if (!Float.isFinite(maxHz) || maxHz <= 0.0f) {
+            maxHz = currentHz;
+        }
+        if (maxHz < currentHz) {
+            maxHz = currentHz;
+        }
+
+        float targetHz;
+        if (forcedFrameRateHz > 0.0f && Float.isFinite(forcedFrameRateHz)) {
+            targetHz = forcedFrameRateHz;
+        } else if (autoMaxFrameRate) {
+            targetHz = Math.max(currentHz, maxHz);
+        } else {
+            targetHz = currentHz;
+        }
+        if (!Float.isFinite(targetHz) || targetHz <= 0.0f) {
+            targetHz = currentHz;
+        }
+        return targetHz;
+    }
+
+    private static String resolveStartupFilterCommand(String filterChainSpec) {
         String filterChainCmd = buildFilterChainSetCommand(filterChainSpec);
         if (filterChainCmd != null) {
             return filterChainCmd;
-        }
-
-        if (blurRadius > 0) {
-            float sigma = blurSigma;
-            if (!Float.isFinite(sigma) || sigma <= 0f) {
-                sigma = Math.max(0.001f, blurRadius / 3.0f);
-            }
-            return "FILTER_SET_GAUSSIAN " + blurRadius + " " + String.format(Locale.US, "%.3f", sigma);
         }
         return "FILTER_CLEAR";
     }
@@ -666,14 +812,13 @@ final class RgbaFramePresenter {
 
         if (bitmap != null) {
             try {
-                ReflectBridge.invoke(bitmap, "recycle");
+                bitmapRecycleMethod.invoke(bitmap);
             } catch (Throwable ignored) {
             }
         }
 
-        bitmap = ReflectBridge.invokeStatic(
-                bitmapClass,
-                "createBitmap",
+        bitmap = bitmapCreateBitmapMethod.invoke(
+                null,
                 Integer.valueOf(width),
                 Integer.valueOf(height),
                 bitmapArgb8888

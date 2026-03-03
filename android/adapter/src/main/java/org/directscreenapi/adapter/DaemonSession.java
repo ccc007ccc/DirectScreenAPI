@@ -40,13 +40,17 @@ final class DaemonSession {
         final int width;
         final int height;
         final int byteLen;
+        final int originX;
+        final int originY;
         final ByteBuffer rgba8;
 
-        MappedFrame(long frameSeq, int width, int height, int byteLen, ByteBuffer rgba8) {
+        MappedFrame(long frameSeq, int width, int height, int byteLen, int originX, int originY, ByteBuffer rgba8) {
             this.frameSeq = frameSeq;
             this.width = width;
             this.height = height;
             this.byteLen = byteLen;
+            this.originX = originX;
+            this.originY = originY;
             this.rgba8 = rgba8;
         }
 
@@ -101,6 +105,8 @@ final class DaemonSession {
     private int rawFrameMappedLen;
     private int rawFrameCapacity;
     private int rawFrameDataOffset = -1;
+    private final int[] lineTokenStarts = new int[12];
+    private final int[] lineTokenEnds = new int[12];
 
     private boolean closed;
 
@@ -180,22 +186,63 @@ final class DaemonSession {
         writeAsciiLine(rawOutput, CMD_WAIT_SHM + " " + safeSeq + " " + safeTimeout);
 
         String line = requireOkLine(readAsciiLine(rawInput), "daemon_wait_shm_present");
-        String[] tokens = line.split("\\s+");
-        if (tokens.length == 2 && "TIMEOUT".equals(tokens[1])) {
+        int tokenCount = tokenizeWhitespace(line, lineTokenStarts, lineTokenEnds);
+        if (tokenCount == 2 && tokenEquals(line, lineTokenStarts[1], lineTokenEnds[1], "TIMEOUT")) {
             return null;
         }
-        if (tokens.length != 8) {
+        if (tokenCount != 8 && tokenCount != 10) {
             throw new IOException("daemon_wait_shm_present_tokens_invalid");
         }
-        if (!PIXEL_FORMAT_RGBA8888.equals(tokens[4])) {
+        if (!tokenEquals(line, lineTokenStarts[4], lineTokenEnds[4], PIXEL_FORMAT_RGBA8888)) {
             throw new IOException("daemon_wait_shm_present_pixel_format_invalid");
         }
 
-        long frameSeq = parseLongStrict(tokens[1], "daemon_wait_shm_present_frame_seq_invalid");
-        int width = parseIntStrict(tokens[2], "daemon_wait_shm_present_width_invalid");
-        int height = parseIntStrict(tokens[3], "daemon_wait_shm_present_height_invalid");
-        int byteLen = parseIntStrict(tokens[5], "daemon_wait_shm_present_len_invalid");
-        int offset = parseIntStrict(tokens[7], "daemon_wait_shm_present_offset_invalid");
+        long frameSeq = parseLongTokenStrict(
+                line,
+                lineTokenStarts[1],
+                lineTokenEnds[1],
+                "daemon_wait_shm_present_frame_seq_invalid"
+        );
+        int width = parseIntTokenStrict(
+                line,
+                lineTokenStarts[2],
+                lineTokenEnds[2],
+                "daemon_wait_shm_present_width_invalid"
+        );
+        int height = parseIntTokenStrict(
+                line,
+                lineTokenStarts[3],
+                lineTokenEnds[3],
+                "daemon_wait_shm_present_height_invalid"
+        );
+        int byteLen = parseIntTokenStrict(
+                line,
+                lineTokenStarts[5],
+                lineTokenEnds[5],
+                "daemon_wait_shm_present_len_invalid"
+        );
+        int offset = parseIntTokenStrict(
+                line,
+                lineTokenStarts[7],
+                lineTokenEnds[7],
+                "daemon_wait_shm_present_offset_invalid"
+        );
+        int originX = 0;
+        int originY = 0;
+        if (tokenCount == 10) {
+            originX = parseIntTokenStrict(
+                    line,
+                    lineTokenStarts[8],
+                    lineTokenEnds[8],
+                    "daemon_wait_shm_present_origin_x_invalid"
+            );
+            originY = parseIntTokenStrict(
+                    line,
+                    lineTokenStarts[9],
+                    lineTokenEnds[9],
+                    "daemon_wait_shm_present_origin_y_invalid"
+            );
+        }
 
         if (frameSeq < 0L || width <= 0 || height <= 0 || byteLen <= 0 || offset < 0) {
             throw new IOException("daemon_wait_shm_present_header_invalid");
@@ -216,7 +263,7 @@ final class DaemonSession {
         view.position(offset);
         view.limit(mapEnd);
         ByteBuffer rgba = view.slice();
-        return new MappedFrame(frameSeq, width, height, byteLen, rgba);
+        return new MappedFrame(frameSeq, width, height, byteLen, originX, originY, rgba);
     }
 
     synchronized long frameSubmitBoundShm(int width, int height, ByteBuffer rgba8) throws Exception {
@@ -265,17 +312,37 @@ final class DaemonSession {
                         + rawFrameDataOffset
         );
         String line = requireOkLine(readAsciiLine(rawInput), "daemon_submit_shm");
-        String[] tokens = line.split("\\s+");
-        if (tokens.length != 7) {
+        int tokenCount = tokenizeWhitespace(line, lineTokenStarts, lineTokenEnds);
+        if (tokenCount != 7) {
             throw new IOException("daemon_submit_shm_tokens_invalid");
         }
-        if (!PIXEL_FORMAT_RGBA8888.equals(tokens[4])) {
+        if (!tokenEquals(line, lineTokenStarts[4], lineTokenEnds[4], PIXEL_FORMAT_RGBA8888)) {
             throw new IOException("daemon_submit_shm_pixel_format_invalid");
         }
-        long frameSeq = parseLongStrict(tokens[1], "daemon_submit_shm_frame_seq_invalid");
-        int outWidth = parseIntStrict(tokens[2], "daemon_submit_shm_width_invalid");
-        int outHeight = parseIntStrict(tokens[3], "daemon_submit_shm_height_invalid");
-        int outByteLen = parseIntStrict(tokens[5], "daemon_submit_shm_len_invalid");
+        long frameSeq = parseLongTokenStrict(
+                line,
+                lineTokenStarts[1],
+                lineTokenEnds[1],
+                "daemon_submit_shm_frame_seq_invalid"
+        );
+        int outWidth = parseIntTokenStrict(
+                line,
+                lineTokenStarts[2],
+                lineTokenEnds[2],
+                "daemon_submit_shm_width_invalid"
+        );
+        int outHeight = parseIntTokenStrict(
+                line,
+                lineTokenStarts[3],
+                lineTokenEnds[3],
+                "daemon_submit_shm_height_invalid"
+        );
+        int outByteLen = parseIntTokenStrict(
+                line,
+                lineTokenStarts[5],
+                lineTokenEnds[5],
+                "daemon_submit_shm_len_invalid"
+        );
         if (outWidth != width || outHeight != height || outByteLen != expectedLen) {
             throw new IOException("daemon_submit_shm_reply_mismatch");
         }
@@ -419,13 +486,23 @@ final class DaemonSession {
         closeRawFrameBinding();
         writeAsciiLine(rawOutput, CMD_BIND_SHM);
         String line = requireOkLine(readAsciiLine(rawInput), "daemon_bind_shm");
-        String[] tokens = line.split("\\s+");
-        if (tokens.length != 4 || !"SHM_BOUND".equals(tokens[1])) {
+        int tokenCount = tokenizeWhitespace(line, lineTokenStarts, lineTokenEnds);
+        if (tokenCount != 4 || !tokenEquals(line, lineTokenStarts[1], lineTokenEnds[1], "SHM_BOUND")) {
             throw new IOException("daemon_bind_shm_tokens_invalid");
         }
 
-        int capacity = parseIntStrict(tokens[2], "daemon_bind_shm_capacity_invalid");
-        int offset = parseIntStrict(tokens[3], "daemon_bind_shm_offset_invalid");
+        int capacity = parseIntTokenStrict(
+                line,
+                lineTokenStarts[2],
+                lineTokenEnds[2],
+                "daemon_bind_shm_capacity_invalid"
+        );
+        int offset = parseIntTokenStrict(
+                line,
+                lineTokenStarts[3],
+                lineTokenEnds[3],
+                "daemon_bind_shm_offset_invalid"
+        );
         if (capacity <= 0 || offset < 0) {
             throw new IOException("daemon_bind_shm_layout_invalid");
         }
@@ -839,14 +916,6 @@ final class DaemonSession {
         }
     }
 
-    private static long parseLongStrict(String s, String err) throws IOException {
-        try {
-            return Long.parseLong(s);
-        } catch (Throwable t) {
-            throw new IOException(err, t);
-        }
-    }
-
     private static float parseFloatStrict(String s, String err) throws IOException {
         try {
             return Float.parseFloat(s);
@@ -861,6 +930,97 @@ final class DaemonSession {
             throw new IOException(errMsg);
         }
         return (int) out;
+    }
+
+    private static int tokenizeWhitespace(String line, int[] starts, int[] ends) {
+        if (line == null || line.isEmpty()) {
+            return 0;
+        }
+        int len = line.length();
+        int idx = 0;
+        int count = 0;
+        while (idx < len) {
+            while (idx < len && Character.isWhitespace(line.charAt(idx))) {
+                idx += 1;
+            }
+            if (idx >= len) {
+                break;
+            }
+
+            int start = idx;
+            while (idx < len && !Character.isWhitespace(line.charAt(idx))) {
+                idx += 1;
+            }
+
+            if (count < starts.length) {
+                starts[count] = start;
+                ends[count] = idx;
+            }
+            count += 1;
+        }
+        return count;
+    }
+
+    private static boolean tokenEquals(String line, int start, int end, String expected) {
+        if (line == null || expected == null) {
+            return false;
+        }
+        int tokenLen = end - start;
+        if (tokenLen != expected.length()) {
+            return false;
+        }
+        for (int i = 0; i < tokenLen; i++) {
+            if (line.charAt(start + i) != expected.charAt(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static int parseIntTokenStrict(String line, int start, int end, String err) throws IOException {
+        long parsed = parseLongTokenStrict(line, start, end, err);
+        if (parsed < Integer.MIN_VALUE || parsed > Integer.MAX_VALUE) {
+            throw new IOException(err);
+        }
+        return (int) parsed;
+    }
+
+    private static long parseLongTokenStrict(String line, int start, int end, String err) throws IOException {
+        if (line == null || start < 0 || end > line.length() || start >= end) {
+            throw new IOException(err);
+        }
+
+        int idx = start;
+        boolean negative = false;
+        char first = line.charAt(idx);
+        if (first == '-' || first == '+') {
+            negative = first == '-';
+            idx += 1;
+            if (idx >= end) {
+                throw new IOException(err);
+            }
+        }
+
+        long limit = negative ? Long.MIN_VALUE : -Long.MAX_VALUE;
+        long multMin = limit / 10L;
+        long result = 0L;
+        while (idx < end) {
+            int digit = line.charAt(idx) - '0';
+            if (digit < 0 || digit > 9) {
+                throw new IOException(err);
+            }
+            if (result < multMin) {
+                throw new IOException(err);
+            }
+            result *= 10L;
+            if (result < (limit + digit)) {
+                throw new IOException(err);
+            }
+            result -= digit;
+            idx += 1;
+        }
+
+        return negative ? result : -result;
     }
 
     private static String[] splitTokens(String cmd) {

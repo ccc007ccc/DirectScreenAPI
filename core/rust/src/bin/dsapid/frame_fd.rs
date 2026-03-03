@@ -273,7 +273,7 @@ pub(super) fn handle_frame_wait_shm_present(
     last_seq: u64,
     timeout_ms: u32,
 ) -> std::io::Result<()> {
-    let Some((frame, pixels_rgba8)) = engine
+    let Some((frame, pixels_rgba8, origin_x, origin_y)) = engine
         .wait_for_frame_after_and_present(last_seq, timeout_ms)
         .map_err(|_| std::io::Error::other("frame_wait_failed"))?
     else {
@@ -289,13 +289,15 @@ pub(super) fn handle_frame_wait_shm_present(
 
     let meta = write_frame_into_bound_shm(bound_fd, frame, pixels_rgba8.as_ref())?;
     let line = format!(
-        "OK {} {} {} RGBA8888 {} {} {}\n",
+        "OK {} {} {} RGBA8888 {} {} {} {} {}\n",
         frame.frame_seq,
         frame.width,
         frame.height,
         frame.byte_len,
         frame.checksum_fnv1a32,
-        meta.offset
+        meta.offset,
+        origin_x,
+        origin_y
     );
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
@@ -323,8 +325,14 @@ pub(super) fn handle_frame_submit_shm(
         return Ok(());
     }
 
-    let pixels = mapped[req.offset..end].to_vec();
-    let frame = match engine.submit_render_frame_rgba(req.width, req.height, pixels) {
+    let pixels = &mapped[req.offset..end];
+    let frame = match engine.submit_render_frame_rgba_at(
+        req.width,
+        req.height,
+        pixels,
+        req.origin_x,
+        req.origin_y,
+    ) {
         Ok(v) => v,
         Err(status) => {
             write_status_error(stream, status);

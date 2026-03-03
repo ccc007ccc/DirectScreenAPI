@@ -6,6 +6,8 @@ pub(super) struct ShmFrameSubmitRequest {
     pub(super) height: u32,
     pub(super) byte_len: usize,
     pub(super) offset: usize,
+    pub(super) origin_x: i32,
+    pub(super) origin_y: i32,
 }
 
 fn parse_u32(token: &str) -> Result<u32, Status> {
@@ -14,6 +16,10 @@ fn parse_u32(token: &str) -> Result<u32, Status> {
 
 fn parse_u64(token: &str) -> Result<u64, Status> {
     token.parse::<u64>().map_err(|_| Status::InvalidArgument)
+}
+
+fn parse_i32(token: &str) -> Result<i32, Status> {
+    token.parse::<i32>().map_err(|_| Status::InvalidArgument)
 }
 
 pub(super) fn parse_frame_bind_shm_request(line: &str) -> Result<bool, Status> {
@@ -78,6 +84,14 @@ pub(super) fn parse_frame_submit_shm_request(
     let height = parse_u32(tokens.next().ok_or(Status::InvalidArgument)?)?;
     let byte_len_u32 = parse_u32(tokens.next().ok_or(Status::InvalidArgument)?)?;
     let offset_u32 = parse_u32(tokens.next().ok_or(Status::InvalidArgument)?)?;
+    let origin_x = match tokens.next() {
+        Some(v) => parse_i32(v)?,
+        None => 0,
+    };
+    let origin_y = match tokens.next() {
+        Some(v) => parse_i32(v)?,
+        None => 0,
+    };
     if tokens.next().is_some() {
         return Err(Status::InvalidArgument);
     }
@@ -104,5 +118,7 @@ pub(super) fn parse_frame_submit_shm_request(
         height,
         byte_len,
         offset,
+        origin_x,
+        origin_y,
     }))
 }

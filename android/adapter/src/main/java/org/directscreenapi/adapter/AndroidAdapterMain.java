@@ -41,7 +41,7 @@ public final class AndroidAdapterMain {
         System.out.println("usage:");
         System.out.println("  AndroidAdapterMain display-kv");
         System.out.println("  AndroidAdapterMain display-line");
-        System.out.println("  AndroidAdapterMain present-loop [control_socket_path] [data_socket_path] [poll_ms] [z_layer] [layer_name] [blur_radius] [blur_sigma] [filter_chain]");
+        System.out.println("  AndroidAdapterMain present-loop [control_socket_path] [data_socket_path] [poll_ms] [z_layer] [layer_name] [blur_radius] [blur_sigma] [filter_chain] [frame_rate]");
         System.out.println("  AndroidAdapterMain screen-stream [control_socket_path] [data_socket_path] [target_fps]");
     }
 
@@ -49,6 +49,7 @@ public final class AndroidAdapterMain {
         System.out.println("width=" + s.width);
         System.out.println("height=" + s.height);
         System.out.println(String.format(Locale.US, "refresh_hz=%.2f", s.refreshHz));
+        System.out.println(String.format(Locale.US, "max_refresh_hz=%.2f", s.maxRefreshHz));
         System.out.println("density_dpi=" + s.densityDpi);
         System.out.println("rotation=" + s.rotation);
     }
@@ -56,10 +57,11 @@ public final class AndroidAdapterMain {
     private static void printDisplayLine(DisplayAdapter.DisplaySnapshot s) {
         System.out.println(String.format(
                 Locale.US,
-                "display_snapshot width=%d height=%d refresh_hz=%.2f density_dpi=%d rotation=%d",
+                "display_snapshot width=%d height=%d refresh_hz=%.2f max_refresh_hz=%.2f density_dpi=%d rotation=%d",
                 s.width,
                 s.height,
                 s.refreshHz,
+                s.maxRefreshHz,
                 s.densityDpi,
                 s.rotation
         ));
@@ -97,6 +99,7 @@ public final class AndroidAdapterMain {
             int blurRadius = args.length > (baseIdx + 3) ? parseInt(args[baseIdx + 3], 0) : 0;
             float blurSigma = args.length > (baseIdx + 4) ? parseFloat(args[baseIdx + 4], 0.0f) : 0.0f;
             String filterChain = args.length > (baseIdx + 5) ? args[baseIdx + 5] : "";
+            String frameRateSpec = args.length > (baseIdx + 6) ? args[baseIdx + 6] : "auto";
             try {
                 RgbaFramePresenter presenter = new RgbaFramePresenter(
                         controlSocketPath,
@@ -106,7 +109,8 @@ public final class AndroidAdapterMain {
                         layerName,
                         blurRadius,
                         blurSigma,
-                        filterChain
+                        filterChain,
+                        frameRateSpec
                 );
                 presenter.runLoop();
                 return;

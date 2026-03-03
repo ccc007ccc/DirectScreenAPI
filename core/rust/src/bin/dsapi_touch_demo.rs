@@ -147,6 +147,8 @@ struct ShmSubmitClient {
     submit_cmd_width: u32,
     submit_cmd_height: u32,
     submit_cmd_len: usize,
+    submit_cmd_origin_x: i32,
+    submit_cmd_origin_y: i32,
 }
 
 impl ShmSubmitClient {
@@ -165,6 +167,8 @@ impl ShmSubmitClient {
             submit_cmd_width: 0,
             submit_cmd_height: 0,
             submit_cmd_len: 0,
+            submit_cmd_origin_x: i32::MIN,
+            submit_cmd_origin_y: i32::MIN,
         })
     }
 
@@ -186,9 +190,11 @@ impl ShmSubmitClient {
         width: u32,
         height: u32,
         byte_len: usize,
+        origin_x: i32,
+        origin_y: i32,
     ) -> io::Result<()> {
         self.ensure_mapping_capacity(byte_len)?;
-        self.ensure_submit_cmd(width, height, byte_len);
+        self.ensure_submit_cmd(width, height, byte_len, origin_x, origin_y);
         self.stream.write_all(&self.submit_cmd_cache)?;
         let line = read_line_fast(&mut self.stream, 4096)?;
         if !line.starts_with("OK") {
@@ -224,26 +230,39 @@ impl ShmSubmitClient {
         self.submit_cmd_width = 0;
         self.submit_cmd_height = 0;
         self.submit_cmd_len = 0;
+        self.submit_cmd_origin_x = i32::MIN;
+        self.submit_cmd_origin_y = i32::MIN;
         Ok(())
     }
 
-    fn ensure_submit_cmd(&mut self, width: u32, height: u32, byte_len: usize) {
+    fn ensure_submit_cmd(
+        &mut self,
+        width: u32,
+        height: u32,
+        byte_len: usize,
+        origin_x: i32,
+        origin_y: i32,
+    ) {
         if self.submit_cmd_width == width
             && self.submit_cmd_height == height
             && self.submit_cmd_len == byte_len
+            && self.submit_cmd_origin_x == origin_x
+            && self.submit_cmd_origin_y == origin_y
             && !self.submit_cmd_cache.is_empty()
         {
             return;
         }
 
         self.submit_cmd_cache = format!(
-            "RENDER_FRAME_SUBMIT_SHM {} {} {} {}\n",
-            width, height, byte_len, self.mapping.data_offset
+            "RENDER_FRAME_SUBMIT_SHM {} {} {} {} {} {}\n",
+            width, height, byte_len, self.mapping.data_offset, origin_x, origin_y
         )
         .into_bytes();
         self.submit_cmd_width = width;
         self.submit_cmd_height = height;
         self.submit_cmd_len = byte_len;
+        self.submit_cmd_origin_x = origin_x;
+        self.submit_cmd_origin_y = origin_y;
     }
 }
 
@@ -453,7 +472,6 @@ struct Args {
     device_path: Option<String>,
     route_name: String,
     fps: f32,
-    render_scale: f32,
     run_seconds: Option<f32>,
     no_touch_router: bool,
     quiet: bool,
@@ -472,7 +490,6 @@ fn usage() {
     eprintln!("  --device <event_path>     touch input device path");
     eprintln!("  --route-name <name>       touch route name (default: demo-window)");
     eprintln!("  --fps <n>                 render fps cap, 0 means auto by refresh rate");
-    eprintln!("  --render-scale <n>        render resolution scale in (0,1], default: 1.0");
     eprintln!("  --run-seconds <n>         auto stop after n seconds");
     eprintln!("  --window-x <n>            initial window x");
     eprintln!("  --window-y <n>            initial window y");
@@ -507,7 +524,6 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut device_path: Option<String> = None;
     let mut route_name = "demo-window".to_string();
     let mut fps = 0.0f32;
-    let mut render_scale = 1.0f32;
     let mut run_seconds: Option<f32> = None;
     let mut no_touch_router = false;
     let mut quiet = false;
@@ -515,10 +531,6 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut window_y: Option<f32> = None;
     let mut window_w = 520.0f32;
     let mut window_h = 360.0f32;
-
-    if let Some(v) = env_non_empty("DSAPI_DEMO_RENDER_SCALE") {
-        render_scale = parse_f32("render_scale", &v)?;
-    }
 
     let mut i = 1usize;
     while i < args.len() {
@@ -556,13 +568,6 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                     return Err("missing_fps".to_string());
                 }
                 fps = parse_f32("fps", &args[i + 1])?;
-                i += 2;
-            }
-            "--render-scale" => {
-                if i + 1 >= args.len() {
-                    return Err("missing_render_scale".to_string());
-                }
-                render_scale = parse_f32("render_scale", &args[i + 1])?;
                 i += 2;
             }
             "--run-seconds" => {
@@ -623,9 +628,6 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     if !fps.is_finite() || fps < 0.0 || (fps > 0.0 && fps <= 1.0) {
         return Err("fps_must_be_zero_or_gt_1".to_string());
     }
-    if !render_scale.is_finite() || render_scale <= 0.0 || render_scale > 1.0 {
-        return Err("render_scale_must_be_in_0_1".to_string());
-    }
     if let Some(v) = run_seconds {
         if !v.is_finite() || v <= 0.0 {
             return Err("run_seconds_must_be_gt_0".to_string());
@@ -645,7 +647,6 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         device_path,
         route_name,
         fps,
-        render_scale,
         run_seconds,
         no_touch_router,
         quiet,
@@ -865,6 +866,7 @@ impl FpsCounter {
     }
 }
 
+#[allow(dead_code)]
 struct BlurScratch {
     src: Vec<u8>,
     tmp: Vec<u8>,
@@ -878,6 +880,7 @@ struct BlurScratch {
     cache_valid: bool,
 }
 
+#[allow(dead_code)]
 impl BlurScratch {
     fn new(radius: u32, sigma: f32) -> Self {
         Self {
@@ -970,30 +973,26 @@ fn frame_interval_from_fps(fps: f32) -> Duration {
     Duration::from_secs_f64((1.0f32 / fps.max(1.0)) as f64)
 }
 
-fn build_render_display(display: DisplayInfo, scale: f32) -> DisplayInfo {
-    if (scale - 1.0).abs() < f32::EPSILON {
-        return display;
-    }
-    let scaled_w = ((display.width as f32) * scale).round().max(1.0) as u32;
-    let scaled_h = ((display.height as f32) * scale).round().max(1.0) as u32;
-    let scaled_dpi = if display.density_dpi == 0 {
-        0
-    } else {
-        ((display.density_dpi as f32) * scale).round().max(1.0) as u32
-    };
-    DisplayInfo {
-        width: scaled_w,
-        height: scaled_h,
-        refresh_hz: display.refresh_hz,
-        density_dpi: scaled_dpi,
-        rotation: display.rotation,
-    }
-}
-
 fn touch_scale(physical: DisplayInfo, render: DisplayInfo) -> (f32, f32) {
     let sx = render.width as f32 / (physical.width.max(1) as f32);
     let sy = render.height as f32 / (physical.height.max(1) as f32);
     (sx, sy)
+}
+
+fn rescale_window_for_render_change(
+    window: &mut WindowState,
+    old_render: DisplayInfo,
+    new_render: DisplayInfo,
+) {
+    if old_render.width == 0 || old_render.height == 0 {
+        return;
+    }
+    let sx = new_render.width as f32 / old_render.width as f32;
+    let sy = new_render.height as f32 / old_render.height as f32;
+    window.x *= sx;
+    window.y *= sy;
+    window.w *= sx;
+    window.h *= sy;
 }
 
 fn map_touch_to_render(
@@ -1100,7 +1099,7 @@ fn main() {
         );
         std::process::exit(4);
     }
-    let mut render_display = build_render_display(display, cfg.render_scale);
+    let mut render_display = display;
     let (mut route_scale_x, mut route_scale_y) = touch_scale(display, render_display);
     let init_window_w = (cfg.window_w * route_scale_x).max(WINDOW_ARG_MIN_W * route_scale_x);
     let init_window_h = (cfg.window_h * route_scale_y).max(WINDOW_ARG_MIN_H * route_scale_y);
@@ -1226,13 +1225,14 @@ fn main() {
 
     let mut target_fps = resolve_target_fps(cfg.fps, display.refresh_hz);
     if !cfg.quiet {
+        let init_frame_w = state.window.w.round().max(1.0) as u32;
+        let init_frame_h = state.window.h.round().max(1.0) as u32;
         eprintln!(
-            "touch_demo_status=running display={}x{} render={}x{} scale={:.2} @ {:.2}Hz dpi={} rotation={} target_fps={:.1}",
+            "touch_demo_status=running display={}x{} frame={}x{} @ {:.2}Hz dpi={} rotation={} target_fps={:.1}",
             display.width,
             display.height,
-            render_display.width,
-            render_display.height,
-            cfg.render_scale,
+            init_frame_w,
+            init_frame_h,
             display.refresh_hz,
             display.density_dpi,
             display.rotation,
@@ -1242,7 +1242,6 @@ fn main() {
     }
 
     let mut fps_counter = FpsCounter::new();
-    let mut blur_scratch = BlurScratch::new(6, 2.4);
     let mut frame_interval = frame_interval_from_fps(target_fps);
     let started_at = Instant::now();
     let mut last_perf_log = Instant::now();
@@ -1263,38 +1262,43 @@ fn main() {
             if next.width == 0 || next.height == 0 {
                 continue;
             }
-            if next.width != display.width
+            let layout_changed = next.width != display.width
                 || next.height != display.height
                 || next.density_dpi != display.density_dpi
-                || next.rotation != display.rotation
-            {
+                || next.rotation != display.rotation;
+            let refresh_changed =
+                (next.refresh_hz - display.refresh_hz).abs() >= 0.01f32 && next.refresh_hz > 1.0;
+            if layout_changed || refresh_changed {
+                let old_render = render_display;
                 display = next;
-                render_display = build_render_display(display, cfg.render_scale);
-                (route_scale_x, route_scale_y) = touch_scale(display, render_display);
-                state
-                    .window
-                    .clamp_to_display(render_display, ui_metrics(render_display));
-                blur_scratch.invalidate_cache();
+                render_display = display;
+                if layout_changed {
+                    rescale_window_for_render_change(&mut state.window, old_render, render_display);
+                    (route_scale_x, route_scale_y) = touch_scale(display, render_display);
+                    state
+                        .window
+                        .clamp_to_display(render_display, ui_metrics(render_display));
+                    if let Some(handle) = touch_handle.as_ref() {
+                        let _ = handle.update_display_transform(
+                            display.width,
+                            display.height,
+                            display.rotation as i32,
+                        );
+                    }
+                }
                 if cfg.fps <= 1.0 {
                     target_fps = resolve_target_fps(cfg.fps, display.refresh_hz);
                     frame_interval = frame_interval_from_fps(target_fps);
                 }
-                if let Some(handle) = touch_handle.as_ref() {
-                    let _ = handle.update_display_transform(
-                        display.width,
-                        display.height,
-                        display.rotation as i32,
-                    );
-                }
                 if !cfg.quiet {
                     eprintln!(
-                        "touch_demo_status=display_changed size={}x{} render={}x{} dpi={} rotation={}",
+                        "touch_demo_status=display_changed size={}x{} refresh_hz={:.2} dpi={} rotation={} target_fps={:.1}",
                         display.width,
                         display.height,
-                        render_display.width,
-                        render_display.height,
+                        display.refresh_hz,
                         display.density_dpi,
-                        display.rotation
+                        display.rotation,
+                        target_fps
                     );
                 }
             }
@@ -1309,34 +1313,54 @@ fn main() {
         let fps = fps_counter.on_frame();
         let blocked = route_blocked_down.load(Ordering::Relaxed);
         let passed = route_passed_down.load(Ordering::Relaxed);
-        let frame_len = match frame_byte_len(render_display.width, render_display.height) {
+
+        let frame_w = state
+            .window
+            .w
+            .round()
+            .max(1.0)
+            .min(render_display.width.max(1) as f32) as u32;
+        let frame_h = state
+            .window
+            .h
+            .round()
+            .max(1.0)
+            .min(render_display.height.max(1) as f32) as u32;
+        let max_origin_x = render_display.width.saturating_sub(frame_w) as i32;
+        let max_origin_y = render_display.height.saturating_sub(frame_h) as i32;
+        let frame_origin_x = (state.window.x.round() as i32).clamp(0, max_origin_x);
+        let frame_origin_y = (state.window.y.round() as i32).clamp(0, max_origin_y);
+
+        let frame_len = match frame_byte_len(frame_w, frame_h) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("touch_demo_error=frame_size_invalid err={}", e);
                 break;
             }
         };
-        let frame_buf =
-            match submitter.frame_buffer_mut(render_display.width, render_display.height) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("touch_demo_error=frame_buffer_failed err={}", e);
-                    break;
-                }
-            };
-        render_scene(
-            frame_buf,
-            render_display,
-            &state,
-            fps,
-            blocked,
-            passed,
-            &mut blur_scratch,
-        );
+        let frame_buf = match submitter.frame_buffer_mut(frame_w, frame_h) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("touch_demo_error=frame_buffer_failed err={}", e);
+                break;
+            }
+        };
+        let frame_display = DisplayInfo {
+            width: frame_w,
+            height: frame_h,
+            refresh_hz: display.refresh_hz,
+            density_dpi: display.density_dpi,
+            rotation: display.rotation,
+        };
+        render_scene(frame_buf, frame_display, &state, fps, blocked, passed);
 
-        if let Err(e) =
-            submitter.submit_rendered_frame(render_display.width, render_display.height, frame_len)
-        {
+        if let Err(e) = submitter.submit_rendered_frame(
+            frame_w,
+            frame_h,
+            frame_len,
+            frame_origin_x,
+            frame_origin_y,
+        ) {
             eprintln!("touch_demo_error=submit_frame_failed err={}", e);
             break;
         }
@@ -1409,23 +1433,22 @@ fn render_scene(
     fps: f32,
     blocked_down: u64,
     passed_down: u64,
-    blur_scratch: &mut BlurScratch,
 ) {
     frame.fill(0);
     let metrics = ui_metrics(display);
 
-    let wx = state.window.x.round() as i32;
-    let wy = state.window.y.round() as i32;
-    let ww = state.window.w.round().max(1.0) as i32;
-    let wh = state.window.h.round().max(1.0) as i32;
+    // 窗口内容帧采用局部坐标系：提交 origin 后由 presenter 负责层位置。
+    let wx = 0i32;
+    let wy = 0i32;
+    let ww = display.width.max(1) as i32;
+    let wh = display.height.max(1) as i32;
     let title_h = metrics.title_height.round().max(1.0) as i32;
     let close_w = metrics.close_w.round().max(16.0) as i32;
     let close_h = metrics.close_h.round().max(14.0) as i32;
     let close_margin = metrics.close_margin.round().max(2.0) as i32;
     let close_top = metrics.close_top.round().max(2.0) as i32;
 
-    draw_backdrop_pattern(frame, display.width, display.height, wx, wy, ww, wh);
-    blur_region_gaussian(
+    fill_rect(
         frame,
         display.width,
         display.height,
@@ -1433,18 +1456,7 @@ fn render_scene(
         wy,
         ww,
         wh,
-        blur_scratch,
-    );
-    blend_rect(
-        frame,
-        display.width,
-        display.height,
-        wx,
-        wy,
-        ww,
-        wh,
-        [26, 34, 48, 255],
-        76,
+        [26, 34, 48, 138],
     );
 
     fill_rect(
@@ -1545,7 +1557,7 @@ fn render_scene(
             state.window.x, state.window.y, state.window.w, state.window.h
         ),
         format!(
-            "Display: {}x{} dpi={}",
+            "Frame: {}x{} dpi={}",
             display.width, display.height, display.density_dpi
         ),
         format!("Touch block downs: {}", blocked_down),
@@ -1607,6 +1619,7 @@ fn fill_rect(
     }
 }
 
+#[allow(dead_code)]
 fn blend_rect(
     frame: &mut [u8],
     fb_width: u32,
@@ -1646,6 +1659,7 @@ fn blend_rect(
     }
 }
 
+#[allow(dead_code)]
 fn draw_backdrop_pattern(
     frame: &mut [u8],
     fb_width: u32,
@@ -1688,6 +1702,7 @@ fn draw_backdrop_pattern(
     }
 }
 
+#[allow(dead_code)]
 fn blur_region_gaussian(
     frame: &mut [u8],
     fb_width: u32,

@@ -53,6 +53,23 @@ public final class AndroidDisplayAdapter implements DisplayAdapter {
         return 0f;
     }
 
+    private static Object readObjectField(Object obj, String... names) {
+        for (String n : names) {
+            try {
+                Field f = obj.getClass().getField(n);
+                return f.get(obj);
+            } catch (Throwable ignored) {
+            }
+            try {
+                Field f = obj.getClass().getDeclaredField(n);
+                f.setAccessible(true);
+                return f.get(obj);
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
     private static int normalizeRotation(int rotation) {
         int r = rotation % 4;
         if (r < 0) r += 4;
@@ -133,6 +150,97 @@ public final class AndroidDisplayAdapter implements DisplayAdapter {
         return fallback;
     }
 
+    private static float maxRefreshFromModesObject(
+            Object modesObj,
+            int targetWidth,
+            int targetHeight,
+            float fallback
+    ) {
+        if (modesObj == null) {
+            return fallback;
+        }
+
+        float maxMatched = 0f;
+        float maxAll = 0f;
+        Object[] modesArray = null;
+        if (modesObj instanceof Object[]) {
+            modesArray = (Object[]) modesObj;
+        } else if (modesObj instanceof Iterable) {
+            java.util.ArrayList<Object> list = new java.util.ArrayList<Object>();
+            for (Object it : (Iterable<?>) modesObj) {
+                list.add(it);
+            }
+            modesArray = list.toArray(new Object[0]);
+        }
+        if (modesArray == null || modesArray.length == 0) {
+            return fallback;
+        }
+
+        for (Object mode : modesArray) {
+            if (mode == null) {
+                continue;
+            }
+            int mw = invokeIntNoArg(mode, "getPhysicalWidth", 0);
+            if (mw <= 0) {
+                mw = invokeIntNoArg(mode, "getWidth", 0);
+            }
+            if (mw <= 0) {
+                mw = readIntField(mode, "physicalWidth", "width", "mWidth");
+            }
+
+            int mh = invokeIntNoArg(mode, "getPhysicalHeight", 0);
+            if (mh <= 0) {
+                mh = invokeIntNoArg(mode, "getHeight", 0);
+            }
+            if (mh <= 0) {
+                mh = readIntField(mode, "physicalHeight", "height", "mHeight");
+            }
+
+            float hz = invokeFloatNoArg(mode, "getRefreshRate", 0f);
+            if (hz <= 0f) {
+                hz = readFloatField(mode, "refreshRate", "fps", "mRefreshRate");
+            }
+            if (hz <= 0f) {
+                continue;
+            }
+            if (hz > maxAll) {
+                maxAll = hz;
+            }
+            if (targetWidth > 0 && targetHeight > 0 && mw == targetWidth && mh == targetHeight && hz > maxMatched) {
+                maxMatched = hz;
+            }
+        }
+
+        if (maxMatched > 0f) {
+            return maxMatched;
+        }
+        if (maxAll > 0f) {
+            return maxAll;
+        }
+        return fallback;
+    }
+
+    private static float readMaxRefreshFromDisplay(Object displayObj, int width, int height, float fallback) {
+        try {
+            Method m = findMethodByName(displayObj.getClass(), "getSupportedModes", 0);
+            if (m == null) {
+                return fallback;
+            }
+            Object modesObj = m.invoke(displayObj);
+            return maxRefreshFromModesObject(modesObj, width, height, fallback);
+        } catch (Throwable ignored) {
+        }
+        return fallback;
+    }
+
+    private static float readMaxRefreshFromDisplayInfo(Object info, int width, int height, float fallback) {
+        if (info == null) {
+            return fallback;
+        }
+        Object supportedModes = readObjectField(info, "supportedModes", "appsSupportedModes", "mSupportedModes");
+        return maxRefreshFromModesObject(supportedModes, width, height, fallback);
+    }
+
     private static int invokeIntNoArg(Object obj, String name, int fallback) {
         try {
             Method m = findMethodByName(obj.getClass(), name, 0);
@@ -167,6 +275,7 @@ public final class AndroidDisplayAdapter implements DisplayAdapter {
         int width = 1080;
         int height = 2400;
         float refreshHz = 60f;
+        float maxRefreshHz = 60f;
         int densityDpi = 420;
         int rotation = 0;
 
@@ -190,11 +299,13 @@ public final class AndroidDisplayAdapter implements DisplayAdapter {
                     }
                     if (hz > 0f) {
                         refreshHz = hz;
+                        maxRefreshHz = hz;
                     }
                     if (density > 0) {
                         densityDpi = density;
                     }
                     rotation = rot;
+                    maxRefreshHz = readMaxRefreshFromDisplayInfo(info, width, height, maxRefreshHz);
                 }
 
                 Object display = invokeSingleDisplayIdMethod(dmg, "getRealDisplay", 0);
@@ -209,6 +320,7 @@ public final class AndroidDisplayAdapter implements DisplayAdapter {
                     if (hz > 0f) {
                         refreshHz = hz;
                     }
+                    maxRefreshHz = readMaxRefreshFromDisplay(display, width, height, Math.max(maxRefreshHz, refreshHz));
                     int rot = invokeIntNoArg(display, "getRotation", rotation);
                     rotation = rot;
 
@@ -227,7 +339,16 @@ public final class AndroidDisplayAdapter implements DisplayAdapter {
         if (width <= 0) width = 1080;
         if (height <= 0) height = 2400;
         if (refreshHz <= 0f) refreshHz = 60f;
+        if (maxRefreshHz <= 0f) maxRefreshHz = refreshHz;
+        if (maxRefreshHz < refreshHz) maxRefreshHz = refreshHz;
 
-        return new DisplaySnapshot(width, height, refreshHz, densityDpi, normalizeRotation(rotation));
+        return new DisplaySnapshot(
+                width,
+                height,
+                refreshHz,
+                maxRefreshHz,
+                densityDpi,
+                normalizeRotation(rotation)
+        );
     }
 }

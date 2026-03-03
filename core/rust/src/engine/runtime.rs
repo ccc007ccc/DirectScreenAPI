@@ -33,9 +33,11 @@ struct ActiveTouch {
 struct StoredRenderFrame {
     info: RenderFrameInfo,
     pixels_rgba8: Arc<[u8]>,
+    origin_x: i32,
+    origin_y: i32,
 }
 
-type FrameSnapshot = (RenderFrameInfo, Arc<[u8]>);
+type FrameSnapshot = (RenderFrameInfo, Arc<[u8]>, i32, i32);
 
 #[derive(Debug)]
 struct RouteState {
@@ -362,7 +364,18 @@ impl RuntimeEngine {
         &self,
         width: u32,
         height: u32,
-        mut pixels_rgba8: Vec<u8>,
+        pixels_rgba8: &[u8],
+    ) -> Result<RenderFrameInfo, Status> {
+        self.submit_render_frame_rgba_at(width, height, pixels_rgba8, 0, 0)
+    }
+
+    pub fn submit_render_frame_rgba_at(
+        &self,
+        width: u32,
+        height: u32,
+        pixels_rgba8: &[u8],
+        origin_x: i32,
+        origin_y: i32,
     ) -> Result<RenderFrameInfo, Status> {
         if width == 0 || height == 0 {
             return Err(Status::InvalidArgument);
@@ -379,6 +392,7 @@ impl RuntimeEngine {
             return Err(Status::InvalidArgument);
         }
 
+        let mut pixels_rgba8 = pixels_rgba8.to_vec();
         self.apply_filter_pipeline(width, height, &mut pixels_rgba8)?;
 
         let checksum = compute_render_checksum(&pixels_rgba8);
@@ -394,7 +408,12 @@ impl RuntimeEngine {
                 byte_len: expected_len as u32,
                 checksum_fnv1a32: checksum,
             };
-            render.last_render_frame = Some(StoredRenderFrame { info, pixels_rgba8 });
+            render.last_render_frame = Some(StoredRenderFrame {
+                info,
+                pixels_rgba8,
+                origin_x,
+                origin_y,
+            });
             info
         };
 
@@ -482,6 +501,14 @@ impl RuntimeEngine {
             r.last_render_frame
                 .as_ref()
                 .map(|f| (f.info, f.pixels_rgba8.clone()))
+        })
+    }
+
+    pub fn render_frame_origin(&self) -> Option<(i32, i32)> {
+        self.render.read().ok().and_then(|r| {
+            r.last_render_frame
+                .as_ref()
+                .map(|f| (f.origin_x, f.origin_y))
         })
     }
 
@@ -614,14 +641,19 @@ impl RuntimeEngine {
         last_frame_seq: u64,
     ) -> Result<Option<FrameSnapshot>, Status> {
         let mut render = self.render.write().map_err(|_| Status::InternalError)?;
-        let (frame_info, pixels) = {
+        let (frame_info, pixels, origin_x, origin_y) = {
             let Some(frame) = render.last_render_frame.as_ref() else {
                 return Ok(None);
             };
             if frame.info.frame_seq <= last_frame_seq {
                 return Ok(None);
             }
-            (frame.info, frame.pixels_rgba8.clone())
+            (
+                frame.info,
+                frame.pixels_rgba8.clone(),
+                frame.origin_x,
+                frame.origin_y,
+            )
         };
 
         render.present_seq = render.present_seq.saturating_add(1);
@@ -633,7 +665,7 @@ impl RuntimeEngine {
             byte_len: frame_info.byte_len,
             checksum_fnv1a32: frame_info.checksum_fnv1a32,
         });
-        Ok(Some((frame_info, pixels)))
+        Ok(Some((frame_info, pixels, origin_x, origin_y)))
     }
 
     fn notify_display_changed(&self) {
@@ -836,7 +868,7 @@ mod tests {
             255u8, 255u8,
         ];
         let first = engine
-            .submit_render_frame_rgba(2, 2, pixels.clone())
+            .submit_render_frame_rgba(2, 2, &pixels)
             .expect("submit first frame");
         assert_eq!(first.frame_seq, 1);
         assert_eq!(first.width, 2);
@@ -846,7 +878,7 @@ mod tests {
         assert_eq!(engine.render_frame_byte_len(), Some(16));
 
         let second = engine
-            .submit_render_frame_rgba(2, 2, pixels)
+            .submit_render_frame_rgba(2, 2, &pixels)
             .expect("submit second frame");
         assert_eq!(second.frame_seq, 2);
 
@@ -880,7 +912,7 @@ mod tests {
         pixels[center + 3] = 255;
 
         engine
-            .submit_render_frame_rgba(5, 5, pixels)
+            .submit_render_frame_rgba(5, 5, &pixels)
             .expect("submit filtered frame");
         let (_, output) = engine
             .render_frame_snapshot()
@@ -895,7 +927,8 @@ mod tests {
     #[test]
     fn render_frame_rejects_invalid_length() {
         let engine = RuntimeEngine::default();
-        let out = engine.submit_render_frame_rgba(2, 2, vec![1u8; 15]);
+        let pixels = [1u8; 15];
+        let out = engine.submit_render_frame_rgba(2, 2, &pixels);
         assert_eq!(out, Err(Status::InvalidArgument));
     }
 
@@ -907,7 +940,7 @@ mod tests {
             255u8, 255u8,
         ];
         let frame = engine
-            .submit_render_frame_rgba(2, 2, pixels)
+            .submit_render_frame_rgba(2, 2, &pixels)
             .expect("submit frame");
         let presented = engine.render_present().expect("present frame");
         assert_eq!(presented.present_seq, 1);
@@ -937,7 +970,7 @@ mod tests {
             255u8, 255u8,
         ];
         engine
-            .submit_render_frame_rgba(2, 2, pixels)
+            .submit_render_frame_rgba(2, 2, &pixels)
             .expect("submit frame");
         let path = engine.render_dump_ppm().expect("dump ppm");
         assert!(std::path::Path::new(&path).exists());
@@ -948,7 +981,7 @@ mod tests {
         let engine = RuntimeEngine::default();
         let pixels = (0u8..16u8).collect::<Vec<u8>>();
         let frame = engine
-            .submit_render_frame_rgba(2, 2, pixels.clone())
+            .submit_render_frame_rgba(2, 2, &pixels)
             .expect("submit frame");
 
         let a = engine
@@ -977,7 +1010,7 @@ mod tests {
         let engine = RuntimeEngine::default();
         let pixels = vec![1u8; 16];
         engine
-            .submit_render_frame_rgba(2, 2, pixels)
+            .submit_render_frame_rgba(2, 2, &pixels)
             .expect("submit frame");
         assert_eq!(
             engine.render_frame_read_chunk(16, 1),
@@ -1001,7 +1034,7 @@ mod tests {
 
         let pixels = vec![255u8; 16];
         let frame = engine
-            .submit_render_frame_rgba(2, 2, pixels)
+            .submit_render_frame_rgba(2, 2, &pixels)
             .expect("submit frame");
         let waited = engine
             .wait_for_frame_after(0, 10)
@@ -1022,15 +1055,17 @@ mod tests {
 
         let pixels = vec![9u8; 16];
         let frame = engine
-            .submit_render_frame_rgba(2, 2, pixels)
+            .submit_render_frame_rgba(2, 2, &pixels)
             .expect("submit frame");
 
-        let (waited_frame, waited_pixels) = engine
+        let (waited_frame, waited_pixels, waited_origin_x, waited_origin_y) = engine
             .wait_for_frame_after_and_present(0, 10)
             .expect("wait with frame")
             .expect("frame expected");
         assert_eq!(waited_frame.frame_seq, frame.frame_seq);
         assert_eq!(waited_pixels.len(), frame.byte_len as usize);
+        assert_eq!(waited_origin_x, 0);
+        assert_eq!(waited_origin_y, 0);
 
         let present = engine.render_present_get().expect("present state exists");
         assert_eq!(present.frame_seq, waited_frame.frame_seq);
@@ -1077,7 +1112,7 @@ mod tests {
         let engine = RuntimeEngine::default();
         let pixels = vec![255u8; 16];
         engine
-            .submit_render_frame_rgba(2, 2, pixels)
+            .submit_render_frame_rgba(2, 2, &pixels)
             .expect("submit frame");
         assert!(engine.render_frame_info().is_some());
 

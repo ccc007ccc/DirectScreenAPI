@@ -565,7 +565,7 @@ pub unsafe extern "C" fn dsapi_render_submit_frame_rgba(
     if len != expected_len {
         return Status::InvalidArgument as i32;
     }
-    let bytes = unsafe { std::slice::from_raw_parts(pixels_rgba8, len) }.to_vec();
+    let bytes = unsafe { std::slice::from_raw_parts(pixels_rgba8, len) };
 
     with_engine_mut(ctx, |engine| {
         match engine.submit_render_frame_rgba(width, height, bytes) {
@@ -654,24 +654,26 @@ pub unsafe extern "C" fn dsapi_render_submit_frame_ahb_fd(
         return Status::InternalError as i32;
     }
 
-    let bytes = unsafe {
+    let status = {
         let base = mapped as *const u8;
-        let frame_ptr = base.add(offset);
-        std::slice::from_raw_parts(frame_ptr, expected_len).to_vec()
+        let frame_ptr = unsafe { base.add(offset) };
+        let bytes = unsafe { std::slice::from_raw_parts(frame_ptr, expected_len) };
+
+        with_engine_mut(ctx, |engine| {
+            match engine.submit_render_frame_rgba(desc.width, desc.height, bytes) {
+                Ok(info) => {
+                    unsafe {
+                        ptr::write(out_info, info.into());
+                    }
+                    Status::Ok
+                }
+                Err(e) => e,
+            }
+        })
     };
     let _ = unsafe { libc::munmap(mapped, map_len) };
 
-    with_engine_mut(ctx, |engine| {
-        match engine.submit_render_frame_rgba(desc.width, desc.height, bytes) {
-            Ok(info) => {
-                unsafe {
-                    ptr::write(out_info, info.into());
-                }
-                Status::Ok
-            }
-            Err(e) => e,
-        }
-    }) as i32
+    status as i32
 }
 
 #[no_mangle]
