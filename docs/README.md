@@ -5,6 +5,8 @@
 - `architecture/overview.md`
 - `architecture/runtime_model.md`
 - `architecture/daemon_model.md`
+- `architecture/android_event_driven_refactor.md`
+- `architecture/ksu_kernel_core_plan.md`
 
 ## API
 
@@ -20,6 +22,7 @@
 - `guides/touch_routing.md`
 - `guides/touch_bridge.md`
 - `guides/stability_policy.md`
+- `guides/ksu_capability_module_spec.md`
 
 ## 治理
 

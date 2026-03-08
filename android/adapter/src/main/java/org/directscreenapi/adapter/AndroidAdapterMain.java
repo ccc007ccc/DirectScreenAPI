@@ -19,31 +19,17 @@ public final class AndroidAdapterMain {
         }
     }
 
-    private static boolean looksLikeInt(String s) {
-        if (s == null || s.isEmpty()) return false;
-        int start = (s.charAt(0) == '-') ? 1 : 0;
-        if (start >= s.length()) return false;
-        for (int i = start; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (c < '0' || c > '9') return false;
-        }
-        return true;
-    }
-
-    private static String deriveDataSocketPath(String controlSocketPath) {
-        if (controlSocketPath.endsWith(".sock")) {
-            return controlSocketPath.substring(0, controlSocketPath.length() - 5) + ".data.sock";
-        }
-        return controlSocketPath + ".data";
-    }
-
     private static void usage() {
         System.out.println("usage:");
         System.out.println("  AndroidAdapterMain display-kv");
         System.out.println("  AndroidAdapterMain display-line");
         System.out.println("  AndroidAdapterMain blur-probe");
-        System.out.println("  AndroidAdapterMain present-loop [control_socket_path] [data_socket_path] [poll_ms] [z_layer] [layer_name] [blur_radius] [blur_sigma] [filter_chain] [frame_rate]");
-        System.out.println("  AndroidAdapterMain screen-stream [control_socket_path] [data_socket_path] [target_fps]");
+        System.out.println("  AndroidAdapterMain present-loop [control_socket_path] [wait_timeout_ms] [z_layer] [layer_name] [blur_radius] [blur_sigma] [filter_chain] [frame_rate]");
+        System.out.println("  AndroidAdapterMain screen-stream [control_socket_path] [target_fps]");
+        System.out.println("  AndroidAdapterMain cap-ui [dsapi_service_ctl_path] [refresh_ms]");
+        System.out.println("  AndroidAdapterMain bridge-server [dsapi_service_ctl_path] [service_name] [ready_file]");
+        System.out.println("  AndroidAdapterMain manager-host [dsapi_service_ctl_path] [manager_component] [manager_package] [bridge_service] [refresh_ms] [ready_file]");
+        System.out.println("  AndroidAdapterMain zygote-agent [zygote_service_name] [daemon_service_name] [ready_file] [scope_file]");
     }
 
     private static void printDisplayKv(DisplayAdapter.DisplaySnapshot s) {
@@ -212,16 +198,31 @@ public final class AndroidAdapterMain {
         }
 
         String cmd = args[0];
-        DisplayAdapter adapter = new AndroidDisplayAdapter();
-        DisplayAdapter.DisplaySnapshot snapshot = adapter.queryDisplaySnapshot();
-
         if ("display-kv".equals(cmd)) {
-            printDisplayKv(snapshot);
-            return;
+            try {
+                DisplayAdapter adapter = new AndroidDisplayAdapter();
+                DisplayAdapter.DisplaySnapshot snapshot = adapter.queryDisplaySnapshot();
+                printDisplayKv(snapshot);
+                return;
+            } catch (Throwable t) {
+                System.out.println("display_status=failed");
+                System.out.println("display_error=" + t.getClass().getName() + ":" + t.getMessage());
+                t.printStackTrace(System.out);
+                System.exit(2);
+            }
         }
         if ("display-line".equals(cmd)) {
-            printDisplayLine(snapshot);
-            return;
+            try {
+                DisplayAdapter adapter = new AndroidDisplayAdapter();
+                DisplayAdapter.DisplaySnapshot snapshot = adapter.queryDisplaySnapshot();
+                printDisplayLine(snapshot);
+                return;
+            } catch (Throwable t) {
+                System.out.println("display_status=failed");
+                System.out.println("display_error=" + t.getClass().getName() + ":" + t.getMessage());
+                t.printStackTrace(System.out);
+                System.exit(2);
+            }
         }
         if ("blur-probe".equals(cmd)) {
             printBlurProbe();
@@ -229,13 +230,8 @@ public final class AndroidAdapterMain {
         }
         if ("present-loop".equals(cmd)) {
             String controlSocketPath = args.length > 1 ? args[1] : "artifacts/run/dsapi.sock";
-            String dataSocketPath = deriveDataSocketPath(controlSocketPath);
             int baseIdx = 2;
-            if (args.length > 2 && !looksLikeInt(args[2])) {
-                dataSocketPath = args[2];
-                baseIdx = 3;
-            }
-            int pollMs = args.length > baseIdx ? parseInt(args[baseIdx], 2) : 2;
+            int waitTimeoutMs = args.length > baseIdx ? parseInt(args[baseIdx], 0) : 0;
             int zLayer = args.length > (baseIdx + 1) ? parseInt(args[baseIdx + 1], 1_000_000) : 1_000_000;
             String layerName = args.length > (baseIdx + 2) ? args[baseIdx + 2] : "DirectScreenAPI";
             int blurRadius = args.length > (baseIdx + 3) ? parseInt(args[baseIdx + 3], 0) : 0;
@@ -245,8 +241,7 @@ public final class AndroidAdapterMain {
             try {
                 RgbaFramePresenter presenter = new RgbaFramePresenter(
                         controlSocketPath,
-                        dataSocketPath,
-                        pollMs,
+                        waitTimeoutMs,
                         zLayer,
                         layerName,
                         blurRadius,
@@ -265,17 +260,11 @@ public final class AndroidAdapterMain {
         }
         if ("screen-stream".equals(cmd)) {
             String controlSocketPath = args.length > 1 ? args[1] : "artifacts/run/dsapi.sock";
-            String dataSocketPath = deriveDataSocketPath(controlSocketPath);
             int baseIdx = 2;
-            if (args.length > 2 && !looksLikeInt(args[2])) {
-                dataSocketPath = args[2];
-                baseIdx = 3;
-            }
             int targetFps = args.length > baseIdx ? parseInt(args[baseIdx], 60) : 60;
             try {
                 ScreenCaptureStreamer streamer = new ScreenCaptureStreamer(
                         controlSocketPath,
-                        dataSocketPath,
                         targetFps
                 );
                 streamer.runLoop();
@@ -287,7 +276,80 @@ public final class AndroidAdapterMain {
                 System.exit(2);
             }
         }
-
+        if ("cap-ui".equals(cmd)) {
+            String ctlPath = args.length > 1 ? args[1] : "/data/adb/modules/directscreenapi/bin/dsapi_service_ctl.sh";
+            int refreshMs = args.length > 2 ? parseInt(args[2], 1200) : 1200;
+            try {
+                CapabilityManagerUi ui = new CapabilityManagerUi(ctlPath, refreshMs);
+                ui.runLoop();
+                return;
+            } catch (Throwable t) {
+                System.out.println("cap_ui_status=failed");
+                System.out.println("cap_ui_error=" + t.getClass().getName() + ":" + t.getMessage());
+                t.printStackTrace(System.out);
+                System.exit(2);
+            }
+        }
+        if ("bridge-server".equals(cmd)) {
+            String ctlPath = args.length > 1 ? args[1] : "/data/adb/modules/directscreenapi/bin/dsapi_service_ctl.sh";
+            String serviceName = args.length > 2 ? args[2] : "dsapi.directscreenapi.bridge";
+            String readyFile = args.length > 3 ? args[3] : "";
+            if (serviceName == null || serviceName.trim().isEmpty()) {
+                System.out.println("bridge_server_error=invalid_service");
+                System.exit(2);
+            }
+            try {
+                BridgeControlServer bridge = new BridgeControlServer(ctlPath, serviceName, readyFile);
+                bridge.runLoop();
+                return;
+            } catch (Throwable t) {
+                System.out.println("bridge_server_status=failed");
+                System.out.println("bridge_server_error=" + t.getClass().getName() + ":" + t.getMessage());
+                t.printStackTrace(System.out);
+                System.exit(2);
+            }
+        }
+        if ("manager-host".equals(cmd)) {
+            String ctlPath = args.length > 1 ? args[1] : "/data/adb/modules/directscreenapi/bin/dsapi_service_ctl.sh";
+            String managerComponent = args.length > 2 ? args[2] : "org.directscreenapi.manager/.MainActivity";
+            String managerPackage = args.length > 3 ? args[3] : "org.directscreenapi.manager";
+            String bridgeService = args.length > 4 ? args[4] : "assetatlas";
+            int refreshMs = args.length > 5 ? parseInt(args[5], 1200) : 1200;
+            String readyFile = args.length > 6 ? args[6] : "";
+            try {
+                ParasiticManagerHost host = new ParasiticManagerHost(
+                        ctlPath,
+                        managerComponent,
+                        managerPackage,
+                        bridgeService,
+                        refreshMs,
+                        readyFile
+                );
+                host.runLoop();
+                return;
+            } catch (Throwable t) {
+                System.out.println("manager_host_status=failed");
+                System.out.println("manager_host_error=" + t.getClass().getName() + ":" + t.getMessage());
+                t.printStackTrace(System.out);
+                System.exit(2);
+            }
+        }
+        if ("zygote-agent".equals(cmd)) {
+            String zygoteService = args.length > 1 ? args[1] : "dsapi.zygote.injector";
+            String daemonService = args.length > 2 ? args[2] : "assetatlas";
+            String readyFile = args.length > 3 ? args[3] : "";
+            String scopeFile = args.length > 4 ? args[4] : "/data/adb/dsapi/state/zygote_scope.db";
+            try {
+                ZygoteAgentServer server = new ZygoteAgentServer(zygoteService, daemonService, readyFile, scopeFile);
+                server.runLoop();
+                return;
+            } catch (Throwable t) {
+                System.out.println("zygote_agent_status=failed");
+                System.out.println("zygote_agent_error=" + t.getClass().getName() + ":" + t.getMessage());
+                t.printStackTrace(System.out);
+                System.exit(2);
+            }
+        }
         usage();
         System.exit(1);
     }

@@ -35,6 +35,11 @@ pub const TOUCH_MAX_POINTERS: usize = 16;
 pub const RENDER_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const RENDER_MAX_CHUNK_BYTES: usize = 1024 * 1024;
 pub const DSAPI_ABI_VERSION: u32 = 0x0001_0000;
+pub const KEYBOARD_EVENT_KIND_CHAR: u32 = 1;
+pub const KEYBOARD_EVENT_KIND_BACKSPACE: u32 = 2;
+pub const KEYBOARD_EVENT_KIND_DONE: u32 = 3;
+pub const KEYBOARD_EVENT_KIND_FOCUS_ON: u32 = 4;
+pub const KEYBOARD_EVENT_KIND_FOCUS_OFF: u32 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct RenderStats {

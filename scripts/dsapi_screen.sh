@@ -64,6 +64,10 @@ screen_start_impl() {
     echo "screen_stream_warn=log_file_not_writable path=$SCREEN_LOG_FILE fallback=$fallback_log"
     SCREEN_LOG_FILE="$fallback_log"
   fi
+  LOG_START_LINE=0
+  if [ -f "$SCREEN_LOG_FILE" ]; then
+    LOG_START_LINE="$(wc -l < "$SCREEN_LOG_FILE" 2>/dev/null || echo 0)"
+  fi
 
   screen_cleanup_orphans_impl "$SCREEN_RUN_AS_ROOT"
 
@@ -91,6 +95,41 @@ screen_start_impl() {
 
   sleep 1
   if pid_is_running "$screen_pid"; then
+    START_MARKER_OK=0
+    START_MARKER_FAIL=0
+    i=0
+    while [ "$i" -lt 40 ]
+    do
+      NEW_LOGS="$(tail -n +"$((LOG_START_LINE + 1))" "$SCREEN_LOG_FILE" 2>/dev/null || true)"
+      if printf '%s\n' "$NEW_LOGS" | grep -q "screen_stream_status=started target_fps="; then
+        START_MARKER_OK=1
+        break
+      fi
+      if printf '%s\n' "$NEW_LOGS" | grep -q "screen_stream_status=failed\\|screen_stream_error="; then
+        START_MARKER_FAIL=1
+        break
+      fi
+      i=$((i + 1))
+      sleep 0.1
+    done
+
+    if [ "$START_MARKER_OK" = "1" ]; then
+      echo "screen_stream_status=started pid=$screen_pid log=$SCREEN_LOG_FILE"
+      return 0
+    fi
+    if [ "$START_MARKER_FAIL" = "1" ]; then
+      screen_kill_pid_if_running "$screen_pid"
+      rm -f "$SCREEN_PID_FILE"
+      echo "screen_stream_status=failed_start marker=failed_in_log"
+      if [ -f "$SCREEN_LOG_FILE" ]; then
+        echo "screen_stream_last_log_start"
+        tail -n 40 "$SCREEN_LOG_FILE"
+        echo "screen_stream_last_log_end"
+      fi
+      return 2
+    fi
+
+    echo "screen_stream_warn=start_marker_timeout pid=$screen_pid log=$SCREEN_LOG_FILE"
     echo "screen_stream_status=started pid=$screen_pid log=$SCREEN_LOG_FILE"
     return 0
   fi
@@ -142,13 +181,13 @@ screen_status_impl() {
 
 screen_run_impl() {
   CONTROL_SOCKET_PATH="$(control_socket_path)"
-  DATA_SOCKET_PATH="$(data_socket_path)"
-  OUT_DIR="${DSAPI_ANDROID_OUT_DIR:-artifacts/android}"
+  OUT_DIR="${DSAPI_ANDROID_OUT_DIR:-artifacts/ksu_module/android_adapter}"
   DEX_JAR="$OUT_DIR/directscreen-adapter-dex.jar"
   MAIN_CLASS="org.directscreenapi.adapter.AndroidAdapterMain"
   APP_PROCESS_BIN="${DSAPI_APP_PROCESS_BIN:-}"
   RUN_AS_ROOT="${DSAPI_SCREEN_RUN_AS_ROOT:-${DSAPI_RUN_AS_ROOT:-1}}"
   TARGET_FPS="${DSAPI_SCREEN_TARGET_FPS:-60}"
+  SUBMIT_MODE="${DSAPI_SCREEN_SUBMIT_MODE:-dmabuf}"
   AUTO_REBUILD="${DSAPI_SCREEN_AUTO_REBUILD:-1}"
   PRECHECK="${DSAPI_SCREEN_PRECHECK:-}"
   if [ -z "$PRECHECK" ]; then
@@ -162,7 +201,7 @@ screen_run_impl() {
   if [ -z "${DSAPI_ANDROID_OUT_DIR:-}" ]; then
     if { [ -d "$OUT_DIR" ] && [ ! -w "$OUT_DIR" ]; } \
       || { [ -d "$OUT_DIR/classes" ] && [ ! -w "$OUT_DIR/classes" ]; }; then
-      OUT_DIR="artifacts/android_user"
+      OUT_DIR="artifacts/ksu_module/android_adapter_user"
       DEX_JAR="$OUT_DIR/directscreen-adapter-dex.jar"
       echo "screen_stream_warn=android_out_dir_not_writable fallback_out_dir=$OUT_DIR"
     fi
@@ -172,18 +211,10 @@ screen_run_impl() {
     echo "screen_stream_error=daemon_control_socket_missing socket=$CONTROL_SOCKET_PATH"
     return 2
   fi
-  if [ ! -S "$DATA_SOCKET_PATH" ]; then
-    echo "screen_stream_error=daemon_data_socket_missing socket=$DATA_SOCKET_PATH"
-    return 2
-  fi
 
   case "$CONTROL_SOCKET_PATH" in
     /*) CONTROL_SOCKET_ABS="$CONTROL_SOCKET_PATH" ;;
     *) CONTROL_SOCKET_ABS="$ROOT_DIR/$CONTROL_SOCKET_PATH" ;;
-  esac
-  case "$DATA_SOCKET_PATH" in
-    /*) DATA_SOCKET_ABS="$DATA_SOCKET_PATH" ;;
-    *) DATA_SOCKET_ABS="$ROOT_DIR/$DATA_SOCKET_PATH" ;;
   esac
 
   if [ "$AUTO_REBUILD" = "1" ] || [ ! -f "$DEX_JAR" ]; then
@@ -200,6 +231,15 @@ screen_run_impl() {
     /*) DEX_JAR_ABS="$DEX_JAR" ;;
     *) DEX_JAR_ABS="$ROOT_DIR/$DEX_JAR" ;;
   esac
+  HWBUFFER_BRIDGE_LIB="${DSAPI_HWBUFFER_BRIDGE_LIB:-$OUT_DIR/libdsapi_hwbuffer_bridge.so}"
+  case "$HWBUFFER_BRIDGE_LIB" in
+    /*) HWBUFFER_BRIDGE_LIB_ABS="$HWBUFFER_BRIDGE_LIB" ;;
+    *) HWBUFFER_BRIDGE_LIB_ABS="$ROOT_DIR/$HWBUFFER_BRIDGE_LIB" ;;
+  esac
+  if [ "$SUBMIT_MODE" = "dmabuf" ] && [ ! -f "$HWBUFFER_BRIDGE_LIB_ABS" ]; then
+    echo "screen_stream_error=hwbuffer_bridge_missing path=$HWBUFFER_BRIDGE_LIB_ABS"
+    return 2
+  fi
 
   if [ -n "$APP_PROCESS_BIN" ] && ! command -v "$APP_PROCESS_BIN" >/dev/null 2>&1 && [ ! -x "$APP_PROCESS_BIN" ]; then
     echo "screen_stream_error=app_process_not_found path=$APP_PROCESS_BIN"
@@ -239,7 +279,7 @@ screen_run_impl() {
     fi
   fi
 
-  echo "screen_stream_exec app_process=$APP_PROCESS_BIN dex=$DEX_JAR_ABS target_fps=$TARGET_FPS"
+  echo "screen_stream_exec app_process=$APP_PROCESS_BIN dex=$DEX_JAR_ABS target_fps=$TARGET_FPS submit_mode=$SUBMIT_MODE"
 
   if [ "$PRECHECK" = "1" ]; then
     if ! CLASSPATH="$DEX_JAR_ABS" "$APP_PROCESS_BIN" /system/bin "$MAIN_CLASS" display-line >/dev/null 2>&1; then
@@ -253,14 +293,19 @@ screen_run_impl() {
       echo "screen_stream_error=su_not_found"
       return 2
     fi
-    su_exec_with_env CLASSPATH "$DEX_JAR_ABS" \
+    su_exec env \
+      "CLASSPATH=$DEX_JAR_ABS" \
+      "DSAPI_SCREEN_SUBMIT_MODE=$SUBMIT_MODE" \
+      "DSAPI_HWBUFFER_BRIDGE_LIB=$HWBUFFER_BRIDGE_LIB_ABS" \
       "$APP_PROCESS_BIN" /system/bin "$MAIN_CLASS" screen-stream \
-      "$CONTROL_SOCKET_ABS" "$DATA_SOCKET_ABS" "$TARGET_FPS"
+      "$CONTROL_SOCKET_ABS" "$TARGET_FPS"
     return 0
   fi
 
+  DSAPI_SCREEN_SUBMIT_MODE="$SUBMIT_MODE" \
+  DSAPI_HWBUFFER_BRIDGE_LIB="$HWBUFFER_BRIDGE_LIB_ABS" \
   CLASSPATH="$DEX_JAR_ABS" "$APP_PROCESS_BIN" /system/bin "$MAIN_CLASS" screen-stream \
-    "$CONTROL_SOCKET_PATH" "$DATA_SOCKET_PATH" "$TARGET_FPS"
+    "$CONTROL_SOCKET_PATH" "$TARGET_FPS"
 }
 
 screen_bench_impl() {

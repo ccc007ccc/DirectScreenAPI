@@ -1,12 +1,10 @@
 android_probe_impl() {
   probe_cmd="${1:-display-kv}"
-  OUT_DIR="${DSAPI_ANDROID_OUT_DIR:-artifacts/android}"
-  if [ -z "${DSAPI_ANDROID_OUT_DIR:-}" ]; then
-    if { [ -d "$OUT_DIR" ] && [ ! -w "$OUT_DIR" ]; } \
-      || { [ -d "$OUT_DIR/classes" ] && [ ! -w "$OUT_DIR/classes" ]; }; then
-      OUT_DIR="artifacts/android_user"
-      echo "android_probe_warn=android_out_dir_not_writable fallback_out_dir=$OUT_DIR"
-    fi
+  OUT_DIR="${DSAPI_ANDROID_OUT_DIR:-artifacts/ksu_module/android_adapter}"
+  if { [ -d "$OUT_DIR" ] && [ ! -w "$OUT_DIR" ]; } \
+    || { [ -d "$OUT_DIR/classes" ] && [ ! -w "$OUT_DIR/classes" ]; }; then
+    echo "android_probe_error=android_out_dir_not_writable path=$OUT_DIR"
+    return 2
   fi
   DEX_JAR="$OUT_DIR/directscreen-adapter-dex.jar"
   MAIN_CLASS="org.directscreenapi.adapter.AndroidAdapterMain"

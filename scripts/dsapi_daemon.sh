@@ -1,3 +1,28 @@
+daemon_ready_probe_impl() {
+  ctl_bin="$1"
+  socket_path="$2"
+  ready_line="$("$ctl_bin" --socket "$socket_path" READY 2>/dev/null || true)"
+  printf '%s\n' "$ready_line" | grep -q '^OK state=ready '
+}
+
+daemon_wait_ready_impl() {
+  ctl_bin="$1"
+  socket_path="$2"
+  max_tries="${3:-20}"
+  interval_s="${4:-0.1}"
+
+  i=0
+  while [ "$i" -lt "$max_tries" ]
+  do
+    if [ -S "$socket_path" ] && daemon_ready_probe_impl "$ctl_bin" "$socket_path"; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep "$interval_s"
+  done
+  return 1
+}
+
 daemon_start_impl() {
   DAEMON_CONTROL_SOCKET_PATH="$(control_socket_path)"
   DAEMON_DATA_SOCKET_PATH="$(data_socket_path)"
@@ -48,16 +73,9 @@ daemon_start_impl() {
     daemon_ready=0
     daemon_ctl_bin="$(release_bin dsapictl)"
     if [ -x "$daemon_ctl_bin" ]; then
-      i=0
-      while [ "$i" -lt 20 ]; do
-        if [ -S "$DAEMON_CONTROL_SOCKET_PATH" ] \
-          && "$daemon_ctl_bin" --socket "$DAEMON_CONTROL_SOCKET_PATH" PING >/dev/null 2>&1; then
-          daemon_ready=1
-          break
-        fi
-        i=$((i + 1))
-        sleep 0.1
-      done
+      if daemon_wait_ready_impl "$daemon_ctl_bin" "$DAEMON_CONTROL_SOCKET_PATH" 20 0.1; then
+        daemon_ready=1
+      fi
     else
       daemon_ready=1
     fi
@@ -96,8 +114,8 @@ daemon_status_impl() {
     fi
     if [ -S "$DAEMON_CONTROL_SOCKET_PATH" ] && [ -S "$DAEMON_DATA_SOCKET_PATH" ]; then
       if [ -x "$(release_bin dsapictl)" ] \
-        && ! "$(release_bin dsapictl)" --socket "$DAEMON_CONTROL_SOCKET_PATH" PING >/dev/null 2>&1; then
-        echo "daemon_status=degraded pid=$pid control_probe_failed=1 control_socket=$DAEMON_CONTROL_SOCKET_PATH data_socket=$DAEMON_DATA_SOCKET_PATH"
+        && ! daemon_ready_probe_impl "$(release_bin dsapictl)" "$DAEMON_CONTROL_SOCKET_PATH"; then
+        echo "daemon_status=degraded pid=$pid ready_probe_failed=1 control_socket=$DAEMON_CONTROL_SOCKET_PATH data_socket=$DAEMON_DATA_SOCKET_PATH"
         return 1
       fi
       echo "daemon_status=running pid=$pid control_socket=$DAEMON_CONTROL_SOCKET_PATH data_socket=$DAEMON_DATA_SOCKET_PATH"

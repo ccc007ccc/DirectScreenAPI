@@ -3,13 +3,14 @@ use std::io::{Read, Write};
 use crate::api::Status;
 use crate::engine::{
     BinaryOpcode, BINARY_COMMAND_HEADER_BYTES, BINARY_PROTOCOL_MAGIC, BINARY_PROTOCOL_VERSION,
-    BINARY_RESPONSE_PAYLOAD_BYTES, BINARY_RESPONSE_VALUE_COUNT,
+    BINARY_RESPONSE_VALUE_COUNT,
 };
 
 #[derive(Debug, Clone)]
 pub enum BinaryCtlCommand {
     Ping,
     Version,
+    ReadyGet,
     DisplayGet,
     DisplayWait {
         last_seq: u64,
@@ -40,6 +41,30 @@ pub enum BinaryCtlCommand {
     },
     FilterClear,
     FilterGet,
+    KeyboardInject {
+        kind: u32,
+        codepoint: u32,
+    },
+    KeyboardWait {
+        last_seq: u64,
+        timeout_ms: u32,
+    },
+    RenderFrameBindShm,
+    RenderFrameWaitShmPresent {
+        last_seq: u64,
+        timeout_ms: u32,
+    },
+    RenderFrameSubmitShm {
+        width: u32,
+        height: u32,
+        byte_len: u32,
+        offset: u32,
+        origin_x: i32,
+        origin_y: i32,
+    },
+    ModuleRpc {
+        command: String,
+    },
     Shutdown,
 }
 
@@ -49,12 +74,13 @@ pub struct BinaryCtlGaussianPass {
     pub sigma: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BinaryCtlResponse {
     pub seq: u64,
     pub opcode: u16,
     pub status: Status,
     pub values: [u64; BINARY_RESPONSE_VALUE_COUNT],
+    pub body: Vec<u8>,
 }
 
 fn parse_u32(token: &str) -> Result<u32, String> {
@@ -79,6 +105,20 @@ fn parse_f32(token: &str) -> Result<f32, String> {
     token
         .parse::<f32>()
         .map_err(|_| format!("invalid_f32:{}", token))
+}
+
+fn parse_keyboard_codepoint(token: &str) -> Result<u32, String> {
+    if let Ok(v) = parse_u32(token) {
+        return Ok(v);
+    }
+    let mut chars = token.chars();
+    let Some(ch) = chars.next() else {
+        return Err("keyboard_codepoint_empty".to_string());
+    };
+    if chars.next().is_some() {
+        return Err(format!("invalid_keyboard_codepoint:{}", token));
+    }
+    Ok(ch as u32)
 }
 
 fn parse_filter_chain_passes(
@@ -122,6 +162,15 @@ fn format_filter_info(values: &[u64; BINARY_RESPONSE_VALUE_COUNT]) -> String {
     )
 }
 
+fn format_ready_state(state_code: u64) -> &'static str {
+    match state_code {
+        0 => "starting",
+        1 => "ready",
+        2 => "stopping",
+        _ => "unknown",
+    }
+}
+
 pub fn parse_command_tokens(tokens: &[&str]) -> Result<BinaryCtlCommand, String> {
     if tokens.is_empty() {
         return Err("empty_command".to_string());
@@ -139,6 +188,12 @@ pub fn parse_command_tokens(tokens: &[&str]) -> Result<BinaryCtlCommand, String>
             return Err("version_args_invalid".to_string());
         }
         return Ok(BinaryCtlCommand::Version);
+    }
+    if cmd.eq_ignore_ascii_case("READY") || cmd.eq_ignore_ascii_case("READY_GET") {
+        if tokens.len() != 1 {
+            return Err("ready_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::ReadyGet);
     }
     if cmd.eq_ignore_ascii_case("DISPLAY_GET") {
         if tokens.len() != 1 {
@@ -233,11 +288,121 @@ pub fn parse_command_tokens(tokens: &[&str]) -> Result<BinaryCtlCommand, String>
         }
         return Ok(BinaryCtlCommand::FilterGet);
     }
+    if cmd.eq_ignore_ascii_case("KEYBOARD_CHAR") {
+        if tokens.len() != 2 {
+            return Err("keyboard_char_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::KeyboardInject {
+            kind: crate::api::KEYBOARD_EVENT_KIND_CHAR,
+            codepoint: parse_keyboard_codepoint(tokens[1])?,
+        });
+    }
+    if cmd.eq_ignore_ascii_case("KEYBOARD_BACKSPACE") {
+        if tokens.len() != 1 {
+            return Err("keyboard_backspace_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::KeyboardInject {
+            kind: crate::api::KEYBOARD_EVENT_KIND_BACKSPACE,
+            codepoint: 0,
+        });
+    }
+    if cmd.eq_ignore_ascii_case("KEYBOARD_DONE") {
+        if tokens.len() != 1 {
+            return Err("keyboard_done_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::KeyboardInject {
+            kind: crate::api::KEYBOARD_EVENT_KIND_DONE,
+            codepoint: 0,
+        });
+    }
+    if cmd.eq_ignore_ascii_case("KEYBOARD_FOCUS_ON") {
+        if tokens.len() != 1 {
+            return Err("keyboard_focus_on_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::KeyboardInject {
+            kind: crate::api::KEYBOARD_EVENT_KIND_FOCUS_ON,
+            codepoint: 0,
+        });
+    }
+    if cmd.eq_ignore_ascii_case("KEYBOARD_FOCUS_OFF") {
+        if tokens.len() != 1 {
+            return Err("keyboard_focus_off_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::KeyboardInject {
+            kind: crate::api::KEYBOARD_EVENT_KIND_FOCUS_OFF,
+            codepoint: 0,
+        });
+    }
+    if cmd.eq_ignore_ascii_case("KEYBOARD_INJECT") {
+        if tokens.len() != 3 {
+            return Err("keyboard_inject_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::KeyboardInject {
+            kind: parse_u32(tokens[1])?,
+            codepoint: parse_u32(tokens[2])?,
+        });
+    }
+    if cmd.eq_ignore_ascii_case("KEYBOARD_WAIT") {
+        if tokens.len() != 3 {
+            return Err("keyboard_wait_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::KeyboardWait {
+            last_seq: parse_u64(tokens[1])?,
+            timeout_ms: parse_u32(tokens[2])?,
+        });
+    }
+    if cmd.eq_ignore_ascii_case("RENDER_FRAME_BIND_SHM") {
+        if tokens.len() != 1 {
+            return Err("render_frame_bind_shm_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::RenderFrameBindShm);
+    }
+    if cmd.eq_ignore_ascii_case("RENDER_FRAME_WAIT_SHM_PRESENT") {
+        if tokens.len() != 3 {
+            return Err("render_frame_wait_shm_present_args_invalid".to_string());
+        }
+        return Ok(BinaryCtlCommand::RenderFrameWaitShmPresent {
+            last_seq: parse_u64(tokens[1])?,
+            timeout_ms: parse_u32(tokens[2])?,
+        });
+    }
+    if cmd.eq_ignore_ascii_case("RENDER_FRAME_SUBMIT_SHM") {
+        if tokens.len() != 5 && tokens.len() != 7 {
+            return Err("render_frame_submit_shm_args_invalid".to_string());
+        }
+        let width = parse_u32(tokens[1])?;
+        let height = parse_u32(tokens[2])?;
+        let byte_len = parse_u32(tokens[3])?;
+        let offset = parse_u32(tokens[4])?;
+        let origin_x = if tokens.len() == 7 {
+            parse_i32(tokens[5])?
+        } else {
+            0
+        };
+        let origin_y = if tokens.len() == 7 {
+            parse_i32(tokens[6])?
+        } else {
+            0
+        };
+        return Ok(BinaryCtlCommand::RenderFrameSubmitShm {
+            width,
+            height,
+            byte_len,
+            offset,
+            origin_x,
+            origin_y,
+        });
+    }
     if cmd.eq_ignore_ascii_case("SHUTDOWN") {
         if tokens.len() != 1 {
             return Err("shutdown_args_invalid".to_string());
         }
         return Ok(BinaryCtlCommand::Shutdown);
+    }
+    if cmd.starts_with("MODULE_") {
+        return Ok(BinaryCtlCommand::ModuleRpc {
+            command: tokens.join(" "),
+        });
     }
 
     Err(format!("unsupported_command:{}", tokens[0]))
@@ -252,6 +417,7 @@ fn opcode_of(cmd: &BinaryCtlCommand) -> BinaryOpcode {
     match cmd {
         BinaryCtlCommand::Ping => BinaryOpcode::Ping,
         BinaryCtlCommand::Version => BinaryOpcode::Version,
+        BinaryCtlCommand::ReadyGet => BinaryOpcode::ReadyGet,
         BinaryCtlCommand::DisplayGet => BinaryOpcode::DisplayGet,
         BinaryCtlCommand::DisplayWait { .. } => BinaryOpcode::DisplayWait,
         BinaryCtlCommand::DisplaySet { .. } => BinaryOpcode::DisplaySet,
@@ -263,6 +429,14 @@ fn opcode_of(cmd: &BinaryCtlCommand) -> BinaryOpcode {
         BinaryCtlCommand::FilterChainSet { .. } => BinaryOpcode::FilterChainSet,
         BinaryCtlCommand::FilterClear => BinaryOpcode::FilterClear,
         BinaryCtlCommand::FilterGet => BinaryOpcode::FilterGet,
+        BinaryCtlCommand::KeyboardInject { .. } => BinaryOpcode::KeyboardInject,
+        BinaryCtlCommand::KeyboardWait { .. } => BinaryOpcode::KeyboardWait,
+        BinaryCtlCommand::RenderFrameBindShm => BinaryOpcode::RenderFrameBindShm,
+        BinaryCtlCommand::RenderFrameWaitShmPresent { .. } => {
+            BinaryOpcode::RenderFrameWaitShmPresent
+        }
+        BinaryCtlCommand::RenderFrameSubmitShm { .. } => BinaryOpcode::RenderFrameSubmitShm,
+        BinaryCtlCommand::ModuleRpc { .. } => BinaryOpcode::ModuleRpc,
         BinaryCtlCommand::Shutdown => BinaryOpcode::Shutdown,
     }
 }
@@ -271,6 +445,7 @@ fn payload_of(cmd: &BinaryCtlCommand) -> Vec<u8> {
     match cmd {
         BinaryCtlCommand::Ping
         | BinaryCtlCommand::Version
+        | BinaryCtlCommand::ReadyGet
         | BinaryCtlCommand::DisplayGet
         | BinaryCtlCommand::TouchClear
         | BinaryCtlCommand::TouchCount
@@ -331,6 +506,49 @@ fn payload_of(cmd: &BinaryCtlCommand) -> Vec<u8> {
             }
             out
         }
+        BinaryCtlCommand::KeyboardInject { kind, codepoint } => {
+            let mut out = Vec::with_capacity(8);
+            out.extend_from_slice(&kind.to_le_bytes());
+            out.extend_from_slice(&codepoint.to_le_bytes());
+            out
+        }
+        BinaryCtlCommand::KeyboardWait {
+            last_seq,
+            timeout_ms,
+        } => {
+            let mut out = Vec::with_capacity(12);
+            out.extend_from_slice(&last_seq.to_le_bytes());
+            out.extend_from_slice(&timeout_ms.to_le_bytes());
+            out
+        }
+        BinaryCtlCommand::RenderFrameBindShm => Vec::new(),
+        BinaryCtlCommand::RenderFrameWaitShmPresent {
+            last_seq,
+            timeout_ms,
+        } => {
+            let mut out = Vec::with_capacity(12);
+            out.extend_from_slice(&last_seq.to_le_bytes());
+            out.extend_from_slice(&timeout_ms.to_le_bytes());
+            out
+        }
+        BinaryCtlCommand::RenderFrameSubmitShm {
+            width,
+            height,
+            byte_len,
+            offset,
+            origin_x,
+            origin_y,
+        } => {
+            let mut out = Vec::with_capacity(24);
+            out.extend_from_slice(&width.to_le_bytes());
+            out.extend_from_slice(&height.to_le_bytes());
+            out.extend_from_slice(&byte_len.to_le_bytes());
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&origin_x.to_le_bytes());
+            out.extend_from_slice(&origin_y.to_le_bytes());
+            out
+        }
+        BinaryCtlCommand::ModuleRpc { command } => command.as_bytes().to_vec(),
     }
 }
 
@@ -361,6 +579,7 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result
                 ));
             }
             Ok(n) => offset += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }
@@ -407,15 +626,21 @@ pub fn read_response<R: Read>(reader: &mut R) -> std::io::Result<Option<BinaryCt
             "binary_response_header_invalid",
         ));
     }
-    if payload_len != BINARY_RESPONSE_PAYLOAD_BYTES {
+    if payload_len < 4 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "binary_response_payload_len_invalid",
         ));
     }
 
-    let mut payload = [0u8; BINARY_RESPONSE_PAYLOAD_BYTES];
-    read_exact_or_eof(reader, &mut payload)?;
+    let mut payload = vec![0u8; payload_len];
+    let has_payload = read_exact_or_eof(reader, &mut payload)?;
+    if !has_payload {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "binary_response_payload_missing",
+        ));
+    }
 
     let status_i32 = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let status = Status::from_i32(status_i32).ok_or_else(|| {
@@ -426,18 +651,66 @@ pub fn read_response<R: Read>(reader: &mut R) -> std::io::Result<Option<BinaryCt
     })?;
 
     let mut values = [0u64; BINARY_RESPONSE_VALUE_COUNT];
+    let max_value_bytes = BINARY_RESPONSE_VALUE_COUNT.saturating_mul(8usize);
+    let value_bytes = payload.len().saturating_sub(4).min(max_value_bytes);
+    let value_slots = value_bytes / 8;
     let mut cursor = 4usize;
-    for slot in values.iter_mut() {
-        *slot = read_u64_le(&payload, cursor);
+    for idx in 0..value_slots {
+        values[idx] = read_u64_le(&payload, cursor);
         cursor += 8;
     }
+    let body_offset = 4usize.saturating_add(max_value_bytes);
+    let body = if payload.len() > body_offset {
+        payload[body_offset..].to_vec()
+    } else {
+        Vec::new()
+    };
 
     Ok(Some(BinaryCtlResponse {
         seq,
         opcode,
         status,
         values,
+        body,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, ErrorKind};
+
+    fn encode_test_response_frame(status: Status, values: [u64; BINARY_RESPONSE_VALUE_COUNT]) -> Vec<u8> {
+        let payload_bytes = 4usize + (BINARY_RESPONSE_VALUE_COUNT * 8usize);
+        let mut out = Vec::with_capacity(BINARY_COMMAND_HEADER_BYTES + payload_bytes);
+        out.extend_from_slice(&BINARY_PROTOCOL_MAGIC.to_le_bytes());
+        out.extend_from_slice(&BINARY_PROTOCOL_VERSION.to_le_bytes());
+        out.extend_from_slice(&(BinaryOpcode::Ping as u16).to_le_bytes());
+        out.extend_from_slice(&(payload_bytes as u32).to_le_bytes());
+        out.extend_from_slice(&42u64.to_le_bytes());
+        out.extend_from_slice(&(status as i32).to_le_bytes());
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn read_response_returns_none_on_clean_eof() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let got = read_response(&mut cursor).expect("eof should not fail");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn read_response_payload_missing_returns_unexpected_eof() {
+        let frame = encode_test_response_frame(Status::Ok, [0u64; BINARY_RESPONSE_VALUE_COUNT]);
+        let truncated = frame[..BINARY_COMMAND_HEADER_BYTES].to_vec();
+        let mut cursor = Cursor::new(truncated);
+        let err = read_response(&mut cursor)
+            .expect_err("payload eof must fail");
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+    }
 }
 
 pub fn write_request<W: Write>(
@@ -453,6 +726,12 @@ pub fn write_request<W: Write>(
 
 pub fn format_response(cmd: &BinaryCtlCommand, resp: &BinaryCtlResponse) -> String {
     if resp.status != Status::Ok {
+        if !resp.body.is_empty() {
+            let body = String::from_utf8_lossy(&resp.body).trim().to_string();
+            if !body.is_empty() {
+                return format!("ERR {} {}", resp.status.as_str(), body);
+            }
+        }
         return format!("ERR {}", resp.status.as_str());
     }
 
@@ -462,6 +741,21 @@ pub fn format_response(cmd: &BinaryCtlCommand, resp: &BinaryCtlResponse) -> Stri
             "OK {}.{}.{}",
             resp.values[0], resp.values[1], resp.values[2]
         ),
+        BinaryCtlCommand::ReadyGet => {
+            let state_code = resp.values[0];
+            let state = format_ready_state(state_code);
+            format!(
+                "OK state={} state_code={} boot_id={} uptime_ms={} pid={} module_count={} module_event_seq={} module_error={}",
+                state,
+                state_code,
+                resp.values[1],
+                resp.values[2],
+                resp.values[3],
+                resp.values[4],
+                resp.values[5],
+                resp.values[6]
+            )
+        }
         BinaryCtlCommand::DisplayGet => {
             let refresh = f32::from_bits(resp.values[2] as u32);
             format!(
@@ -503,6 +797,57 @@ pub fn format_response(cmd: &BinaryCtlCommand, resp: &BinaryCtlResponse) -> Stri
         BinaryCtlCommand::FilterChainSet { .. }
         | BinaryCtlCommand::FilterClear
         | BinaryCtlCommand::FilterGet => format!("OK {}", format_filter_info(&resp.values)),
+        BinaryCtlCommand::KeyboardInject { .. } => format!(
+            "OK seq={} kind={} codepoint={}",
+            resp.values[0], resp.values[1], resp.values[2]
+        ),
+        BinaryCtlCommand::KeyboardWait { .. } => {
+            if resp.values[3] == 0 {
+                "OK TIMEOUT".to_string()
+            } else {
+                format!(
+                    "OK seq={} kind={} codepoint={}",
+                    resp.values[0], resp.values[1], resp.values[2]
+                )
+            }
+        }
+        BinaryCtlCommand::RenderFrameBindShm => {
+            format!(
+                "OK SHM_BOUND {} {} fd_attached={}",
+                resp.values[0], resp.values[1], resp.values[2]
+            )
+        }
+        BinaryCtlCommand::RenderFrameWaitShmPresent { .. } => {
+            if resp.values[3] == 0 {
+                "OK TIMEOUT".to_string()
+            } else {
+                format!(
+                    "OK {} {} {} RGBA8888 {} {} {} {} {}",
+                    resp.values[0],
+                    resp.values[1],
+                    resp.values[2],
+                    resp.values[3],
+                    resp.values[4],
+                    resp.values[5],
+                    resp.values[6] as i64 as i32,
+                    resp.values[7] as i64 as i32
+                )
+            }
+        }
+        BinaryCtlCommand::RenderFrameSubmitShm { .. } => {
+            format!(
+                "OK {} {} {} RGBA8888 {} {}",
+                resp.values[0], resp.values[1], resp.values[2], resp.values[3], resp.values[4]
+            )
+        }
+        BinaryCtlCommand::ModuleRpc { .. } => {
+            let body = String::from_utf8_lossy(&resp.body).to_string();
+            if body.trim().is_empty() {
+                "OK".to_string()
+            } else {
+                body.trim_end().to_string()
+            }
+        }
         BinaryCtlCommand::Shutdown => "OK SHUTDOWN".to_string(),
     }
 }

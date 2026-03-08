@@ -33,7 +33,7 @@
   验收：控制面仅接受 `DSAP` 二进制帧，响应为固定 `status + [u64;8]`。
 
 - [x] 控制面命令集明确收敛
-  动作：实现并暴露 `PING / VERSION / SHUTDOWN / DISPLAY_GET / DISPLAY_SET / TOUCH_CLEAR / TOUCH_COUNT / TOUCH_MOVE / RENDER_SUBMIT / RENDER_GET`。
+  动作：实现并暴露 `PING / VERSION / READY_GET / SHUTDOWN / DISPLAY_GET / DISPLAY_SET / TOUCH_CLEAR / TOUCH_COUNT / TOUCH_MOVE / RENDER_SUBMIT / RENDER_GET`。
   验收：`dsapictl` 与 `dsapistream` 全部通过二进制 opcode 通信。
 
 - [x] 移除旧文本解析热路径分配

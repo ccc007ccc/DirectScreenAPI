@@ -4,8 +4,25 @@ presenter_kill_pid_if_running() {
     return 0
   fi
   kill -- "-$target_pid" >/dev/null 2>&1 || kill "$target_pid" >/dev/null 2>&1 || true
-  sleep 0.1
+  i=0
+  while [ "$i" -lt 30 ]
+  do
+    if ! pid_is_running "$target_pid"; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 0.1
+  done
   kill -KILL -- "-$target_pid" >/dev/null 2>&1 || kill -KILL "$target_pid" >/dev/null 2>&1 || true
+  i=0
+  while [ "$i" -lt 10 ]
+  do
+    if ! pid_is_running "$target_pid"; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 0.1
+  done
 }
 
 presenter_collect_nonroot_pids() {
@@ -35,8 +52,25 @@ presenter_cleanup_orphans_impl() {
     for pid in $(presenter_collect_root_pids "AndroidAdapterMain.*present-loop")
     do
       su_exec kill -- "-$pid" >/dev/null 2>&1 || su_exec kill "$pid" >/dev/null 2>&1 || true
-      sleep 0.1
+      i=0
+      while [ "$i" -lt 30 ]
+      do
+        if ! su_exec kill -0 "$pid" >/dev/null 2>&1; then
+          break
+        fi
+        i=$((i + 1))
+        sleep 0.1
+      done
       su_exec kill -KILL -- "-$pid" >/dev/null 2>&1 || su_exec kill -KILL "$pid" >/dev/null 2>&1 || true
+      i=0
+      while [ "$i" -lt 10 ]
+      do
+        if ! su_exec kill -0 "$pid" >/dev/null 2>&1; then
+          break
+        fi
+        i=$((i + 1))
+        sleep 0.1
+      done
     done
   fi
 }
@@ -46,23 +80,18 @@ presenter_start_impl() {
   PRESENTER_LOG_FILE="${DSAPI_PRESENTER_LOG_FILE:-artifacts/run/dsapi_presenter.log}"
   PRESENTER_SUPERVISE="${DSAPI_SUPERVISE_PRESENTER:-0}"
   PRESENTER_USE_SETSID="${DSAPI_PRESENTER_USE_SETSID:-1}"
+  PRESENTER_DAEMON_READY_RETRIES="${DSAPI_PRESENTER_DAEMON_READY_RETRIES:-40}"
+  DAEMON_CONTROL_SOCKET_PATH="$(control_socket_path)"
 
   mkdir -p "$(dirname "$PRESENTER_PID_FILE")"
   mkdir -p "$(dirname "$PRESENTER_LOG_FILE")"
-
   if ! ( : >>"$PRESENTER_LOG_FILE" ) 2>/dev/null; then
-    if [ -n "${DSAPI_PRESENTER_LOG_FILE:-}" ]; then
-      echo "presenter_error=log_file_not_writable path=$PRESENTER_LOG_FILE"
-      return 2
-    fi
-    fallback_log="artifacts/run/dsapi_presenter_user.log"
-    mkdir -p "$(dirname "$fallback_log")"
-    if ! ( : >>"$fallback_log" ) 2>/dev/null; then
-      echo "presenter_error=log_file_not_writable path=$PRESENTER_LOG_FILE fallback=$fallback_log"
-      return 2
-    fi
-    echo "presenter_warn=log_file_not_writable path=$PRESENTER_LOG_FILE fallback=$fallback_log"
-    PRESENTER_LOG_FILE="$fallback_log"
+    echo "presenter_error=log_file_not_writable path=$PRESENTER_LOG_FILE"
+    return 2
+  fi
+  LOG_START_LINE=0
+  if [ -f "$PRESENTER_LOG_FILE" ]; then
+    LOG_START_LINE="$(wc -l < "$PRESENTER_LOG_FILE" 2>/dev/null || echo 0)"
   fi
 
   if [ "$PRESENTER_SUPERVISE" = "1" ]; then
@@ -85,6 +114,13 @@ presenter_start_impl() {
   if ! daemon_status_impl >/dev/null 2>&1; then
     daemon_start_impl >/dev/null
   fi
+  daemon_ctl_bin="$(release_bin dsapictl)"
+  if [ -x "$daemon_ctl_bin" ]; then
+    if ! daemon_wait_ready_impl "$daemon_ctl_bin" "$DAEMON_CONTROL_SOCKET_PATH" "$PRESENTER_DAEMON_READY_RETRIES" 0.1; then
+      echo "presenter_error=daemon_not_ready control_socket=$DAEMON_CONTROL_SOCKET_PATH"
+      return 2
+    fi
+  fi
 
   android_sync_display_impl >/dev/null 2>&1 || true
 
@@ -98,6 +134,41 @@ presenter_start_impl() {
 
   sleep 1
   if pid_is_running "$presenter_pid"; then
+    START_MARKER_OK=0
+    START_MARKER_FAIL=0
+    i=0
+    while [ "$i" -lt 40 ]
+    do
+      NEW_LOGS="$(tail -n +"$((LOG_START_LINE + 1))" "$PRESENTER_LOG_FILE" 2>/dev/null || true)"
+      if printf '%s\n' "$NEW_LOGS" | grep -q "presenter_status=started"; then
+        START_MARKER_OK=1
+        break
+      fi
+      if printf '%s\n' "$NEW_LOGS" | grep -q "presenter_status=failed\\|presenter_error="; then
+        START_MARKER_FAIL=1
+        break
+      fi
+      i=$((i + 1))
+      sleep 0.1
+    done
+
+    if [ "$START_MARKER_OK" = "1" ]; then
+      echo "presenter_status=started pid=$presenter_pid log=$PRESENTER_LOG_FILE"
+      return 0
+    fi
+    if [ "$START_MARKER_FAIL" = "1" ]; then
+      presenter_kill_pid_if_running "$presenter_pid"
+      rm -f "$PRESENTER_PID_FILE"
+      echo "presenter_status=failed_start marker=failed_in_log"
+      if [ -f "$PRESENTER_LOG_FILE" ]; then
+        echo "presenter_last_log_start"
+        tail -n 30 "$PRESENTER_LOG_FILE"
+        echo "presenter_last_log_end"
+      fi
+      return 2
+    fi
+
+    echo "presenter_warn=start_marker_timeout pid=$presenter_pid log=$PRESENTER_LOG_FILE"
     echo "presenter_status=started pid=$presenter_pid log=$PRESENTER_LOG_FILE"
     return 0
   fi
@@ -168,13 +239,12 @@ presenter_status_impl() {
 
 presenter_run_impl() {
   CONTROL_SOCKET_PATH="$(control_socket_path)"
-  DATA_SOCKET_PATH="$(data_socket_path)"
-  OUT_DIR="${DSAPI_ANDROID_OUT_DIR:-artifacts/android}"
+  OUT_DIR="${DSAPI_ANDROID_OUT_DIR:-artifacts/ksu_module/android_adapter}"
   DEX_JAR="$OUT_DIR/directscreen-adapter-dex.jar"
   MAIN_CLASS="org.directscreenapi.adapter.AndroidAdapterMain"
   APP_PROCESS_BIN="${DSAPI_APP_PROCESS_BIN:-}"
   RUN_AS_ROOT="${DSAPI_RUN_AS_ROOT:-1}"
-  POLL_MS="${DSAPI_PRESENTER_POLL_MS:-2}"
+  WAIT_TIMEOUT_MS="${DSAPI_PRESENTER_WAIT_TIMEOUT_MS:-0}"
   LAYER_Z="${DSAPI_PRESENTER_LAYER_Z:-1000000}"
   LAYER_NAME="${DSAPI_PRESENTER_LAYER_NAME:-DirectScreenAPI}"
   BLUR_RADIUS="${DSAPI_PRESENTER_BLUR_RADIUS:-0}"
@@ -184,21 +254,14 @@ presenter_run_impl() {
   AUTO_REBUILD="${DSAPI_PRESENTER_AUTO_REBUILD:-1}"
   PRECHECK="${DSAPI_PRESENTER_PRECHECK:-1}"
 
-  if [ -z "${DSAPI_ANDROID_OUT_DIR:-}" ]; then
-    if { [ -d "$OUT_DIR" ] && [ ! -w "$OUT_DIR" ]; } \
-      || { [ -d "$OUT_DIR/classes" ] && [ ! -w "$OUT_DIR/classes" ]; }; then
-      OUT_DIR="artifacts/android_user"
-      DEX_JAR="$OUT_DIR/directscreen-adapter-dex.jar"
-      echo "presenter_warn=android_out_dir_not_writable fallback_out_dir=$OUT_DIR"
-    fi
+  if { [ -d "$OUT_DIR" ] && [ ! -w "$OUT_DIR" ]; } \
+    || { [ -d "$OUT_DIR/classes" ] && [ ! -w "$OUT_DIR/classes" ]; }; then
+    echo "presenter_error=android_out_dir_not_writable path=$OUT_DIR"
+    return 2
   fi
 
   if [ ! -S "$CONTROL_SOCKET_PATH" ]; then
     echo "presenter_error=daemon_control_socket_missing socket=$CONTROL_SOCKET_PATH"
-    return 2
-  fi
-  if [ ! -S "$DATA_SOCKET_PATH" ]; then
-    echo "presenter_error=daemon_data_socket_missing socket=$DATA_SOCKET_PATH"
     return 2
   fi
 
@@ -206,18 +269,11 @@ presenter_run_impl() {
     /*) CONTROL_SOCKET_ABS="$CONTROL_SOCKET_PATH" ;;
     *) CONTROL_SOCKET_ABS="$ROOT_DIR/$CONTROL_SOCKET_PATH" ;;
   esac
-  case "$DATA_SOCKET_PATH" in
-    /*) DATA_SOCKET_ABS="$DATA_SOCKET_PATH" ;;
-    *) DATA_SOCKET_ABS="$ROOT_DIR/$DATA_SOCKET_PATH" ;;
-  esac
 
   if [ "$AUTO_REBUILD" = "1" ] || [ ! -f "$DEX_JAR" ]; then
     if ! DSAPI_ANDROID_BUILD_MODE=presenter ./scripts/build_android_adapter.sh >/dev/null; then
-      if [ ! -f "$DEX_JAR" ]; then
-        echo "presenter_error=android_adapter_build_failed_no_cached_dex path=$DEX_JAR"
-        return 2
-      fi
-      echo "presenter_warn=android_adapter_build_failed_using_cached_dex path=$DEX_JAR"
+      echo "presenter_error=android_adapter_build_failed path=$DEX_JAR"
+      return 2
     fi
   fi
 
@@ -280,12 +336,12 @@ presenter_run_impl() {
     fi
     su_exec_with_env CLASSPATH "$DEX_JAR_ABS" \
       "$APP_PROCESS_BIN" /system/bin "$MAIN_CLASS" present-loop \
-      "$CONTROL_SOCKET_ABS" "$DATA_SOCKET_ABS" "$POLL_MS" "$LAYER_Z" "$LAYER_NAME" \
+      "$CONTROL_SOCKET_ABS" "$WAIT_TIMEOUT_MS" "$LAYER_Z" "$LAYER_NAME" \
       "$BLUR_RADIUS" "$BLUR_SIGMA" "$FILTER_CHAIN" "$FRAME_RATE_MODE"
     return 0
   fi
 
   CLASSPATH="$DEX_JAR_ABS" "$APP_PROCESS_BIN" /system/bin "$MAIN_CLASS" present-loop \
-    "$CONTROL_SOCKET_PATH" "$DATA_SOCKET_PATH" "$POLL_MS" "$LAYER_Z" "$LAYER_NAME" \
+    "$CONTROL_SOCKET_PATH" "$WAIT_TIMEOUT_MS" "$LAYER_Z" "$LAYER_NAME" \
     "$BLUR_RADIUS" "$BLUR_SIGMA" "$FILTER_CHAIN" "$FRAME_RATE_MODE"
 }

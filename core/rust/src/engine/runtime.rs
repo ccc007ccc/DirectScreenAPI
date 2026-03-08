@@ -1,11 +1,16 @@
 use crate::api::{
     Decision, DisplayState, RectRegion, RenderFrameChunk, RenderFrameInfo, RenderStats,
-    RouteResult, Status, TouchEvent, RENDER_MAX_CHUNK_BYTES, RENDER_MAX_FRAME_BYTES,
-    TOUCH_MAX_POINTERS,
+    RouteResult, Status, TouchEvent, KEYBOARD_EVENT_KIND_BACKSPACE, KEYBOARD_EVENT_KIND_CHAR,
+    KEYBOARD_EVENT_KIND_DONE, KEYBOARD_EVENT_KIND_FOCUS_OFF, KEYBOARD_EVENT_KIND_FOCUS_ON,
+    RENDER_MAX_CHUNK_BYTES, RENDER_MAX_FRAME_BYTES, TOUCH_MAX_POINTERS,
 };
 use crate::backend::filter::{apply_filter_pipeline_rgba, FilterPipeline};
 use crate::backend::vulkan::VulkanBackend;
-use std::collections::HashMap;
+use crate::engine::module_registry::{
+    ModuleErrorRecord, ModuleRecord, ModuleRegistryError, ModuleReloadAllResult,
+};
+use crate::engine::module_runtime::{ModuleRuntime, ModuleRuntimeConfig, ModuleRuntimeRpcError};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{create_dir_all, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -38,6 +43,21 @@ struct StoredRenderFrame {
 }
 
 type FrameSnapshot = (RenderFrameInfo, Arc<[u8]>, i32, i32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyboardEvent {
+    pub seq: u64,
+    pub kind: u32,
+    pub codepoint: u32,
+}
+
+#[derive(Debug, Default)]
+struct KeyboardState {
+    next_seq: u64,
+    events: VecDeque<KeyboardEvent>,
+}
+
+const KEYBOARD_EVENT_QUEUE_MAX: usize = 1024;
 
 #[derive(Debug)]
 struct RouteState {
@@ -106,19 +126,32 @@ pub struct RuntimeEngine {
     display_signal_cv: Condvar,
     frame_signal_seq: Mutex<u64>,
     frame_signal_cv: Condvar,
+    keyboard_state: Mutex<KeyboardState>,
+    keyboard_signal_cv: Condvar,
     filter_pipeline: RwLock<FilterPipeline>,
     vulkan_backend: Mutex<Option<VulkanBackend>>,
+    module_runtime: Mutex<ModuleRuntime>,
     render_output_dir: PathBuf,
 }
 
 impl Default for RuntimeEngine {
     fn default() -> Self {
-        Self::new_with_render_output_dir("artifacts/render")
+        Self::new_with_config(
+            "artifacts/render",
+            ModuleRuntimeConfig::default(),
+        )
     }
 }
 
 impl RuntimeEngine {
     pub fn new_with_render_output_dir(render_output_dir: impl Into<PathBuf>) -> Self {
+        Self::new_with_config(render_output_dir, ModuleRuntimeConfig::default())
+    }
+
+    pub fn new_with_config(
+        render_output_dir: impl Into<PathBuf>,
+        module_runtime_cfg: ModuleRuntimeConfig,
+    ) -> Self {
         Self {
             display: RwLock::new(DisplayState::default()),
             route: RwLock::new(RouteState::default()),
@@ -128,8 +161,11 @@ impl RuntimeEngine {
             display_signal_cv: Condvar::new(),
             frame_signal_seq: Mutex::new(0),
             frame_signal_cv: Condvar::new(),
+            keyboard_state: Mutex::new(KeyboardState::default()),
+            keyboard_signal_cv: Condvar::new(),
             filter_pipeline: RwLock::new(FilterPipeline::default()),
             vulkan_backend: Mutex::new(init_vulkan_backend()),
+            module_runtime: Mutex::new(ModuleRuntime::new(module_runtime_cfg)),
             render_output_dir: render_output_dir.into(),
         }
     }
@@ -173,12 +209,19 @@ impl RuntimeEngine {
             .lock()
             .map_err(|_| Status::InternalError)?;
         if *seq <= last_seq {
-            let timeout = Duration::from_millis(timeout_ms as u64);
-            let (next, _) = self
-                .display_signal_cv
-                .wait_timeout_while(seq, timeout, |v| *v <= last_seq)
-                .map_err(|_| Status::InternalError)?;
-            seq = next;
+            if timeout_ms == 0 {
+                seq = self
+                    .display_signal_cv
+                    .wait_while(seq, |v| *v <= last_seq)
+                    .map_err(|_| Status::InternalError)?;
+            } else {
+                let timeout = Duration::from_millis(timeout_ms as u64);
+                let (next, _) = self
+                    .display_signal_cv
+                    .wait_timeout_while(seq, timeout, |v| *v <= last_seq)
+                    .map_err(|_| Status::InternalError)?;
+                seq = next;
+            }
         }
 
         if *seq <= last_seq {
@@ -288,6 +331,61 @@ impl RuntimeEngine {
             Ok(touch) => touch.active_touches.len(),
             Err(_) => 0,
         }
+    }
+
+    pub fn submit_keyboard_event(
+        &self,
+        kind: u32,
+        codepoint: u32,
+    ) -> Result<KeyboardEvent, Status> {
+        validate_keyboard_event(kind, codepoint)?;
+        let mut state = self
+            .keyboard_state
+            .lock()
+            .map_err(|_| Status::InternalError)?;
+        state.next_seq = state.next_seq.saturating_add(1);
+        let event = KeyboardEvent {
+            seq: state.next_seq,
+            kind,
+            codepoint,
+        };
+        state.events.push_back(event);
+        while state.events.len() > KEYBOARD_EVENT_QUEUE_MAX {
+            let _ = state.events.pop_front();
+        }
+        drop(state);
+        self.keyboard_signal_cv.notify_all();
+        Ok(event)
+    }
+
+    pub fn wait_for_keyboard_after(
+        &self,
+        last_seq: u64,
+        timeout_ms: u32,
+    ) -> Result<Option<KeyboardEvent>, Status> {
+        let mut state = self
+            .keyboard_state
+            .lock()
+            .map_err(|_| Status::InternalError)?;
+        if !state.events.iter().any(|v| v.seq > last_seq) {
+            if timeout_ms == 0 {
+                state = self
+                    .keyboard_signal_cv
+                    .wait_while(state, |v| !v.events.iter().any(|evt| evt.seq > last_seq))
+                    .map_err(|_| Status::InternalError)?;
+            } else {
+                let timeout = Duration::from_millis(timeout_ms as u64);
+                let (next, _) = self
+                    .keyboard_signal_cv
+                    .wait_timeout_while(state, timeout, |v| {
+                        !v.events.iter().any(|evt| evt.seq > last_seq)
+                    })
+                    .map_err(|_| Status::InternalError)?;
+                state = next;
+            }
+        }
+
+        Ok(state.events.iter().find(|v| v.seq > last_seq).copied())
     }
 
     pub fn submit_render_stats(
@@ -432,17 +530,24 @@ impl RuntimeEngine {
             }
         }
 
-        let timeout = Duration::from_millis(timeout_ms as u64);
         let mut seq = self
             .frame_signal_seq
             .lock()
             .map_err(|_| Status::InternalError)?;
         if *seq <= last_frame_seq {
-            let (next, _) = self
-                .frame_signal_cv
-                .wait_timeout_while(seq, timeout, |v| *v <= last_frame_seq)
-                .map_err(|_| Status::InternalError)?;
-            seq = next;
+            if timeout_ms == 0 {
+                seq = self
+                    .frame_signal_cv
+                    .wait_while(seq, |v| *v <= last_frame_seq)
+                    .map_err(|_| Status::InternalError)?;
+            } else {
+                let timeout = Duration::from_millis(timeout_ms as u64);
+                let (next, _) = self
+                    .frame_signal_cv
+                    .wait_timeout_while(seq, timeout, |v| *v <= last_frame_seq)
+                    .map_err(|_| Status::InternalError)?;
+                seq = next;
+            }
         }
         drop(seq);
 
@@ -459,17 +564,24 @@ impl RuntimeEngine {
             return Ok(Some(snapshot));
         }
 
-        let timeout = Duration::from_millis(timeout_ms as u64);
         let mut seq = self
             .frame_signal_seq
             .lock()
             .map_err(|_| Status::InternalError)?;
         if *seq <= last_frame_seq {
-            let (next, _) = self
-                .frame_signal_cv
-                .wait_timeout_while(seq, timeout, |v| *v <= last_frame_seq)
-                .map_err(|_| Status::InternalError)?;
-            seq = next;
+            if timeout_ms == 0 {
+                seq = self
+                    .frame_signal_cv
+                    .wait_while(seq, |v| *v <= last_frame_seq)
+                    .map_err(|_| Status::InternalError)?;
+            } else {
+                let timeout = Duration::from_millis(timeout_ms as u64);
+                let (next, _) = self
+                    .frame_signal_cv
+                    .wait_timeout_while(seq, timeout, |v| *v <= last_frame_seq)
+                    .map_err(|_| Status::InternalError)?;
+                seq = next;
+            }
         }
         drop(seq);
 
@@ -617,12 +729,12 @@ impl RuntimeEngine {
             .lock()
             .map_err(|_| Status::InternalError)?;
         if let Some(vk) = backend.as_mut() {
-            vk.set_filter_pipeline(pipeline.clone());
-            if vk.process_frame_rgba(width, height, pixels_rgba8).is_ok() {
-                return Ok(());
+            if vk.filter_pipeline() != &pipeline {
+                vk.set_filter_pipeline(pipeline.clone());
             }
-            // Vulkan 后端异常时回退 CPU 路径，避免影响主渲染链路稳定性。
-            *backend = None;
+            return vk
+                .process_frame_rgba(width, height, pixels_rgba8)
+                .map(|_| ());
         }
 
         let _report = apply_filter_pipeline_rgba(&pipeline, width, height, pixels_rgba8)?;
@@ -674,6 +786,122 @@ impl RuntimeEngine {
             self.display_signal_cv.notify_all();
         }
     }
+
+    pub fn module_registry_upsert(
+        &self,
+        record: ModuleRecord,
+    ) -> Result<ModuleRecord, ModuleRegistryError> {
+        let mut guard = self
+            .module_runtime
+            .lock()
+            .map_err(|_| ModuleRegistryError::internal())?;
+        guard.upsert(record)
+    }
+
+    pub fn module_registry_remove(&self, module_id: &str) -> Result<bool, ModuleRegistryError> {
+        let mut guard = self
+            .module_runtime
+            .lock()
+            .map_err(|_| ModuleRegistryError::internal())?;
+        Ok(guard.remove(module_id))
+    }
+
+    pub fn module_registry_get(
+        &self,
+        module_id: &str,
+    ) -> Result<Option<ModuleRecord>, ModuleRegistryError> {
+        let guard = self
+            .module_runtime
+            .lock()
+            .map_err(|_| ModuleRegistryError::internal())?;
+        Ok(guard.get(module_id))
+    }
+
+    pub fn module_registry_list(&self) -> Result<Vec<ModuleRecord>, ModuleRegistryError> {
+        let guard = self
+            .module_runtime
+            .lock()
+            .map_err(|_| ModuleRegistryError::internal())?;
+        Ok(guard.list())
+    }
+
+    pub fn module_registry_reload(
+        &self,
+        module_id: &str,
+    ) -> Result<ModuleRecord, ModuleRegistryError> {
+        let mut guard = self
+            .module_runtime
+            .lock()
+            .map_err(|_| ModuleRegistryError::internal())?;
+        guard.reload_by_id(module_id)
+    }
+
+    pub fn module_registry_reload_all(&self) -> Result<ModuleReloadAllResult, ModuleRegistryError> {
+        let mut guard = self
+            .module_runtime
+            .lock()
+            .map_err(|_| ModuleRegistryError::internal())?;
+        Ok(guard.reload_all())
+    }
+
+    pub fn module_registry_last_error(
+        &self,
+    ) -> Result<Option<ModuleErrorRecord>, ModuleRegistryError> {
+        let guard = self
+            .module_runtime
+            .lock()
+            .map_err(|_| ModuleRegistryError::internal())?;
+        Ok(guard.last_error())
+    }
+
+    pub fn module_registry_clear_error(&self) -> Result<(), ModuleRegistryError> {
+        let mut guard = self
+            .module_runtime
+            .lock()
+            .map_err(|_| ModuleRegistryError::internal())?;
+        guard.clear_last_error();
+        Ok(())
+    }
+
+    pub fn module_registry_set_error(
+        &self,
+        record: ModuleErrorRecord,
+    ) -> Result<(), ModuleRegistryError> {
+        let mut guard = self
+            .module_runtime
+            .lock()
+            .map_err(|_| ModuleRegistryError::internal())?;
+        guard.set_last_error(record);
+        Ok(())
+    }
+
+    pub fn module_registry_event_seq(&self) -> Result<u64, ModuleRegistryError> {
+        let guard = self
+            .module_runtime
+            .lock()
+            .map_err(|_| ModuleRegistryError::internal())?;
+        Ok(guard.event_seq())
+    }
+
+    pub fn module_registry_count(&self) -> Result<usize, ModuleRegistryError> {
+        let guard = self
+            .module_runtime
+            .lock()
+            .map_err(|_| ModuleRegistryError::internal())?;
+        Ok(guard.count())
+    }
+
+    pub fn module_rpc(
+        &self,
+        request: &str,
+        peer_uid: u32,
+    ) -> Result<String, ModuleRuntimeRpcError> {
+        let mut guard = self
+            .module_runtime
+            .lock()
+            .map_err(|_| ModuleRuntimeRpcError::internal("ksu_dsapi_error=module_runtime_poisoned"))?;
+        guard.handle_rpc(request, peer_uid)
+    }
 }
 
 fn init_vulkan_backend() -> Option<VulkanBackend> {
@@ -682,6 +910,27 @@ fn init_vulkan_backend() -> Option<VulkanBackend> {
         return None;
     }
     VulkanBackend::new().ok()
+}
+
+fn validate_keyboard_event(kind: u32, codepoint: u32) -> Result<(), Status> {
+    match kind {
+        KEYBOARD_EVENT_KIND_CHAR => {
+            if char::from_u32(codepoint).is_none() {
+                return Err(Status::InvalidArgument);
+            }
+            Ok(())
+        }
+        KEYBOARD_EVENT_KIND_BACKSPACE
+        | KEYBOARD_EVENT_KIND_DONE
+        | KEYBOARD_EVENT_KIND_FOCUS_ON
+        | KEYBOARD_EVENT_KIND_FOCUS_OFF => {
+            if codepoint != 0 {
+                return Err(Status::InvalidArgument);
+            }
+            Ok(())
+        }
+        _ => Err(Status::InvalidArgument),
+    }
 }
 
 fn write_ppm_rgba(path: &Path, width: u32, height: u32, rgba8: &[u8]) -> std::io::Result<()> {
@@ -700,13 +949,27 @@ fn write_ppm_rgba(path: &Path, width: u32, height: u32, rgba8: &[u8]) -> std::io
     let header = format!("P6\n{} {}\n255\n", width, height);
     f.write_all(header.as_bytes())?;
 
-    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3usize);
-    for px in rgba8.chunks_exact(4) {
-        rgb.push(px[0]);
-        rgb.push(px[1]);
-        rgb.push(px[2]);
+    let width_usize = width as usize;
+    let rgba_row_bytes = width_usize
+        .checked_mul(4usize)
+        .ok_or_else(|| std::io::Error::other("ppm_row_size_overflow"))?;
+    let mut rgb_row = vec![
+        0u8;
+        width_usize
+            .checked_mul(3usize)
+            .ok_or_else(|| std::io::Error::other("ppm_row_size_overflow"))?
+    ];
+
+    for row in rgba8.chunks_exact(rgba_row_bytes) {
+        let mut dst = 0usize;
+        for px in row.chunks_exact(4) {
+            rgb_row[dst] = px[0];
+            rgb_row[dst + 1] = px[1];
+            rgb_row[dst + 2] = px[2];
+            dst += 3;
+        }
+        f.write_all(&rgb_row)?;
     }
-    f.write_all(&rgb)?;
     Ok(())
 }
 
@@ -741,6 +1004,28 @@ fn compute_render_checksum(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::ModuleState;
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn module_registry_roundtrip_in_runtime_engine() {
+        let engine = RuntimeEngine::default();
+        let mut record = crate::engine::ModuleRecord::new("test.touch_demo");
+        record.state = ModuleState::Running;
+        record.reason = "-".to_string();
+        engine.module_registry_upsert(record).expect("upsert");
+
+        let listed = engine.module_registry_list().expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "test.touch_demo");
+
+        let reloaded = engine
+            .module_registry_reload("test.touch_demo")
+            .expect("reload");
+        assert_eq!(reloaded.state, ModuleState::Ready);
+    }
 
     #[test]
     fn route_prefers_last_added_region() {
@@ -1044,6 +1329,40 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_frame_timeout_zero_blocks_until_new_frame() {
+        let engine = Arc::new(RuntimeEngine::default());
+        let waiter_engine = Arc::clone(&engine);
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (result_tx, result_rx) = mpsc::channel::<u64>();
+
+        let waiter = thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let waited = waiter_engine
+                .wait_for_frame_after(0, 0)
+                .expect("wait without timeout")
+                .expect("frame expected");
+            let _ = result_tx.send(waited.frame_seq);
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("waiter started");
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(40)).is_err(),
+            "must block until a new frame arrives"
+        );
+
+        let frame = engine
+            .submit_render_frame_rgba(2, 2, &[7u8; 16])
+            .expect("submit frame");
+        let waited_seq = result_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("waiter unblocked");
+        assert_eq!(waited_seq, frame.frame_seq);
+        waiter.join().expect("join waiter");
+    }
+
+    #[test]
     fn wait_for_frame_after_and_present_keeps_frame_consistent() {
         let engine = RuntimeEngine::default();
         assert_eq!(
@@ -1069,6 +1388,40 @@ mod tests {
 
         let present = engine.render_present_get().expect("present state exists");
         assert_eq!(present.frame_seq, waited_frame.frame_seq);
+    }
+
+    #[test]
+    fn wait_for_frame_and_present_timeout_zero_blocks_until_new_frame() {
+        let engine = Arc::new(RuntimeEngine::default());
+        let waiter_engine = Arc::clone(&engine);
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (result_tx, result_rx) = mpsc::channel::<u64>();
+
+        let waiter = thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let waited = waiter_engine
+                .wait_for_frame_after_and_present(0, 0)
+                .expect("wait without timeout")
+                .expect("frame expected");
+            let _ = result_tx.send(waited.0.frame_seq);
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("waiter started");
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(40)).is_err(),
+            "must block until a new frame arrives"
+        );
+
+        let frame = engine
+            .submit_render_frame_rgba(2, 2, &[5u8; 16])
+            .expect("submit frame");
+        let waited_seq = result_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("waiter unblocked");
+        assert_eq!(waited_seq, frame.frame_seq);
+        waiter.join().expect("join waiter");
     }
 
     #[test]
@@ -1108,6 +1461,47 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_display_timeout_zero_blocks_until_change() {
+        let engine = Arc::new(RuntimeEngine::default());
+        let waiter_engine = Arc::clone(&engine);
+        let initial_seq = engine.display_signal_seq();
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (result_tx, result_rx) = mpsc::channel::<u64>();
+
+        let waiter = thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let (next_seq, _) = waiter_engine
+                .wait_for_display_after(initial_seq, 0)
+                .expect("wait display")
+                .expect("display expected");
+            let _ = result_tx.send(next_seq);
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("waiter started");
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(40)).is_err(),
+            "must block until display changes"
+        );
+
+        engine
+            .set_display_state(DisplayState {
+                width: 1080,
+                height: 2400,
+                refresh_hz: 120.0,
+                density_dpi: 420,
+                rotation: 0,
+            })
+            .expect("set display");
+        let next_seq = result_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("waiter unblocked");
+        assert!(next_seq > initial_seq);
+        waiter.join().expect("join waiter");
+    }
+
+    #[test]
     fn display_change_clears_cached_render_frame() {
         let engine = RuntimeEngine::default();
         let pixels = vec![255u8; 16];
@@ -1127,5 +1521,72 @@ mod tests {
             .expect("set display");
 
         assert_eq!(engine.render_frame_info(), None);
+    }
+
+    #[test]
+    fn keyboard_wait_wakes_on_new_event() {
+        let engine = RuntimeEngine::default();
+        assert_eq!(
+            engine.wait_for_keyboard_after(0, 1).expect("wait keyboard"),
+            None
+        );
+
+        let event = engine
+            .submit_keyboard_event(KEYBOARD_EVENT_KIND_CHAR, 'A' as u32)
+            .expect("submit keyboard");
+        let waited = engine
+            .wait_for_keyboard_after(0, 10)
+            .expect("wait keyboard with event")
+            .expect("keyboard event expected");
+        assert_eq!(waited.seq, event.seq);
+        assert_eq!(waited.kind, KEYBOARD_EVENT_KIND_CHAR);
+        assert_eq!(waited.codepoint, 'A' as u32);
+    }
+
+    #[test]
+    fn keyboard_wait_timeout_zero_blocks_until_new_event() {
+        let engine = Arc::new(RuntimeEngine::default());
+        let waiter_engine = Arc::clone(&engine);
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (result_tx, result_rx) = mpsc::channel::<u64>();
+
+        let waiter = thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let waited = waiter_engine
+                .wait_for_keyboard_after(0, 0)
+                .expect("wait without timeout")
+                .expect("keyboard event expected");
+            let _ = result_tx.send(waited.seq);
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("waiter started");
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(40)).is_err(),
+            "must block until keyboard event arrives"
+        );
+
+        let event = engine
+            .submit_keyboard_event(KEYBOARD_EVENT_KIND_BACKSPACE, 0)
+            .expect("submit keyboard");
+        let waited_seq = result_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("waiter unblocked");
+        assert_eq!(waited_seq, event.seq);
+        waiter.join().expect("join waiter");
+    }
+
+    #[test]
+    fn keyboard_event_validation_rejects_invalid_codepoint() {
+        let engine = RuntimeEngine::default();
+        assert_eq!(
+            engine.submit_keyboard_event(KEYBOARD_EVENT_KIND_CHAR, 0xD800),
+            Err(Status::InvalidArgument)
+        );
+        assert_eq!(
+            engine.submit_keyboard_event(KEYBOARD_EVENT_KIND_DONE, 1),
+            Err(Status::InvalidArgument)
+        );
     }
 }

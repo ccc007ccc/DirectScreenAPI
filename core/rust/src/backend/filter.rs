@@ -85,11 +85,9 @@ fn apply_gaussian_blur_rgba(
     for y in 0..h {
         for x in 0..w {
             let mut acc = [0.0f32; 4];
-            let mut ws = 0.0f32;
             for k in -radius..=radius {
                 let sx = (x + k).clamp(0, w - 1);
                 let weight = kernel[(k + radius) as usize];
-                ws += weight;
                 let idx = ((y * w + sx) as usize) * 4;
                 for c in 0..4usize {
                     acc[c] += pixels_rgba8[idx + c] as f32 * weight;
@@ -97,7 +95,7 @@ fn apply_gaussian_blur_rgba(
             }
             let out_idx = ((y * w + x) as usize) * 4;
             for c in 0..4usize {
-                scratch[out_idx + c] = f32_to_u8(acc[c] / ws.max(0.0001));
+                scratch[out_idx + c] = f32_to_u8(acc[c]);
             }
         }
     }
@@ -105,11 +103,9 @@ fn apply_gaussian_blur_rgba(
     for y in 0..h {
         for x in 0..w {
             let mut acc = [0.0f32; 4];
-            let mut ws = 0.0f32;
             for k in -radius..=radius {
                 let sy = (y + k).clamp(0, h - 1);
                 let weight = kernel[(k + radius) as usize];
-                ws += weight;
                 let idx = ((sy * w + x) as usize) * 4;
                 for c in 0..4usize {
                     acc[c] += scratch[idx + c] as f32 * weight;
@@ -117,7 +113,7 @@ fn apply_gaussian_blur_rgba(
             }
             let out_idx = ((y * w + x) as usize) * 4;
             for c in 0..4usize {
-                pixels_rgba8[out_idx + c] = f32_to_u8(acc[c] / ws.max(0.0001));
+                pixels_rgba8[out_idx + c] = f32_to_u8(acc[c]);
             }
         }
     }

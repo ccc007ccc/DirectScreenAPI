@@ -138,8 +138,8 @@ DSAPI_ANDROID_OUT_DIR=artifacts/android_user DSAPI_SCREEN_RUN_AS_ROOT=1 ./script
 DSAPI_FRAME_PULL_ENGINE=rust ./scripts/dsapi.sh frame pull artifacts/frame/latest.rgba
 ```
 
-控制面已经完全二进制化，`dsapictl/dsapistream` 会自动按二进制协议编码请求并解码响应；
-数据面只保留 SHM 取帧与触控二进制流，不再提供 RAW 像素流与旧 fd 绑定命令。
+控制面已支持统一二进制协议（含 `RENDER_FRAME_*`）；默认单 socket 模式下，
+同一路径可承载控制命令、SHM 帧交换与触控流。
 
 真实触摸采集桥接（native input -> daemon binary stream）：
 
@@ -165,6 +165,7 @@ cargo run --release --manifest-path core/rust/Cargo.toml --bin dsapi_touch_demo 
 
 - `--device /dev/input/eventX`：手动指定触摸设备（默认自动探测）
 - `--no-touch-router`：仅渲染（不接管触摸）
+- `--no-soft-keyboard`：关闭 demo 内置软键盘面板
 - `--fps 90`：设置渲染帧率上限
 - `--window-x/--window-y/--window-w/--window-h`：设置窗口初始位置与尺寸
 - `--control-socket/--data-socket`：自定义 socket 路径

@@ -15,7 +15,7 @@
 ## 发送命令
 
 ```sh
-./scripts/dsapi.sh daemon cmd PING
+./scripts/dsapi.sh daemon cmd READY
 ./scripts/dsapi.sh daemon cmd VERSION
 ./scripts/dsapi.sh daemon cmd DISPLAY_GET
 ./scripts/dsapi.sh daemon cmd TOUCH_MOVE 1 300 300
@@ -27,10 +27,8 @@
 ```
 
 `dsapi.sh daemon cmd` / `dsapictl` 连接的是 **control socket**（默认 `artifacts/run/dsapi.sock`），
-并自动使用二进制控制协议（`DSAP` header）。
-
-像素帧拉取走 **data socket**（默认 `artifacts/run/dsapi.data.sock`）的
-`RENDER_FRAME_BIND_SHM + RENDER_FRAME_WAIT_SHM_PRESENT` 零拷贝路径。
+并自动使用二进制协议（`DSAP` header）。默认统一单 socket 模式下，
+帧拉取同样通过该路径完成（`RENDER_FRAME_BIND_SHM + RENDER_FRAME_WAIT_SHM_PRESENT`）。
 
 同步 Android 实际显示参数：
 
@@ -72,6 +70,7 @@ DSAPI_SUPERVISE_PRESENTER=1 DSAPI_SUPERVISE_INPUT=1 ./scripts/dsapi.sh daemon st
 - `DSAPI_SOCKET_PATH`
 - `DSAPI_CONTROL_SOCKET_PATH`
 - `DSAPI_DATA_SOCKET_PATH`
+- `DSAPI_UNIFIED_SOCKET`
 - `DSAPI_PID_FILE`
 - `DSAPI_LOG_FILE`
 - `DSAPI_TOUCH_BRIDGE_PID_FILE`
@@ -90,6 +89,8 @@ DSAPI_SUPERVISE_PRESENTER=1 DSAPI_SUPERVISE_INPUT=1 ./scripts/dsapi.sh daemon st
 - `DSAPI_MAX_CONNECTIONS`
 - `DSAPI_SCREEN_RUN_AS_ROOT`
 - `DSAPI_SCREEN_TARGET_FPS`
+- `DSAPI_SCREEN_SUBMIT_MODE`（`dmabuf` 或 `shm`）
+- `DSAPI_HWBUFFER_BRIDGE_LIB`（`dmabuf` 模式 JNI 桥接库路径）
 - `DSAPI_SCREEN_LOG_FILE`
 - `DSAPI_SCREEN_PID_FILE`
 - `DSAPI_FRAME_PULL_TIMEOUT_MS`

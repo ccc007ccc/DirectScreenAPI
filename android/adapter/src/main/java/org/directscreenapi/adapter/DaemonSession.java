@@ -10,10 +10,11 @@ import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Locale;
 
 final class DaemonSession {
-    private static final int DEFAULT_SOCKET_TIMEOUT_MS = 5000;
+    private static final int DEFAULT_SOCKET_TIMEOUT_MS = 0;
     private static final int TRANSIENT_READ_BACKOFF_MS = 2;
     private static final String SOCKET_TIMEOUT_PROPERTY = "dsapi.socket_timeout_ms";
     private static final String PIXEL_FORMAT_RGBA8888 = "RGBA8888";
@@ -25,15 +26,24 @@ final class DaemonSession {
     private static final int BIN_RESPONSE_PAYLOAD_BYTES = 4 + (BIN_RESPONSE_VALUES * 8);
 
     private static final int BIN_OP_PING = 1;
+    private static final int BIN_OP_READY_GET = 15;
     private static final int BIN_OP_DISPLAY_GET = 4;
     private static final int BIN_OP_DISPLAY_SET = 5;
     private static final int BIN_OP_FILTER_CHAIN_SET = 12;
     private static final int BIN_OP_FILTER_CLEAR = 13;
     private static final int BIN_OP_FILTER_GET = 14;
+    private static final int BIN_OP_KEYBOARD_INJECT = 16;
+    private static final int BIN_OP_KEYBOARD_WAIT = 17;
+    private static final int BIN_OP_RENDER_FRAME_BIND_SHM = 18;
+    private static final int BIN_OP_RENDER_FRAME_WAIT_SHM_PRESENT = 19;
+    private static final int BIN_OP_RENDER_FRAME_SUBMIT_SHM = 20;
+    private static final int BIN_OP_RENDER_FRAME_SUBMIT_DMABUF = 21;
     private static final int FILTER_PASS_KIND_GAUSSIAN = 1;
-
-    private static final String CMD_BIND_SHM = "RENDER_FRAME_BIND_SHM";
-    private static final String CMD_WAIT_SHM = "RENDER_FRAME_WAIT_SHM_PRESENT";
+    private static final int KEYBOARD_EVENT_KIND_CHAR = 1;
+    private static final int KEYBOARD_EVENT_KIND_BACKSPACE = 2;
+    private static final int KEYBOARD_EVENT_KIND_DONE = 3;
+    private static final int KEYBOARD_EVENT_KIND_FOCUS_ON = 4;
+    private static final int KEYBOARD_EVENT_KIND_FOCUS_OFF = 5;
 
     static final class MappedFrame {
         final long frameSeq;
@@ -56,6 +66,20 @@ final class DaemonSession {
 
         void closeQuietly() {
             // Mapped buffer is session-scoped.
+        }
+    }
+
+    static final class KeyboardEventReply {
+        final long seq;
+        final int kind;
+        final int codepoint;
+        final boolean hasEvent;
+
+        KeyboardEventReply(long seq, int kind, int codepoint, boolean hasEvent) {
+            this.seq = seq;
+            this.kind = kind;
+            this.codepoint = codepoint;
+            this.hasEvent = hasEvent;
         }
     }
 
@@ -86,7 +110,6 @@ final class DaemonSession {
     }
 
     private final String controlSocketPath;
-    private final String dataSocketPath;
 
     private Object controlSocket;
     private InputStream controlInput;
@@ -96,6 +119,7 @@ final class DaemonSession {
     private Object rawSocket;
     private InputStream rawInput;
     private OutputStream rawOutput;
+    private long rawSeq;
 
     private FileInputStream rawFrameFdStream;
     private FileOutputStream rawFrameFdWriteStream;
@@ -105,10 +129,20 @@ final class DaemonSession {
     private int rawFrameMappedLen;
     private int rawFrameCapacity;
     private int rawFrameDataOffset = -1;
+    private byte[] rowPackScratch = new byte[0];
+    private ByteBuffer rowPackScratchBuffer = ByteBuffer.wrap(rowPackScratch);
     private final int[] lineTokenStarts = new int[12];
     private final int[] lineTokenEnds = new int[12];
 
     private boolean closed;
+
+    DaemonSession(String controlSocketPath) throws Exception {
+        this(controlSocketPath, controlSocketPath, true);
+    }
+
+    DaemonSession(String controlSocketPath, boolean autoBindFrameShm) throws Exception {
+        this(controlSocketPath, controlSocketPath, autoBindFrameShm);
+    }
 
     DaemonSession(String controlSocketPath, String dataSocketPath) throws Exception {
         this(controlSocketPath, dataSocketPath, true);
@@ -118,14 +152,10 @@ final class DaemonSession {
         if (controlSocketPath == null || controlSocketPath.trim().isEmpty()) {
             throw new IOException("control_socket_path_invalid");
         }
-        if (dataSocketPath == null || dataSocketPath.trim().isEmpty()) {
-            throw new IOException("data_socket_path_invalid");
-        }
         this.controlSocketPath = controlSocketPath;
-        this.dataSocketPath = dataSocketPath;
 
         SocketIo control = openSocket(this.controlSocketPath);
-        SocketIo data = openSocket(this.dataSocketPath);
+        SocketIo data = openSocket(this.controlSocketPath);
 
         boolean ok = false;
         try {
@@ -137,6 +167,7 @@ final class DaemonSession {
             this.rawSocket = data.socket;
             this.rawInput = data.input;
             this.rawOutput = data.output;
+            this.rawSeq = 1L;
 
             if (autoBindFrameShm) {
                 bindFrameShm();
@@ -177,72 +208,88 @@ final class DaemonSession {
         return formatControlReply(tokens, reply);
     }
 
+    synchronized KeyboardEventReply keyboardWait(long lastSeq, int timeoutMs) throws Exception {
+        ensureOpen();
+        if (lastSeq < 0L || timeoutMs < 0) {
+            throw new IOException("keyboard_wait_args_invalid");
+        }
+        byte[] payload = new byte[12];
+        writeLe64(payload, 0, lastSeq);
+        writeLe32(payload, 8, timeoutMs);
+        BinaryReply reply = sendBinaryControl(BIN_OP_KEYBOARD_WAIT, payload);
+        if (reply.status != 0) {
+            throw new IOException(
+                    "keyboard_wait_status="
+                            + reply.status
+                            + " opcode="
+                            + reply.opcode
+                            + " seq="
+                            + reply.seq
+            );
+        }
+        boolean hasEvent = reply.values[3] != 0L;
+        return new KeyboardEventReply(
+                reply.values[0],
+                (int) reply.values[1],
+                (int) reply.values[2],
+                hasEvent
+        );
+    }
+
+    synchronized KeyboardEventReply keyboardInject(int kind, int codepoint) throws Exception {
+        ensureOpen();
+        byte[] payload = new byte[8];
+        writeLe32(payload, 0, kind);
+        writeLe32(payload, 4, codepoint);
+        BinaryReply reply = sendBinaryControl(BIN_OP_KEYBOARD_INJECT, payload);
+        if (reply.status != 0) {
+            throw new IOException(
+                    "keyboard_inject_status="
+                            + reply.status
+                            + " opcode="
+                            + reply.opcode
+                            + " seq="
+                            + reply.seq
+            );
+        }
+        return new KeyboardEventReply(
+                reply.values[0],
+                (int) reply.values[1],
+                (int) reply.values[2],
+                true
+        );
+    }
+
     synchronized MappedFrame frameWaitBoundPresent(long lastFrameSeq, int timeoutMs) throws Exception {
         ensureOpen();
         ensureRawFrameBound();
 
         long safeSeq = Math.max(0L, lastFrameSeq);
-        int safeTimeout = Math.max(1, timeoutMs);
-        writeAsciiLine(rawOutput, CMD_WAIT_SHM + " " + safeSeq + " " + safeTimeout);
-
-        String line = requireOkLine(readAsciiLine(rawInput), "daemon_wait_shm_present");
-        int tokenCount = tokenizeWhitespace(line, lineTokenStarts, lineTokenEnds);
-        if (tokenCount == 2 && tokenEquals(line, lineTokenStarts[1], lineTokenEnds[1], "TIMEOUT")) {
+        int safeTimeout = Math.max(0, timeoutMs);
+        byte[] payload = new byte[12];
+        writeLe64(payload, 0, safeSeq);
+        writeLe32(payload, 8, safeTimeout);
+        BinaryReply reply = sendBinaryRaw(BIN_OP_RENDER_FRAME_WAIT_SHM_PRESENT, payload);
+        if (reply.status != 0) {
+            throw new IOException(
+                    "daemon_wait_shm_present_status="
+                            + reply.status
+                            + " opcode="
+                            + reply.opcode
+                            + " seq="
+                            + reply.seq
+            );
+        }
+        int byteLen = (int) reply.values[3];
+        if (byteLen == 0) {
             return null;
         }
-        if (tokenCount != 8 && tokenCount != 10) {
-            throw new IOException("daemon_wait_shm_present_tokens_invalid");
-        }
-        if (!tokenEquals(line, lineTokenStarts[4], lineTokenEnds[4], PIXEL_FORMAT_RGBA8888)) {
-            throw new IOException("daemon_wait_shm_present_pixel_format_invalid");
-        }
-
-        long frameSeq = parseLongTokenStrict(
-                line,
-                lineTokenStarts[1],
-                lineTokenEnds[1],
-                "daemon_wait_shm_present_frame_seq_invalid"
-        );
-        int width = parseIntTokenStrict(
-                line,
-                lineTokenStarts[2],
-                lineTokenEnds[2],
-                "daemon_wait_shm_present_width_invalid"
-        );
-        int height = parseIntTokenStrict(
-                line,
-                lineTokenStarts[3],
-                lineTokenEnds[3],
-                "daemon_wait_shm_present_height_invalid"
-        );
-        int byteLen = parseIntTokenStrict(
-                line,
-                lineTokenStarts[5],
-                lineTokenEnds[5],
-                "daemon_wait_shm_present_len_invalid"
-        );
-        int offset = parseIntTokenStrict(
-                line,
-                lineTokenStarts[7],
-                lineTokenEnds[7],
-                "daemon_wait_shm_present_offset_invalid"
-        );
-        int originX = 0;
-        int originY = 0;
-        if (tokenCount == 10) {
-            originX = parseIntTokenStrict(
-                    line,
-                    lineTokenStarts[8],
-                    lineTokenEnds[8],
-                    "daemon_wait_shm_present_origin_x_invalid"
-            );
-            originY = parseIntTokenStrict(
-                    line,
-                    lineTokenStarts[9],
-                    lineTokenEnds[9],
-                    "daemon_wait_shm_present_origin_y_invalid"
-            );
-        }
+        long frameSeq = reply.values[0];
+        int width = (int) reply.values[1];
+        int height = (int) reply.values[2];
+        int offset = (int) reply.values[5];
+        int originX = (int) reply.values[6];
+        int originY = (int) reply.values[7];
 
         if (frameSeq < 0L || width <= 0 || height <= 0 || byteLen <= 0 || offset < 0) {
             throw new IOException("daemon_wait_shm_present_header_invalid");
@@ -300,51 +347,192 @@ final class DaemonSession {
             writePos += n;
         }
 
-        writeAsciiLine(
-                rawOutput,
-                "RENDER_FRAME_SUBMIT_SHM "
-                        + width
-                        + " "
-                        + height
-                        + " "
-                        + expectedLen
-                        + " "
-                        + rawFrameDataOffset
-        );
-        String line = requireOkLine(readAsciiLine(rawInput), "daemon_submit_shm");
-        int tokenCount = tokenizeWhitespace(line, lineTokenStarts, lineTokenEnds);
-        if (tokenCount != 7) {
-            throw new IOException("daemon_submit_shm_tokens_invalid");
+        byte[] payload = new byte[24];
+        writeLe32(payload, 0, width);
+        writeLe32(payload, 4, height);
+        writeLe32(payload, 8, expectedLen);
+        writeLe32(payload, 12, rawFrameDataOffset);
+        writeLe32(payload, 16, 0);
+        writeLe32(payload, 20, 0);
+        BinaryReply reply = sendBinaryRaw(BIN_OP_RENDER_FRAME_SUBMIT_SHM, payload);
+        if (reply.status != 0) {
+            throw new IOException(
+                    "daemon_submit_shm_status="
+                            + reply.status
+                            + " opcode="
+                            + reply.opcode
+                            + " seq="
+                            + reply.seq
+            );
         }
-        if (!tokenEquals(line, lineTokenStarts[4], lineTokenEnds[4], PIXEL_FORMAT_RGBA8888)) {
-            throw new IOException("daemon_submit_shm_pixel_format_invalid");
-        }
-        long frameSeq = parseLongTokenStrict(
-                line,
-                lineTokenStarts[1],
-                lineTokenEnds[1],
-                "daemon_submit_shm_frame_seq_invalid"
-        );
-        int outWidth = parseIntTokenStrict(
-                line,
-                lineTokenStarts[2],
-                lineTokenEnds[2],
-                "daemon_submit_shm_width_invalid"
-        );
-        int outHeight = parseIntTokenStrict(
-                line,
-                lineTokenStarts[3],
-                lineTokenEnds[3],
-                "daemon_submit_shm_height_invalid"
-        );
-        int outByteLen = parseIntTokenStrict(
-                line,
-                lineTokenStarts[5],
-                lineTokenEnds[5],
-                "daemon_submit_shm_len_invalid"
-        );
+        long frameSeq = reply.values[0];
+        int outWidth = (int) reply.values[1];
+        int outHeight = (int) reply.values[2];
+        int outByteLen = (int) reply.values[3];
         if (outWidth != width || outHeight != height || outByteLen != expectedLen) {
             throw new IOException("daemon_submit_shm_reply_mismatch");
+        }
+        return frameSeq;
+    }
+
+    synchronized long frameSubmitBoundPlane(
+            int width,
+            int height,
+            ByteBuffer srcPlane,
+            int rowStride,
+            int pixelStride
+    ) throws Exception {
+        ensureOpen();
+        ensureRawFrameBound();
+        if (width <= 0 || height <= 0 || srcPlane == null || rowStride <= 0 || pixelStride < 4) {
+            throw new IOException("daemon_submit_plane_args_invalid");
+        }
+
+        long expectedLong = (long) width * (long) height * 4L;
+        if (expectedLong <= 0L || expectedLong > Integer.MAX_VALUE) {
+            throw new IOException("daemon_submit_plane_len_invalid");
+        }
+        int expectedLen = (int) expectedLong;
+        if (expectedLen > rawFrameCapacity) {
+            throw new IOException("daemon_submit_plane_over_capacity");
+        }
+
+        int mapEnd = safeAdd(rawFrameDataOffset, expectedLen, "daemon_submit_plane_offset_overflow");
+        if (mapEnd > rawFrameMappedLen || rawFrameFdWriteChannel == null) {
+            throw new IOException("daemon_submit_plane_offset_overflow");
+        }
+
+        ByteBuffer src = srcPlane.duplicate();
+        int srcBase = src.position();
+        int srcCap = src.capacity();
+        int rowBytes = width * 4;
+        long writePos = rawFrameDataOffset;
+
+        if (pixelStride == 4) {
+            for (int y = 0; y < height; y++) {
+                int rowStart = safeAdd(srcBase, y * rowStride, "daemon_submit_plane_row_start_overflow");
+                int rowEnd = safeAdd(rowStart, rowBytes, "daemon_submit_plane_row_end_overflow");
+                if (rowStart < 0 || rowEnd < rowStart || rowEnd > srcCap) {
+                    throw new IOException("daemon_submit_plane_bounds_invalid");
+                }
+                src.limit(srcCap);
+                src.position(rowStart);
+                src.limit(rowEnd);
+                writeFullyAt(
+                        rawFrameFdWriteChannel,
+                        src.slice(),
+                        writePos,
+                        "daemon_submit_plane_write_failed"
+                );
+                writePos += rowBytes;
+            }
+        } else {
+            ensureRowPackScratch(rowBytes);
+            for (int y = 0; y < height; y++) {
+                int rowStart = safeAdd(srcBase, y * rowStride, "daemon_submit_plane_row_start_overflow");
+                for (int x = 0; x < width; x++) {
+                    int px = safeAdd(rowStart, x * pixelStride, "daemon_submit_plane_px_overflow");
+                    int pxEnd = safeAdd(px, 4, "daemon_submit_plane_px_end_overflow");
+                    if (px < 0 || pxEnd < px || pxEnd > srcCap) {
+                        throw new IOException("daemon_submit_plane_bounds_invalid");
+                    }
+                    int dst = x * 4;
+                    rowPackScratch[dst] = src.get(px);
+                    rowPackScratch[dst + 1] = src.get(px + 1);
+                    rowPackScratch[dst + 2] = src.get(px + 2);
+                    rowPackScratch[dst + 3] = src.get(px + 3);
+                }
+                writeFullyAt(
+                        rawFrameFdWriteChannel,
+                        rowPackBuffer(rowBytes),
+                        writePos,
+                        "daemon_submit_plane_write_failed"
+                );
+                writePos += rowBytes;
+            }
+        }
+
+        byte[] payload = new byte[24];
+        writeLe32(payload, 0, width);
+        writeLe32(payload, 4, height);
+        writeLe32(payload, 8, expectedLen);
+        writeLe32(payload, 12, rawFrameDataOffset);
+        writeLe32(payload, 16, 0);
+        writeLe32(payload, 20, 0);
+        BinaryReply reply = sendBinaryRaw(BIN_OP_RENDER_FRAME_SUBMIT_SHM, payload);
+        if (reply.status != 0) {
+            throw new IOException(
+                    "daemon_submit_plane_status="
+                            + reply.status
+                            + " opcode="
+                            + reply.opcode
+                            + " seq="
+                            + reply.seq
+            );
+        }
+        long frameSeq = reply.values[0];
+        int outWidth = (int) reply.values[1];
+        int outHeight = (int) reply.values[2];
+        int outByteLen = (int) reply.values[3];
+        if (outWidth != width || outHeight != height || outByteLen != expectedLen) {
+            throw new IOException("daemon_submit_plane_reply_mismatch");
+        }
+        return frameSeq;
+    }
+
+    synchronized long frameSubmitDmabuf(
+            int width,
+            int height,
+            int stride,
+            int format,
+            long usage,
+            int byteLen,
+            int byteOffset,
+            int originX,
+            int originY,
+            FileDescriptor fd
+    ) throws Exception {
+        ensureOpen();
+        if (width <= 0 || height <= 0 || stride < width || format <= 0 || byteLen <= 0 || byteOffset < 0 || fd == null) {
+            throw new IOException("daemon_submit_dmabuf_args_invalid");
+        }
+        long expectedLong = (long) width * (long) height * 4L;
+        if (expectedLong <= 0L || expectedLong > Integer.MAX_VALUE) {
+            throw new IOException("daemon_submit_dmabuf_len_invalid");
+        }
+        int expectedLen = (int) expectedLong;
+        if (byteOffset > byteLen) {
+            throw new IOException("daemon_submit_dmabuf_offset_invalid");
+        }
+
+        byte[] payload = new byte[40];
+        writeLe32(payload, 0, width);
+        writeLe32(payload, 4, height);
+        writeLe32(payload, 8, stride);
+        writeLe32(payload, 12, format);
+        writeLe64(payload, 16, usage);
+        writeLe32(payload, 24, byteLen);
+        writeLe32(payload, 28, byteOffset);
+        writeLe32(payload, 32, originX);
+        writeLe32(payload, 36, originY);
+
+        BinaryReply reply = sendBinaryRawWithFd(BIN_OP_RENDER_FRAME_SUBMIT_DMABUF, payload, fd);
+        if (reply.status != 0) {
+            throw new IOException(
+                    "daemon_submit_dmabuf_status="
+                            + reply.status
+                            + " opcode="
+                            + reply.opcode
+                            + " seq="
+                            + reply.seq
+            );
+        }
+        long frameSeq = reply.values[0];
+        int outWidth = (int) reply.values[1];
+        int outHeight = (int) reply.values[2];
+        int outByteLen = (int) reply.values[3];
+        if (outWidth != width || outHeight != height || outByteLen != expectedLen) {
+            throw new IOException("daemon_submit_dmabuf_reply_mismatch");
         }
         return frameSeq;
     }
@@ -484,25 +672,19 @@ final class DaemonSession {
 
     private void bindFrameShm() throws Exception {
         closeRawFrameBinding();
-        writeAsciiLine(rawOutput, CMD_BIND_SHM);
-        String line = requireOkLine(readAsciiLine(rawInput), "daemon_bind_shm");
-        int tokenCount = tokenizeWhitespace(line, lineTokenStarts, lineTokenEnds);
-        if (tokenCount != 4 || !tokenEquals(line, lineTokenStarts[1], lineTokenEnds[1], "SHM_BOUND")) {
-            throw new IOException("daemon_bind_shm_tokens_invalid");
+        BinaryReply reply = sendBinaryRaw(BIN_OP_RENDER_FRAME_BIND_SHM, new byte[0]);
+        if (reply.status != 0) {
+            throw new IOException(
+                    "daemon_bind_shm_status="
+                            + reply.status
+                            + " opcode="
+                            + reply.opcode
+                            + " seq="
+                            + reply.seq
+            );
         }
-
-        int capacity = parseIntTokenStrict(
-                line,
-                lineTokenStarts[2],
-                lineTokenEnds[2],
-                "daemon_bind_shm_capacity_invalid"
-        );
-        int offset = parseIntTokenStrict(
-                line,
-                lineTokenStarts[3],
-                lineTokenEnds[3],
-                "daemon_bind_shm_offset_invalid"
-        );
+        int capacity = (int) reply.values[0];
+        int offset = (int) reply.values[1];
         if (capacity <= 0 || offset < 0) {
             throw new IOException("daemon_bind_shm_layout_invalid");
         }
@@ -612,6 +794,77 @@ final class DaemonSession {
             }
             return sendBinaryControl(BIN_OP_FILTER_GET, new byte[0]);
         }
+        if ("KEYBOARD_CHAR".equals(cmd)) {
+            if (tokens.length != 2) {
+                throw new IOException("keyboard_char_args_invalid");
+            }
+            int codepoint = parseU32BitsStrict(tokens[1], "keyboard_char_codepoint_invalid");
+            byte[] payload = new byte[8];
+            writeLe32(payload, 0, KEYBOARD_EVENT_KIND_CHAR);
+            writeLe32(payload, 4, codepoint);
+            return sendBinaryControl(BIN_OP_KEYBOARD_INJECT, payload);
+        }
+        if ("KEYBOARD_BACKSPACE".equals(cmd)) {
+            if (tokens.length != 1) {
+                throw new IOException("keyboard_backspace_args_invalid");
+            }
+            byte[] payload = new byte[8];
+            writeLe32(payload, 0, KEYBOARD_EVENT_KIND_BACKSPACE);
+            writeLe32(payload, 4, 0);
+            return sendBinaryControl(BIN_OP_KEYBOARD_INJECT, payload);
+        }
+        if ("KEYBOARD_DONE".equals(cmd)) {
+            if (tokens.length != 1) {
+                throw new IOException("keyboard_done_args_invalid");
+            }
+            byte[] payload = new byte[8];
+            writeLe32(payload, 0, KEYBOARD_EVENT_KIND_DONE);
+            writeLe32(payload, 4, 0);
+            return sendBinaryControl(BIN_OP_KEYBOARD_INJECT, payload);
+        }
+        if ("KEYBOARD_FOCUS_ON".equals(cmd)) {
+            if (tokens.length != 1) {
+                throw new IOException("keyboard_focus_on_args_invalid");
+            }
+            byte[] payload = new byte[8];
+            writeLe32(payload, 0, KEYBOARD_EVENT_KIND_FOCUS_ON);
+            writeLe32(payload, 4, 0);
+            return sendBinaryControl(BIN_OP_KEYBOARD_INJECT, payload);
+        }
+        if ("KEYBOARD_FOCUS_OFF".equals(cmd)) {
+            if (tokens.length != 1) {
+                throw new IOException("keyboard_focus_off_args_invalid");
+            }
+            byte[] payload = new byte[8];
+            writeLe32(payload, 0, KEYBOARD_EVENT_KIND_FOCUS_OFF);
+            writeLe32(payload, 4, 0);
+            return sendBinaryControl(BIN_OP_KEYBOARD_INJECT, payload);
+        }
+        if ("KEYBOARD_INJECT".equals(cmd)) {
+            if (tokens.length != 3) {
+                throw new IOException("keyboard_inject_args_invalid");
+            }
+            int kind = parseU32BitsStrict(tokens[1], "keyboard_inject_kind_invalid");
+            int codepoint = parseU32BitsStrict(tokens[2], "keyboard_inject_codepoint_invalid");
+            byte[] payload = new byte[8];
+            writeLe32(payload, 0, kind);
+            writeLe32(payload, 4, codepoint);
+            return sendBinaryControl(BIN_OP_KEYBOARD_INJECT, payload);
+        }
+        if ("KEYBOARD_WAIT".equals(cmd)) {
+            if (tokens.length != 3) {
+                throw new IOException("keyboard_wait_args_invalid");
+            }
+            long lastSeq = parseU64Strict(tokens[1], "keyboard_wait_last_seq_invalid");
+            int timeoutMs = parseIntStrict(tokens[2], "keyboard_wait_timeout_invalid");
+            if (lastSeq < 0L || timeoutMs < 0) {
+                throw new IOException("keyboard_wait_args_invalid");
+            }
+            byte[] payload = new byte[12];
+            writeLe64(payload, 0, lastSeq);
+            writeLe32(payload, 8, timeoutMs);
+            return sendBinaryControl(BIN_OP_KEYBOARD_WAIT, payload);
+        }
         if ("DISPLAY_GET".equals(cmd)) {
             if (tokens.length != 1) {
                 throw new IOException("display_get_args_invalid");
@@ -623,6 +876,12 @@ final class DaemonSession {
                 throw new IOException("ping_args_invalid");
             }
             return sendBinaryControl(BIN_OP_PING, new byte[0]);
+        }
+        if ("READY".equals(cmd) || "READY_GET".equals(cmd)) {
+            if (tokens.length != 1) {
+                throw new IOException("ready_args_invalid");
+            }
+            return sendBinaryControl(BIN_OP_READY_GET, new byte[0]);
         }
         throw new IOException("control_command_unsupported:" + cmd);
     }
@@ -644,12 +903,59 @@ final class DaemonSession {
         if ("PING".equals(cmd)) {
             return "OK PONG";
         }
+        if ("READY".equals(cmd) || "READY_GET".equals(cmd)) {
+            long stateCode = reply.values[0];
+            String state;
+            if (stateCode == 0L) {
+                state = "starting";
+            } else if (stateCode == 1L) {
+                state = "ready";
+            } else if (stateCode == 2L) {
+                state = "stopping";
+            } else {
+                state = "unknown";
+            }
+            return "OK state="
+                    + state
+                    + " state_code="
+                    + stateCode
+                    + " boot_id="
+                    + reply.values[1]
+                    + " uptime_ms="
+                    + reply.values[2]
+                    + " pid="
+                    + reply.values[3];
+        }
         if ("FILTER_SET_GAUSSIAN".equals(cmd)
                 || "FILTER_CHAIN_SET".equals(cmd)
                 || "FILTER_CLEAR".equals(cmd)
                 || "FILTER_CHAIN_CLEAR".equals(cmd)
                 || "FILTER_GET".equals(cmd)) {
             return formatFilterInfo(reply.values);
+        }
+        if ("KEYBOARD_CHAR".equals(cmd)
+                || "KEYBOARD_BACKSPACE".equals(cmd)
+                || "KEYBOARD_DONE".equals(cmd)
+                || "KEYBOARD_FOCUS_ON".equals(cmd)
+                || "KEYBOARD_FOCUS_OFF".equals(cmd)
+                || "KEYBOARD_INJECT".equals(cmd)) {
+            return "OK seq="
+                    + reply.values[0]
+                    + " kind="
+                    + reply.values[1]
+                    + " codepoint="
+                    + reply.values[2];
+        }
+        if ("KEYBOARD_WAIT".equals(cmd)) {
+            if (reply.values[3] == 0L) {
+                return "OK TIMEOUT";
+            }
+            return "OK seq="
+                    + reply.values[0]
+                    + " kind="
+                    + reply.values[1]
+                    + " codepoint="
+                    + reply.values[2];
         }
         throw new IOException("control_reply_unsupported:" + cmd);
     }
@@ -750,6 +1056,149 @@ final class DaemonSession {
         return reply;
     }
 
+    private BinaryReply sendBinaryRaw(int opcode, byte[] payload) throws Exception {
+        byte[] body = payload == null ? new byte[0] : payload;
+        byte[] header = new byte[BIN_HEADER_BYTES];
+        writeLe32(header, 0, BIN_MAGIC);
+        writeLe16(header, 4, BIN_VERSION);
+        writeLe16(header, 6, opcode);
+        writeLe32(header, 8, body.length);
+        writeLe64(header, 12, rawSeq);
+
+        rawOutput.write(header);
+        if (body.length > 0) {
+            rawOutput.write(body);
+        }
+        rawOutput.flush();
+
+        byte[] respHeader = new byte[BIN_HEADER_BYTES];
+        readFully(rawInput, respHeader);
+        int magic = readLe32(respHeader, 0);
+        int version = readLe16(respHeader, 4);
+        int respOpcode = readLe16(respHeader, 6);
+        int payloadLen = readLe32(respHeader, 8);
+        long seq = readLe64(respHeader, 12);
+        if (magic != BIN_MAGIC || version != BIN_VERSION) {
+            throw new IOException("daemon_raw_header_invalid");
+        }
+        if (payloadLen != BIN_RESPONSE_PAYLOAD_BYTES) {
+            throw new IOException("daemon_raw_payload_len_invalid");
+        }
+        if (respOpcode != opcode) {
+            throw new IOException("daemon_raw_opcode_mismatch");
+        }
+        if (seq != rawSeq) {
+            throw new IOException("daemon_raw_seq_mismatch");
+        }
+
+        byte[] respPayload = new byte[BIN_RESPONSE_PAYLOAD_BYTES];
+        readFully(rawInput, respPayload);
+        int status = readLe32(respPayload, 0);
+        long[] values = new long[BIN_RESPONSE_VALUES];
+        int cursor = 4;
+        for (int i = 0; i < BIN_RESPONSE_VALUES; i++) {
+            values[i] = readLe64(respPayload, cursor);
+            cursor += 8;
+        }
+
+        BinaryReply reply = new BinaryReply(seq, respOpcode, status, values);
+        rawSeq += 1L;
+        return reply;
+    }
+
+    private BinaryReply sendBinaryRawWithFd(int opcode, byte[] payload, FileDescriptor fd) throws Exception {
+        if (fd == null) {
+            throw new IOException("daemon_send_fd_null");
+        }
+        byte[] body = payload == null ? new byte[0] : payload;
+        byte[] header = new byte[BIN_HEADER_BYTES];
+        writeLe32(header, 0, BIN_MAGIC);
+        writeLe16(header, 4, BIN_VERSION);
+        writeLe16(header, 6, opcode);
+        writeLe32(header, 8, body.length);
+        writeLe64(header, 12, rawSeq);
+
+        rawOutput.write(header);
+        if (body.length > 0) {
+            rawOutput.write(body);
+        }
+        rawOutput.flush();
+
+        setFdForNextDataWrite(fd);
+        rawOutput.write('D');
+        rawOutput.flush();
+
+        byte[] respHeader = new byte[BIN_HEADER_BYTES];
+        readFully(rawInput, respHeader);
+        int magic = readLe32(respHeader, 0);
+        int version = readLe16(respHeader, 4);
+        int respOpcode = readLe16(respHeader, 6);
+        int payloadLen = readLe32(respHeader, 8);
+        long seq = readLe64(respHeader, 12);
+        if (magic != BIN_MAGIC || version != BIN_VERSION) {
+            throw new IOException("daemon_raw_header_invalid");
+        }
+        if (payloadLen != BIN_RESPONSE_PAYLOAD_BYTES) {
+            throw new IOException("daemon_raw_payload_len_invalid");
+        }
+        if (respOpcode != opcode) {
+            throw new IOException("daemon_raw_opcode_mismatch");
+        }
+        if (seq != rawSeq) {
+            throw new IOException("daemon_raw_seq_mismatch");
+        }
+
+        byte[] respPayload = new byte[BIN_RESPONSE_PAYLOAD_BYTES];
+        readFully(rawInput, respPayload);
+        int status = readLe32(respPayload, 0);
+        long[] values = new long[BIN_RESPONSE_VALUES];
+        int cursor = 4;
+        for (int i = 0; i < BIN_RESPONSE_VALUES; i++) {
+            values[i] = readLe64(respPayload, cursor);
+            cursor += 8;
+        }
+
+        BinaryReply reply = new BinaryReply(seq, respOpcode, status, values);
+        rawSeq += 1L;
+        return reply;
+    }
+
+    private static void writeFullyAt(
+            FileChannel channel,
+            ByteBuffer src,
+            long startPos,
+            String err
+    ) throws IOException {
+        long pos = startPos;
+        while (src.hasRemaining()) {
+            int n = channel.write(src, pos);
+            if (n <= 0) {
+                throw new IOException(err);
+            }
+            pos += n;
+        }
+    }
+
+    private void ensureRowPackScratch(int rowBytes) {
+        if (rowBytes <= 0) {
+            return;
+        }
+        if (rowPackScratch.length >= rowBytes) {
+            return;
+        }
+        rowPackScratch = Arrays.copyOf(rowPackScratch, rowBytes);
+        rowPackScratchBuffer = ByteBuffer.wrap(rowPackScratch);
+    }
+
+    private ByteBuffer rowPackBuffer(int rowBytes) {
+        if (rowPackScratchBuffer.array() != rowPackScratch) {
+            rowPackScratchBuffer = ByteBuffer.wrap(rowPackScratch);
+        }
+        rowPackScratchBuffer.position(0);
+        rowPackScratchBuffer.limit(rowBytes);
+        return rowPackScratchBuffer;
+    }
+
     private static void writeAsciiLine(OutputStream os, String line) throws IOException {
         if (line == null) {
             throw new IOException("daemon_line_null");
@@ -817,8 +1266,8 @@ final class DaemonSession {
         } catch (Throwable ignored) {
             timeoutMs = DEFAULT_SOCKET_TIMEOUT_MS;
         }
-        if (timeoutMs <= 0) {
-            return DEFAULT_SOCKET_TIMEOUT_MS;
+        if (timeoutMs < 0) {
+            return 0;
         }
         return timeoutMs;
     }
@@ -848,6 +1297,14 @@ final class DaemonSession {
             }
         }
         throw new IOException("daemon_frame_fd_missing_ancillary");
+    }
+
+    private void setFdForNextDataWrite(FileDescriptor fd) throws Exception {
+        if (fd == null) {
+            throw new IOException("daemon_send_fd_null");
+        }
+        FileDescriptor[] toSend = new FileDescriptor[]{fd};
+        ReflectBridge.invoke(rawSocket, "setFileDescriptorsForSend", (Object) toSend);
     }
 
     private static IOException asIOException(String prefix, Throwable t) {
@@ -899,6 +1356,18 @@ final class DaemonSession {
                 throw new NumberFormatException("u32_out_of_range");
             }
             return (int) parsed;
+        } catch (Throwable t) {
+            throw new IOException(err, t);
+        }
+    }
+
+    private static long parseU64Strict(String s, String err) throws IOException {
+        try {
+            long parsed = Long.parseLong(s);
+            if (parsed < 0L) {
+                throw new NumberFormatException("u64_out_of_range");
+            }
+            return parsed;
         } catch (Throwable t) {
             throw new IOException(err, t);
         }

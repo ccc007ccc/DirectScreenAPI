@@ -166,9 +166,6 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     }
 
     let data_socket = data_socket.unwrap_or_else(|| derive_data_socket_path_text(&control_socket));
-    if data_socket == control_socket {
-        return Err("control_socket_and_data_socket_must_differ".to_string());
-    }
 
     Ok(Args {
         data_socket,

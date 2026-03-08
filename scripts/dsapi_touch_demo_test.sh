@@ -17,21 +17,25 @@ examples:
 env:
   DSAPI_DEMO_RUN_AS_ROOT=1|0      run demo as root (default: 1)
   DSAPI_DEMO_KEEP_SERVICES=1|0    keep daemon/presenter after demo exits (default: 0)
-  DSAPI_DEMO_RUN_SECONDS=<n>      auto stop seconds if --run-seconds not provided (default: 12)
+  DSAPI_DEMO_RUN_SECONDS=<n>      auto stop seconds if --run-seconds not provided (default: 0, disabled)
   DSAPI_DEMO_FPS=<n>              auto append --fps when caller not set (default: 0, auto)
-  DSAPI_DEMO_FILTER_CHAIN=<spec>  presenter filter chain (default: empty, disabled)
-  DSAPI_DEMO_BLUR_RADIUS=<n>      presenter compositor blur radius when chain empty (default: 0)
-  DSAPI_DEMO_BLUR_SIGMA=<n>       fallback gaussian sigma when chain empty (default: 0)
+  DSAPI_DEMO_FILTER_CHAIN=<spec>  presenter filter chain (default: 1,24,12 = gaussian on)
+  DSAPI_DEMO_BLUR_RADIUS=<n>      presenter compositor blur radius when chain empty (default: 24)
+  DSAPI_DEMO_BLUR_SIGMA=<n>       fallback gaussian sigma when chain empty (default: 12)
   DSAPI_DEMO_PRESENTER_FRAME_RATE presenter frame-rate policy: auto|max|current|<hz> (default: auto)
   DSAPI_DEMO_RENDER_CHECKSUM=1|0  daemon frame checksum (default: 0 for higher fps)
   DSAPI_DISPATCH_WORKERS=<n>      daemon dispatch workers (default: 8)
   DSAPI_PRESENTER_LOG_FILE=<path> presenter log file (default: artifacts/run/dsapi_presenter_user.log)
   DSAPI_APP_PROCESS_BIN=<path>    app_process binary (default: auto detect, prefer 64-bit)
-  DSAPI_ANDROID_OUT_DIR=<dir>     adapter output dir (default: artifacts/android_user)
+  DSAPI_ANDROID_OUT_DIR=<dir>     adapter output dir (default: artifacts/ksu_module/android_adapter)
 USAGE
 }
 
 derive_data_socket_path() {
+  case "${DSAPI_UNIFIED_SOCKET:-1}" in
+    0|false|FALSE|no|NO|off|OFF) ;;
+    *) printf '%s\n' "$1"; return 0 ;;
+  esac
   case "$1" in
     *.sock) printf '%s\n' "${1%.sock}.data.sock" ;;
     *) printf '%s\n' "${1}.data" ;;
@@ -103,12 +107,12 @@ DATA_SOCKET_ABS="$(to_abs_path "$DATA_SOCKET")"
 
 PRESENTER_LOG_FILE="${DSAPI_PRESENTER_LOG_FILE:-artifacts/run/dsapi_presenter_user.log}"
 APP_PROCESS_BIN="${DSAPI_APP_PROCESS_BIN:-/system/bin/app_process64}"
-ANDROID_OUT_DIR="${DSAPI_ANDROID_OUT_DIR:-artifacts/android_user}"
-DEMO_RUN_SECONDS="${DSAPI_DEMO_RUN_SECONDS:-12}"
+ANDROID_OUT_DIR="${DSAPI_ANDROID_OUT_DIR:-artifacts/ksu_module/android_adapter}"
+DEMO_RUN_SECONDS="${DSAPI_DEMO_RUN_SECONDS:-0}"
 DEMO_FPS="${DSAPI_DEMO_FPS:-0}"
-DEMO_FILTER_CHAIN="${DSAPI_DEMO_FILTER_CHAIN:-}"
-DEMO_BLUR_RADIUS="${DSAPI_DEMO_BLUR_RADIUS:-0}"
-DEMO_BLUR_SIGMA="${DSAPI_DEMO_BLUR_SIGMA:-0}"
+DEMO_FILTER_CHAIN="${DSAPI_DEMO_FILTER_CHAIN:-1,24,12}"
+DEMO_BLUR_RADIUS="${DSAPI_DEMO_BLUR_RADIUS:-24}"
+DEMO_BLUR_SIGMA="${DSAPI_DEMO_BLUR_SIGMA:-12}"
 DEMO_PRESENTER_FRAME_RATE="${DSAPI_DEMO_PRESENTER_FRAME_RATE:-auto}"
 DEMO_RENDER_CHECKSUM="${DSAPI_DEMO_RENDER_CHECKSUM:-0}"
 DAEMON_DISPATCH_WORKERS="${DSAPI_DISPATCH_WORKERS:-8}"
@@ -191,6 +195,7 @@ fi
 
 user_has_run_seconds=0
 user_has_fps=0
+user_has_no_soft_keyboard=0
 for token in "$@"
 do
   if [ "$token" = "--run-seconds" ]; then
@@ -199,6 +204,9 @@ do
   if [ "$token" = "--fps" ]; then
     user_has_fps=1
   fi
+  if [ "$token" = "--no-soft-keyboard" ]; then
+    user_has_no_soft_keyboard=1
+  fi
 done
 if [ "$user_has_run_seconds" = "0" ] && [ "$DEMO_RUN_SECONDS" != "0" ]; then
   set -- "$@" --run-seconds "$DEMO_RUN_SECONDS"
@@ -206,7 +214,6 @@ fi
 if [ "$user_has_fps" = "0" ] && [ -n "$DEMO_FPS" ]; then
   set -- "$@" --fps "$DEMO_FPS"
 fi
-
 set -- "$demo_bin" \
   --control-socket "$CONTROL_SOCKET_ABS" \
   --data-socket "$DATA_SOCKET_ABS" \

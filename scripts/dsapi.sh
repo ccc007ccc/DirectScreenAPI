@@ -11,10 +11,11 @@ usage:
   ./scripts/dsapi.sh presenter start|stop|status|run
   ./scripts/dsapi.sh screen start|stop|status|run|bench [samples]
   ./scripts/dsapi.sh touch start|stop|status|run
+  ./scripts/dsapi.sh ksu preflight|pack|ctl <args...>|ui-install|ui-start [refresh_ms]|ui-stop|ui-status|zygote-start [service] [daemon_service]|zygote-stop|zygote-status|zygote-policy-list|zygote-policy-set <package|*> <user|-1> <allow|deny>|zygote-policy-clear [package user]
   ./scripts/dsapi.sh android probe [display-kv|display-line]
   ./scripts/dsapi.sh android sync-display
   ./scripts/dsapi.sh frame pull <out_rgba_path>
-  ./scripts/dsapi.sh build core|android|c-example|framepull
+  ./scripts/dsapi.sh build core|android|ksu-module|c-example|framepull
   ./scripts/dsapi.sh check|fix
 USAGE
 }
@@ -38,7 +39,18 @@ derive_data_socket_path() {
   esac
 }
 
+is_unified_socket_enabled() {
+  case "${DSAPI_UNIFIED_SOCKET:-1}" in
+    0|false|FALSE|no|NO|off|OFF) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 data_socket_path() {
+  if is_unified_socket_enabled; then
+    control_socket_path
+    return 0
+  fi
   if [ -n "${DSAPI_DATA_SOCKET_PATH:-}" ]; then
     printf '%s\n' "${DSAPI_DATA_SOCKET_PATH}"
   else
@@ -127,6 +139,10 @@ build_impl() {
       shift
       ./scripts/build_android_adapter.sh "$@"
       ;;
+    ksu-module)
+      shift
+      ./scripts/build_ksu_module.sh "$@"
+      ;;
     c-example)
       shift
       ./scripts/build_c_example.sh "$@"
@@ -137,6 +153,120 @@ build_impl() {
       ;;
     *)
       echo "dsapi_error=build_subcommand_invalid subcommand=${sub:-<empty>}"
+      usage
+      return 1
+      ;;
+  esac
+}
+
+run_ksu() {
+  sub="${1:-}"
+  KSU_CTL_PATH="${DSAPI_KSU_CTL_PATH:-/data/adb/modules/directscreenapi/bin/dsapi_service_ctl.sh}"
+  case "$sub" in
+    preflight) shift; ./scripts/dsapi_ksu_preflight.sh "$@" ;;
+    pack) shift; ./scripts/build_ksu_module.sh "$@" ;;
+    ctl)
+      shift
+      if [ "$#" -lt 1 ]; then
+        echo "ksu_error=missing_ctl_args"
+        return 1
+      fi
+      if [ ! -f "$KSU_CTL_PATH" ]; then
+        echo "ksu_error=ctl_script_missing path=$KSU_CTL_PATH"
+        return 2
+      fi
+      su_exec /system/bin/sh "$KSU_CTL_PATH" "$@"
+      ;;
+    ui-start)
+      shift
+      if [ ! -f "$KSU_CTL_PATH" ]; then
+        echo "ksu_error=ctl_script_missing path=$KSU_CTL_PATH"
+        return 2
+      fi
+      su_exec /system/bin/sh "$KSU_CTL_PATH" ui start "${1:-1200}"
+      ;;
+    ui-install)
+      shift
+      if [ ! -f "$KSU_CTL_PATH" ]; then
+        echo "ksu_error=ctl_script_missing path=$KSU_CTL_PATH"
+        return 2
+      fi
+      su_exec /system/bin/sh "$KSU_CTL_PATH" ui install
+      ;;
+    ui-stop)
+      shift
+      if [ ! -f "$KSU_CTL_PATH" ]; then
+        echo "ksu_error=ctl_script_missing path=$KSU_CTL_PATH"
+        return 2
+      fi
+      su_exec /system/bin/sh "$KSU_CTL_PATH" ui stop
+      ;;
+    ui-status)
+      shift
+      if [ ! -f "$KSU_CTL_PATH" ]; then
+        echo "ksu_error=ctl_script_missing path=$KSU_CTL_PATH"
+        return 2
+      fi
+      su_exec /system/bin/sh "$KSU_CTL_PATH" ui status
+      ;;
+    zygote-start)
+      shift
+      if [ ! -f "$KSU_CTL_PATH" ]; then
+        echo "ksu_error=ctl_script_missing path=$KSU_CTL_PATH"
+        return 2
+      fi
+      su_exec /system/bin/sh "$KSU_CTL_PATH" zygote start "${1:-}" "${2:-}"
+      ;;
+    zygote-stop)
+      shift
+      if [ ! -f "$KSU_CTL_PATH" ]; then
+        echo "ksu_error=ctl_script_missing path=$KSU_CTL_PATH"
+        return 2
+      fi
+      su_exec /system/bin/sh "$KSU_CTL_PATH" zygote stop
+      ;;
+    zygote-status)
+      shift
+      if [ ! -f "$KSU_CTL_PATH" ]; then
+        echo "ksu_error=ctl_script_missing path=$KSU_CTL_PATH"
+        return 2
+      fi
+      su_exec /system/bin/sh "$KSU_CTL_PATH" zygote status
+      ;;
+    zygote-policy-list)
+      shift
+      if [ ! -f "$KSU_CTL_PATH" ]; then
+        echo "ksu_error=ctl_script_missing path=$KSU_CTL_PATH"
+        return 2
+      fi
+      su_exec /system/bin/sh "$KSU_CTL_PATH" zygote policy-list
+      ;;
+    zygote-policy-set)
+      shift
+      if [ "$#" -lt 3 ]; then
+        echo "ksu_error=missing_zygote_policy_set_args"
+        return 1
+      fi
+      if [ ! -f "$KSU_CTL_PATH" ]; then
+        echo "ksu_error=ctl_script_missing path=$KSU_CTL_PATH"
+        return 2
+      fi
+      su_exec /system/bin/sh "$KSU_CTL_PATH" zygote policy-set "$1" "$2" "$3"
+      ;;
+    zygote-policy-clear)
+      shift
+      if [ ! -f "$KSU_CTL_PATH" ]; then
+        echo "ksu_error=ctl_script_missing path=$KSU_CTL_PATH"
+        return 2
+      fi
+      if [ "$#" -ge 2 ]; then
+        su_exec /system/bin/sh "$KSU_CTL_PATH" zygote policy-clear "$1" "$2"
+      else
+        su_exec /system/bin/sh "$KSU_CTL_PATH" zygote policy-clear
+      fi
+      ;;
+    *)
+      echo "dsapi_error=ksu_subcommand_invalid subcommand=${sub:-<empty>}"
       usage
       return 1
       ;;
@@ -242,6 +372,7 @@ case "$cmd" in
   presenter) run_presenter "$@" ;;
   screen) run_screen "$@" ;;
   touch) run_touch "$@" ;;
+  ksu) run_ksu "$@" ;;
   android) run_android "$@" ;;
   frame) run_frame "$@" ;;
   build) build_impl "$@" ;;

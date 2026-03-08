@@ -7,6 +7,7 @@ use directscreen_core::util::{default_control_socket_path, derive_data_socket_pa
 pub(super) struct DaemonConfig {
     pub(super) control_socket_path: String,
     pub(super) data_socket_path: String,
+    pub(super) unified_socket: bool,
     pub(super) render_output_dir: String,
     pub(super) supervise_presenter_cmd: Option<String>,
     pub(super) supervise_input_cmd: Option<String>,
@@ -15,6 +16,12 @@ pub(super) struct DaemonConfig {
     pub(super) dispatch_workers: usize,
     pub(super) socket_rw_timeout_ms: u64,
     pub(super) command_max_bytes: usize,
+    pub(super) module_root_dir: String,
+    pub(super) module_state_root_dir: String,
+    pub(super) module_disabled_dir: String,
+    pub(super) module_registry_file: String,
+    pub(super) module_scope_file: String,
+    pub(super) module_action_timeout_sec: u64,
     pub(super) allowed_uids: HashSet<u32>,
     pub(super) auth_permissive: bool,
 }
@@ -31,6 +38,14 @@ fn parse_usize_arg(token: &str) -> Result<usize, String> {
         .map_err(|_| format!("invalid_usize_value:{}", token))
 }
 
+fn parse_flag_bool(raw: &str) -> bool {
+    let v = raw.trim();
+    !(v.eq_ignore_ascii_case("0")
+        || v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("no")
+        || v.eq_ignore_ascii_case("off"))
+}
+
 pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
     let mut control_socket_path = std::env::var("DSAPI_CONTROL_SOCKET_PATH")
         .ok()
@@ -44,6 +59,10 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
     let mut data_socket_path = std::env::var("DSAPI_DATA_SOCKET_PATH")
         .ok()
         .filter(|v| !v.is_empty());
+    let mut unified_socket = std::env::var("DSAPI_UNIFIED_SOCKET")
+        .ok()
+        .map(|v| parse_flag_bool(v.as_str()))
+        .unwrap_or(true);
     let mut render_output_dir =
         std::env::var("DSAPI_RENDER_OUTPUT_DIR").unwrap_or_else(|_| "artifacts/render".to_string());
     let mut supervise_presenter_cmd = std::env::var("DSAPI_SUPERVISE_PRESENTER_CMD")
@@ -71,11 +90,25 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
     let mut socket_rw_timeout_ms = std::env::var("DSAPI_SOCKET_RW_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(30000);
+        .unwrap_or(0);
     let mut command_max_bytes = std::env::var("DSAPI_COMMAND_MAX_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4096usize);
+    let mut module_root_dir = std::env::var("DSAPI_MODULE_ROOT_DIR")
+        .unwrap_or_else(|_| "/data/adb/dsapi/modules".to_string());
+    let mut module_state_root_dir = std::env::var("DSAPI_MODULE_STATE_ROOT_DIR")
+        .unwrap_or_else(|_| "/data/adb/dsapi/state/modules".to_string());
+    let mut module_disabled_dir = std::env::var("DSAPI_MODULE_DISABLED_DIR")
+        .unwrap_or_else(|_| "/data/adb/dsapi/state/modules_disabled".to_string());
+    let mut module_registry_file = std::env::var("DSAPI_MODULE_REGISTRY_FILE")
+        .unwrap_or_else(|_| "/data/adb/dsapi/state/module_registry.db".to_string());
+    let mut module_scope_file = std::env::var("DSAPI_MODULE_SCOPE_FILE")
+        .unwrap_or_else(|_| "/data/adb/dsapi/state/module_scope.db".to_string());
+    let mut module_action_timeout_sec = std::env::var("DSAPI_MODULE_ACTION_TIMEOUT_SEC")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60);
     let auth_permissive = parse_auth_permissive_from_env();
 
     let mut i = 1usize;
@@ -101,6 +134,13 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
                     return Err("missing_data_socket_path".to_string());
                 }
                 data_socket_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--unified-socket" => {
+                if (i + 1) >= args.len() {
+                    return Err("missing_unified_socket_flag".to_string());
+                }
+                unified_socket = parse_flag_bool(&args[i + 1]);
                 i += 2;
             }
             "--render-output-dir" => {
@@ -159,6 +199,48 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
                 command_max_bytes = parse_usize_arg(&args[i + 1])?;
                 i += 2;
             }
+            "--module-root-dir" => {
+                if (i + 1) >= args.len() {
+                    return Err("missing_module_root_dir".to_string());
+                }
+                module_root_dir = args[i + 1].clone();
+                i += 2;
+            }
+            "--module-state-root-dir" => {
+                if (i + 1) >= args.len() {
+                    return Err("missing_module_state_root_dir".to_string());
+                }
+                module_state_root_dir = args[i + 1].clone();
+                i += 2;
+            }
+            "--module-disabled-dir" => {
+                if (i + 1) >= args.len() {
+                    return Err("missing_module_disabled_dir".to_string());
+                }
+                module_disabled_dir = args[i + 1].clone();
+                i += 2;
+            }
+            "--module-registry-file" => {
+                if (i + 1) >= args.len() {
+                    return Err("missing_module_registry_file".to_string());
+                }
+                module_registry_file = args[i + 1].clone();
+                i += 2;
+            }
+            "--module-scope-file" => {
+                if (i + 1) >= args.len() {
+                    return Err("missing_module_scope_file".to_string());
+                }
+                module_scope_file = args[i + 1].clone();
+                i += 2;
+            }
+            "--module-action-timeout-sec" => {
+                if (i + 1) >= args.len() {
+                    return Err("missing_module_action_timeout_sec".to_string());
+                }
+                module_action_timeout_sec = parse_u64_arg(&args[i + 1])?;
+                i += 2;
+            }
             _ => return Err(format!("unknown_arg:{}", args[i])),
         }
     }
@@ -181,11 +263,17 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
     if command_max_bytes < 128 {
         command_max_bytes = 128;
     }
+    if module_action_timeout_sec == 0 {
+        module_action_timeout_sec = 1;
+    }
 
-    let data_socket_path = data_socket_path
+    let mut data_socket_path = data_socket_path
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| derive_data_socket_path_text(&control_socket_path));
-    if control_socket_path == data_socket_path {
+    if unified_socket {
+        data_socket_path = control_socket_path.clone();
+    }
+    if !unified_socket && control_socket_path == data_socket_path {
         return Err("control_socket_and_data_socket_must_differ".to_string());
     }
 
@@ -194,6 +282,7 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
     Ok(DaemonConfig {
         control_socket_path,
         data_socket_path,
+        unified_socket,
         render_output_dir,
         supervise_presenter_cmd,
         supervise_input_cmd,
@@ -202,6 +291,12 @@ pub(super) fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, Strin
         dispatch_workers,
         socket_rw_timeout_ms,
         command_max_bytes,
+        module_root_dir,
+        module_state_root_dir,
+        module_disabled_dir,
+        module_registry_file,
+        module_scope_file,
+        module_action_timeout_sec,
         allowed_uids,
         auth_permissive,
     })

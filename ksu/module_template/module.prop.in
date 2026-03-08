@@ -1,0 +1,7 @@
+id={{MODULE_ID}}
+name={{MODULE_NAME}}
+version={{VERSION}}
+versionCode={{VERSION_CODE}}
+author=DirectScreenAPI
+# KSU 服务化内核，不依赖前台 APK。
+description=DirectScreenAPI kernel-style core service for KernelSU (daemon + AIDL control plane)

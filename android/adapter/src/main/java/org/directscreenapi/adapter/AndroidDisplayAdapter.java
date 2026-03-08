@@ -77,30 +77,18 @@ public final class AndroidDisplayAdapter implements DisplayAdapter {
     }
 
     private static Object invokeSingleDisplayIdMethod(Object target, String methodName, int displayId) {
-        Object out = invokeSingleDisplayIdMethodByType(target, methodName, displayId, int.class);
-        if (out != null) return out;
-        out = invokeSingleDisplayIdMethodByType(target, methodName, displayId, Integer.class);
-        if (out != null) return out;
-        out = invokeSingleDisplayIdMethodByType(target, methodName, displayId, long.class);
-        if (out != null) return out;
-        return invokeSingleDisplayIdMethodByType(target, methodName, displayId, Long.class);
-    }
-
-    private static Object invokeSingleDisplayIdMethodByType(
-            Object target,
-            String methodName,
-            int displayId,
-            Class<?> paramType
-    ) {
         for (Method method : target.getClass().getMethods()) {
             if (!methodName.equals(method.getName())) continue;
             Class<?>[] params = method.getParameterTypes();
-            if (params.length != 1 || params[0] != paramType) continue;
+            if (params.length != 1) continue;
             try {
+                Class<?> paramType = params[0];
                 if (paramType == long.class || paramType == Long.class) {
                     return method.invoke(target, Long.valueOf(displayId));
                 }
-                return method.invoke(target, Integer.valueOf(displayId));
+                if (paramType == int.class || paramType == Integer.class) {
+                    return method.invoke(target, Integer.valueOf(displayId));
+                }
             } catch (Throwable ignored) {
             }
         }

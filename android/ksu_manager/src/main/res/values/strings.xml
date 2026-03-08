@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">DSAPI Manager</string>
+    <string name="modules_title">DSAPI Modules</string>
+    <string name="settings_title">DSAPI Settings</string>
+    <string name="logs_title">DSAPI Logs</string>
+</resources>

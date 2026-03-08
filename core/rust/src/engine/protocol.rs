@@ -1,4 +1,6 @@
-use crate::api::{DisplayState, RenderStats, RouteResult, Status, TouchEvent};
+use crate::api::{
+    DisplayState, RenderStats, RouteResult, Status, TouchEvent, RENDER_MAX_FRAME_BYTES,
+};
 use crate::backend::filter::{
     FilterPass, FilterPipeline, GaussianBlurPass, FILTER_PASS_KIND_GAUSSIAN,
 };
@@ -37,6 +39,14 @@ pub enum BinaryOpcode {
     FilterChainSet = 12,
     FilterClear = 13,
     FilterGet = 14,
+    ReadyGet = 15,
+    KeyboardInject = 16,
+    KeyboardWait = 17,
+    RenderFrameBindShm = 18,
+    RenderFrameWaitShmPresent = 19,
+    RenderFrameSubmitShm = 20,
+    RenderFrameSubmitDmabuf = 21,
+    ModuleRpc = 22,
 }
 
 impl BinaryOpcode {
@@ -56,6 +66,14 @@ impl BinaryOpcode {
             12 => Some(Self::FilterChainSet),
             13 => Some(Self::FilterClear),
             14 => Some(Self::FilterGet),
+            15 => Some(Self::ReadyGet),
+            16 => Some(Self::KeyboardInject),
+            17 => Some(Self::KeyboardWait),
+            18 => Some(Self::RenderFrameBindShm),
+            19 => Some(Self::RenderFrameWaitShmPresent),
+            20 => Some(Self::RenderFrameSubmitShm),
+            21 => Some(Self::RenderFrameSubmitDmabuf),
+            22 => Some(Self::ModuleRpc),
             _ => None,
         }
     }
@@ -100,6 +118,47 @@ pub struct BinaryFilterPassPayload {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BinaryFilterChainSetPayload {
     pub passes: Vec<BinaryFilterPassPayload>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BinaryKeyboardInjectPayload {
+    pub kind: u32,
+    pub codepoint: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BinaryKeyboardWaitPayload {
+    pub last_seq: u64,
+    pub timeout_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BinaryRenderFrameWaitShmPresentPayload {
+    pub last_seq: u64,
+    pub timeout_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BinaryRenderFrameSubmitShmPayload {
+    pub width: u32,
+    pub height: u32,
+    pub byte_len: u32,
+    pub offset: u32,
+    pub origin_x: i32,
+    pub origin_y: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BinaryRenderFrameSubmitDmabufPayload {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: u32,
+    pub usage: u64,
+    pub byte_len: u32,
+    pub byte_offset: u32,
+    pub origin_x: i32,
+    pub origin_y: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +209,36 @@ pub enum BinaryCommand {
     },
     FilterGet {
         seq: u64,
+    },
+    ReadyGet {
+        seq: u64,
+    },
+    KeyboardInject {
+        seq: u64,
+        payload: BinaryKeyboardInjectPayload,
+    },
+    KeyboardWait {
+        seq: u64,
+        payload: BinaryKeyboardWaitPayload,
+    },
+    RenderFrameBindShm {
+        seq: u64,
+    },
+    RenderFrameWaitShmPresent {
+        seq: u64,
+        payload: BinaryRenderFrameWaitShmPresentPayload,
+    },
+    RenderFrameSubmitShm {
+        seq: u64,
+        payload: BinaryRenderFrameSubmitShmPayload,
+    },
+    RenderFrameSubmitDmabuf {
+        seq: u64,
+        payload: BinaryRenderFrameSubmitDmabufPayload,
+    },
+    ModuleRpc {
+        seq: u64,
+        payload: String,
     },
 }
 
@@ -227,6 +316,62 @@ fn parse_filter_chain_payload(payload: &[u8]) -> Result<BinaryFilterChainSetPayl
     }
 
     Ok(BinaryFilterChainSetPayload { passes })
+}
+
+fn validate_shm_submit_payload(payload: BinaryRenderFrameSubmitShmPayload) -> Result<(), Status> {
+    if payload.width == 0 || payload.height == 0 {
+        return Err(Status::InvalidArgument);
+    }
+
+    let expected_len = (payload.width as usize)
+        .checked_mul(payload.height as usize)
+        .and_then(|v| v.checked_mul(4usize))
+        .ok_or(Status::OutOfRange)?;
+    if expected_len > RENDER_MAX_FRAME_BYTES {
+        return Err(Status::OutOfRange);
+    }
+    if expected_len != payload.byte_len as usize {
+        return Err(Status::InvalidArgument);
+    }
+    Ok(())
+}
+
+fn validate_dmabuf_submit_payload(
+    payload: BinaryRenderFrameSubmitDmabufPayload,
+) -> Result<(), Status> {
+    if payload.width == 0 || payload.height == 0 || payload.stride == 0 {
+        return Err(Status::InvalidArgument);
+    }
+    if payload.stride < payload.width {
+        return Err(Status::InvalidArgument);
+    }
+    if payload.byte_len == 0 || payload.byte_offset >= payload.byte_len {
+        return Err(Status::InvalidArgument);
+    }
+    if payload.byte_len as usize > RENDER_MAX_FRAME_BYTES {
+        return Err(Status::OutOfRange);
+    }
+
+    let tight_len = (payload.width as usize)
+        .checked_mul(payload.height as usize)
+        .and_then(|v| v.checked_mul(4usize))
+        .ok_or(Status::OutOfRange)?;
+    if tight_len > RENDER_MAX_FRAME_BYTES {
+        return Err(Status::OutOfRange);
+    }
+
+    let row_bytes = (payload.stride as usize)
+        .checked_mul(4usize)
+        .ok_or(Status::OutOfRange)?;
+    let total_from_offset = row_bytes
+        .checked_mul(payload.height as usize)
+        .and_then(|v| (payload.byte_offset as usize).checked_add(v))
+        .ok_or(Status::OutOfRange)?;
+    if total_from_offset > payload.byte_len as usize {
+        return Err(Status::InvalidArgument);
+    }
+
+    Ok(())
 }
 
 pub fn parse_binary_header(frame: &[u8]) -> Result<BinaryCommandHeader, Status> {
@@ -375,6 +520,103 @@ pub fn parse_binary_command(frame: &[u8]) -> Result<BinaryCommand, Status> {
                 return Err(Status::InvalidArgument);
             }
             Ok(BinaryCommand::FilterGet { seq: header.seq })
+        }
+        BinaryOpcode::ReadyGet => {
+            if !payload.is_empty() {
+                return Err(Status::InvalidArgument);
+            }
+            Ok(BinaryCommand::ReadyGet { seq: header.seq })
+        }
+        BinaryOpcode::KeyboardInject => {
+            if payload.len() != 8 {
+                return Err(Status::InvalidArgument);
+            }
+            Ok(BinaryCommand::KeyboardInject {
+                seq: header.seq,
+                payload: BinaryKeyboardInjectPayload {
+                    kind: read_u32_le(payload, 0)?,
+                    codepoint: read_u32_le(payload, 4)?,
+                },
+            })
+        }
+        BinaryOpcode::KeyboardWait => {
+            if payload.len() != 12 {
+                return Err(Status::InvalidArgument);
+            }
+            Ok(BinaryCommand::KeyboardWait {
+                seq: header.seq,
+                payload: BinaryKeyboardWaitPayload {
+                    last_seq: read_u64_le(payload, 0)?,
+                    timeout_ms: read_u32_le(payload, 8)?,
+                },
+            })
+        }
+        BinaryOpcode::RenderFrameBindShm => {
+            if !payload.is_empty() {
+                return Err(Status::InvalidArgument);
+            }
+            Ok(BinaryCommand::RenderFrameBindShm { seq: header.seq })
+        }
+        BinaryOpcode::RenderFrameWaitShmPresent => {
+            if payload.len() != 12 {
+                return Err(Status::InvalidArgument);
+            }
+            Ok(BinaryCommand::RenderFrameWaitShmPresent {
+                seq: header.seq,
+                payload: BinaryRenderFrameWaitShmPresentPayload {
+                    last_seq: read_u64_le(payload, 0)?,
+                    timeout_ms: read_u32_le(payload, 8)?,
+                },
+            })
+        }
+        BinaryOpcode::RenderFrameSubmitShm => {
+            if payload.len() != 24 {
+                return Err(Status::InvalidArgument);
+            }
+            let parsed = BinaryRenderFrameSubmitShmPayload {
+                width: read_u32_le(payload, 0)?,
+                height: read_u32_le(payload, 4)?,
+                byte_len: read_u32_le(payload, 8)?,
+                offset: read_u32_le(payload, 12)?,
+                origin_x: read_i32_le(payload, 16)?,
+                origin_y: read_i32_le(payload, 20)?,
+            };
+            validate_shm_submit_payload(parsed)?;
+            Ok(BinaryCommand::RenderFrameSubmitShm {
+                seq: header.seq,
+                payload: parsed,
+            })
+        }
+        BinaryOpcode::RenderFrameSubmitDmabuf => {
+            if payload.len() != 40 {
+                return Err(Status::InvalidArgument);
+            }
+            let parsed = BinaryRenderFrameSubmitDmabufPayload {
+                width: read_u32_le(payload, 0)?,
+                height: read_u32_le(payload, 4)?,
+                stride: read_u32_le(payload, 8)?,
+                format: read_u32_le(payload, 12)?,
+                usage: read_u64_le(payload, 16)?,
+                byte_len: read_u32_le(payload, 24)?,
+                byte_offset: read_u32_le(payload, 28)?,
+                origin_x: read_i32_le(payload, 32)?,
+                origin_y: read_i32_le(payload, 36)?,
+            };
+            validate_dmabuf_submit_payload(parsed)?;
+            Ok(BinaryCommand::RenderFrameSubmitDmabuf {
+                seq: header.seq,
+                payload: parsed,
+            })
+        }
+        BinaryOpcode::ModuleRpc => {
+            if payload.is_empty() {
+                return Err(Status::InvalidArgument);
+            }
+            let text = std::str::from_utf8(payload).map_err(|_| Status::InvalidArgument)?;
+            Ok(BinaryCommand::ModuleRpc {
+                seq: header.seq,
+                payload: text.to_string(),
+            })
         }
     }
 }
@@ -616,6 +858,73 @@ pub fn execute_binary_command(engine: &RuntimeEngine, frame: &[u8]) -> BinaryRes
             fill_filter_state_response(engine, &mut resp);
             resp
         }
+        BinaryCommand::ReadyGet { seq } => {
+            let mut resp =
+                BinaryResponse::with_status(seq, BinaryOpcode::ReadyGet as u16, Status::Ok);
+            // 默认值仅用于协议保底，daemon 会在 control_dispatch 中覆写为真实生命周期快照。
+            resp.values[0] = 1;
+            resp
+        }
+        BinaryCommand::KeyboardInject { seq, payload } => {
+            let mut resp =
+                BinaryResponse::with_status(seq, BinaryOpcode::KeyboardInject as u16, Status::Ok);
+            match engine.submit_keyboard_event(payload.kind, payload.codepoint) {
+                Ok(event) => {
+                    resp.values[0] = event.seq;
+                    resp.values[1] = event.kind as u64;
+                    resp.values[2] = event.codepoint as u64;
+                }
+                Err(status) => {
+                    resp.status = status;
+                }
+            }
+            resp
+        }
+        BinaryCommand::KeyboardWait { seq, payload } => {
+            let mut resp =
+                BinaryResponse::with_status(seq, BinaryOpcode::KeyboardWait as u16, Status::Ok);
+            match engine.wait_for_keyboard_after(payload.last_seq, payload.timeout_ms) {
+                Ok(Some(event)) => {
+                    resp.values[0] = event.seq;
+                    resp.values[1] = event.kind as u64;
+                    resp.values[2] = event.codepoint as u64;
+                    resp.values[3] = 1;
+                }
+                Ok(None) => {
+                    resp.values[0] = payload.last_seq;
+                    resp.values[3] = 0;
+                }
+                Err(status) => {
+                    resp.status = status;
+                }
+            }
+            resp
+        }
+        BinaryCommand::RenderFrameBindShm { seq } => BinaryResponse::with_status(
+            seq,
+            BinaryOpcode::RenderFrameBindShm as u16,
+            Status::InvalidArgument,
+        ),
+        BinaryCommand::RenderFrameWaitShmPresent { seq, .. } => BinaryResponse::with_status(
+            seq,
+            BinaryOpcode::RenderFrameWaitShmPresent as u16,
+            Status::InvalidArgument,
+        ),
+        BinaryCommand::RenderFrameSubmitShm { seq, .. } => BinaryResponse::with_status(
+            seq,
+            BinaryOpcode::RenderFrameSubmitShm as u16,
+            Status::InvalidArgument,
+        ),
+        BinaryCommand::RenderFrameSubmitDmabuf { seq, .. } => BinaryResponse::with_status(
+            seq,
+            BinaryOpcode::RenderFrameSubmitDmabuf as u16,
+            Status::InvalidArgument,
+        ),
+        BinaryCommand::ModuleRpc { seq, .. } => BinaryResponse::with_status(
+            seq,
+            BinaryOpcode::ModuleRpc as u16,
+            Status::InvalidArgument,
+        ),
     }
 }
 
@@ -644,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn ping_and_version_binary_commands() {
+    fn ping_version_and_ready_binary_commands() {
         let engine = RuntimeEngine::default();
 
         let ping_resp = execute_binary_command(&engine, &build_frame(7, BinaryOpcode::Ping, &[]));
@@ -658,6 +967,13 @@ mod tests {
         assert_eq!(version_resp.status, Status::Ok);
         assert_eq!(version_resp.seq, 8);
         assert_eq!(version_resp.opcode, BinaryOpcode::Version as u16);
+
+        let ready_resp =
+            execute_binary_command(&engine, &build_frame(9, BinaryOpcode::ReadyGet, &[]));
+        assert_eq!(ready_resp.status, Status::Ok);
+        assert_eq!(ready_resp.seq, 9);
+        assert_eq!(ready_resp.opcode, BinaryOpcode::ReadyGet as u16);
+        assert_eq!(ready_resp.values[0], 1);
     }
 
     #[test]
@@ -807,5 +1123,44 @@ mod tests {
             execute_binary_command(&engine, &build_frame(33, BinaryOpcode::FilterClear, &[]));
         assert_eq!(clear_resp.status, Status::Ok);
         assert_eq!(clear_resp.values[2], 0);
+    }
+
+    #[test]
+    fn keyboard_inject_and_wait_binary_commands() {
+        let engine = RuntimeEngine::default();
+        let inject_payload = [1u32.to_le_bytes(), ('Z' as u32).to_le_bytes()].concat();
+        let inject_resp = execute_binary_command(
+            &engine,
+            &build_frame(40, BinaryOpcode::KeyboardInject, &inject_payload),
+        );
+        assert_eq!(inject_resp.status, Status::Ok);
+        assert_eq!(inject_resp.values[1], 1);
+        assert_eq!(inject_resp.values[2], 'Z' as u64);
+
+        let mut wait_payload = Vec::with_capacity(12);
+        wait_payload.extend_from_slice(&0u64.to_le_bytes());
+        wait_payload.extend_from_slice(&10u32.to_le_bytes());
+        let wait_resp = execute_binary_command(
+            &engine,
+            &build_frame(41, BinaryOpcode::KeyboardWait, &wait_payload),
+        );
+        assert_eq!(wait_resp.status, Status::Ok);
+        assert_eq!(wait_resp.values[3], 1);
+        assert_eq!(wait_resp.values[1], 1);
+        assert_eq!(wait_resp.values[2], 'Z' as u64);
+    }
+
+    #[test]
+    fn keyboard_wait_times_out_without_event() {
+        let engine = RuntimeEngine::default();
+        let mut wait_payload = Vec::with_capacity(12);
+        wait_payload.extend_from_slice(&0u64.to_le_bytes());
+        wait_payload.extend_from_slice(&1u32.to_le_bytes());
+        let wait_resp = execute_binary_command(
+            &engine,
+            &build_frame(42, BinaryOpcode::KeyboardWait, &wait_payload),
+        );
+        assert_eq!(wait_resp.status, Status::Ok);
+        assert_eq!(wait_resp.values[3], 0);
     }
 }

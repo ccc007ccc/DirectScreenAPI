@@ -5,7 +5,7 @@
 ## 能力定义
 
 - 采集来源：Android `VirtualDisplay + ImageReader`（root 运行）
-- 数据去向：通过 daemon data socket 的 `RENDER_FRAME_SUBMIT_SHM` 回灌
+- 数据去向：通过统一 socket 的 `RENDER_FRAME_SUBMIT_SHM/DMABUF` 回灌
 - 可见效果：daemon 当前帧变为系统全屏帧，可由 `frame pull` 拉取
 
 ## 命令
@@ -42,7 +42,6 @@ DSAPI_ANDROID_OUT_DIR=artifacts/android_user DSAPI_SCREEN_RUN_AS_ROOT=1 ./script
 ## 错误语义
 
 - `screen_stream_error=daemon_control_socket_missing`：控制 socket 不可用
-- `screen_stream_error=daemon_data_socket_missing`：数据 socket 不可用
 - `screen_stream_error=on_image_available_failed ...`：图像回调或提交链路失败
 - `screen_stream_status=failed`：采集流初始化失败，需查看日志定位
 

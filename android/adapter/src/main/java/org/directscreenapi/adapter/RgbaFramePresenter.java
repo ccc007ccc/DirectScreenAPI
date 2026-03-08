@@ -9,9 +9,6 @@ import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class RgbaFramePresenter {
-    private static final int DEFAULT_DISPLAY_SYNC_FALLBACK_INTERVAL_MS = 250;
-    private static final String DISPLAY_SYNC_FALLBACK_PROPERTY = "dsapi.display_sync_fallback_ms";
-
     private static final class FrameRatePolicy {
         final String modeLabel;
         final float forcedHz;
@@ -55,8 +52,7 @@ final class RgbaFramePresenter {
 
     private final DaemonSession daemon;
     private final AndroidDisplayAdapter displayAdapter;
-    private final int pollMs;
-    private final int displaySyncFallbackIntervalMs;
+    private final int waitTimeoutMs;
     private final int zLayer;
     private final int layerBlurRadius;
     private final String frameRateModeLabel;
@@ -68,7 +64,6 @@ final class RgbaFramePresenter {
 
     private volatile boolean running = true;
     private long lastFrameSeq = -1L;
-    private long lastDisplaySyncMs = 0L;
     private long perfWindowStartMs = 0L;
     private int perfFrames = 0;
     private long perfBytes = 0L;
@@ -90,6 +85,7 @@ final class RgbaFramePresenter {
     private Object displayManager;
     private Object displayListener;
     private Object displayListenerThread;
+    private boolean displayListenerEnabled = false;
 
     private Object bitmap;
     private int bitmapWidth = 0;
@@ -113,8 +109,7 @@ final class RgbaFramePresenter {
 
     RgbaFramePresenter(
             String controlSocketPath,
-            String dataSocketPath,
-            int pollMs,
+            int waitTimeoutMs,
             int zLayer,
             String layerName,
             int blurRadius,
@@ -122,10 +117,9 @@ final class RgbaFramePresenter {
             String filterChainSpec,
             String frameRateSpec
     ) throws Exception {
-        this.daemon = new DaemonSession(controlSocketPath, dataSocketPath);
+        this.daemon = new DaemonSession(controlSocketPath);
         this.displayAdapter = new AndroidDisplayAdapter();
-        this.pollMs = Math.max(1, pollMs);
-        this.displaySyncFallbackIntervalMs = resolveDisplaySyncFallbackIntervalMs();
+        this.waitTimeoutMs = Math.max(0, waitTimeoutMs);
         this.zLayer = zLayer;
         this.layerName = layerName;
         this.layerBlurRadius = Math.max(0, blurRadius);
@@ -177,8 +171,8 @@ final class RgbaFramePresenter {
         try {
             applyStartupFilter("run_loop_start");
             syncDisplayAndEnsureSurface();
-            log("presenter_status=started poll_ms="
-                    + pollMs
+            log("presenter_status=started wait_timeout_ms="
+                    + waitTimeoutMs
                     + " z_layer="
                     + zLayer
                     + " layer="
@@ -189,17 +183,12 @@ final class RgbaFramePresenter {
                     + layerBlurRadius);
 
             while (running && !Thread.currentThread().isInterrupted()) {
-                long now = System.currentTimeMillis();
-                boolean shouldSync = displayDirty.getAndSet(false);
-                if (!shouldSync && (now - lastDisplaySyncMs >= displaySyncFallbackIntervalMs)) {
-                    shouldSync = true;
-                }
+                boolean shouldSync = !displayListenerEnabled || displayDirty.getAndSet(false);
                 if (shouldSync) {
                     syncDisplayAndEnsureSurface();
-                    lastDisplaySyncMs = now;
                 }
 
-                DaemonSession.MappedFrame mappedFrame = daemon.frameWaitBoundPresent(lastFrameSeq, pollMs);
+                DaemonSession.MappedFrame mappedFrame = daemon.frameWaitBoundPresent(lastFrameSeq, waitTimeoutMs);
                 if (mappedFrame == null || mappedFrame.frameSeq == lastFrameSeq) {
                     if (mappedFrame != null) {
                         mappedFrame.closeQuietly();
@@ -469,7 +458,8 @@ final class RgbaFramePresenter {
         try {
             dm = resolveDisplayManager();
             if (dm == null) {
-                log("presenter_warn=display_listener_no_display_manager fallback=poll");
+                displayListenerEnabled = false;
+                log("presenter_warn=display_listener_no_display_manager mode=frame_driven_sync");
                 return;
             }
 
@@ -500,8 +490,10 @@ final class RgbaFramePresenter {
             displayManager = dm;
             displayListener = listener;
             displayListenerThread = ht;
+            displayListenerEnabled = true;
             log("presenter_status=display_listener_enabled backend=" + dm.getClass().getName());
         } catch (Throwable t) {
+            displayListenerEnabled = false;
             if (registered && dm != null && listener != null) {
                 try {
                     ReflectBridge.invoke(dm, "unregisterDisplayListener", listener);
@@ -518,30 +510,10 @@ final class RgbaFramePresenter {
                     }
                 }
             }
-            log("presenter_warn=display_listener_init_failed err=" + t.getClass().getSimpleName() + " fallback=poll");
+            log("presenter_warn=display_listener_init_failed err="
+                    + t.getClass().getSimpleName()
+                    + " mode=frame_driven_sync");
         }
-    }
-
-    private static int resolveDisplaySyncFallbackIntervalMs() {
-        int value = DEFAULT_DISPLAY_SYNC_FALLBACK_INTERVAL_MS;
-        try {
-            String raw = System.getProperty(DISPLAY_SYNC_FALLBACK_PROPERTY);
-            if (raw == null || raw.trim().isEmpty()) {
-                raw = System.getenv("DSAPI_DISPLAY_SYNC_FALLBACK_MS");
-            }
-            if (raw != null) {
-                value = Integer.parseInt(raw.trim());
-            }
-        } catch (Throwable ignored) {
-            value = DEFAULT_DISPLAY_SYNC_FALLBACK_INTERVAL_MS;
-        }
-        if (value < 50) {
-            return 50;
-        }
-        if (value > 5000) {
-            return 5000;
-        }
-        return value;
     }
 
     private static FrameRatePolicy parseFrameRatePolicy(String specRaw) {

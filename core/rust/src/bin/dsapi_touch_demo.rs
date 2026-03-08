@@ -8,7 +8,10 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use directscreen_core::api::Status;
+use directscreen_core::api::{
+    Status, KEYBOARD_EVENT_KIND_BACKSPACE, KEYBOARD_EVENT_KIND_CHAR, KEYBOARD_EVENT_KIND_DONE,
+    KEYBOARD_EVENT_KIND_FOCUS_OFF, KEYBOARD_EVENT_KIND_FOCUS_ON,
+};
 use directscreen_core::client::{
     spawn_touch_router, TouchMessage, TouchPhase, TouchRouterConfig, TouchRouterHandle,
 };
@@ -30,6 +33,14 @@ const BASE_CLOSE_W_DP: f32 = 40.0;
 const BASE_CLOSE_H_DP: f32 = 32.0;
 const BASE_CLOSE_MARGIN_DP: f32 = 8.0;
 const BASE_CLOSE_TOP_DP: f32 = 6.0;
+const BASE_ACTION_BUTTON_W_DP: f32 = 96.0;
+const BASE_ACTION_BUTTON_H_DP: f32 = 34.0;
+const BASE_INPUT_H_DP: f32 = 36.0;
+const BASE_CONTENT_PADDING_DP: f32 = 12.0;
+const BASE_IME_KEY_GAP_DP: f32 = 4.0;
+const CURSOR_BLINK_MS: u64 = 420;
+const WATCH_EVENT_TIMEOUT_MS: u32 = 120;
+const CLOSE_CLEAR_SETTLE_MS: u64 = 12;
 
 #[derive(Debug, Clone, Copy)]
 struct DisplayInfo {
@@ -38,6 +49,13 @@ struct DisplayInfo {
     refresh_hz: f32,
     density_dpi: u32,
     rotation: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoreKeyboardEvent {
+    seq: u64,
+    kind: u32,
+    codepoint: u32,
 }
 
 #[derive(Debug)]
@@ -111,6 +129,30 @@ impl BinaryControlClient {
                 rotation: resp.values[5] as u32,
             },
         )))
+    }
+
+    fn keyboard_inject(&mut self, kind: u32, codepoint: u32) -> io::Result<(u64, u32, u32)> {
+        let resp = self.request(&ctl_wire::BinaryCtlCommand::KeyboardInject { kind, codepoint })?;
+        Ok((resp.values[0], resp.values[1] as u32, resp.values[2] as u32))
+    }
+
+    fn keyboard_wait_after(
+        &mut self,
+        last_seq: u64,
+        timeout_ms: u32,
+    ) -> io::Result<Option<CoreKeyboardEvent>> {
+        let resp = self.request(&ctl_wire::BinaryCtlCommand::KeyboardWait {
+            last_seq,
+            timeout_ms,
+        })?;
+        if resp.values[3] == 0 {
+            return Ok(None);
+        }
+        Ok(Some(CoreKeyboardEvent {
+            seq: resp.values[0],
+            kind: resp.values[1] as u32,
+            codepoint: resp.values[2] as u32,
+        }))
     }
 }
 
@@ -432,6 +474,11 @@ struct UiMetrics {
     close_h: f32,
     close_margin: f32,
     close_top: f32,
+    action_button_w: f32,
+    action_button_h: f32,
+    input_h: f32,
+    content_padding: f32,
+    ime_key_gap: f32,
     title_text_scale: i32,
     body_text_scale: i32,
     body_line_step: i32,
@@ -459,9 +506,71 @@ fn ui_metrics(display: DisplayInfo) -> UiMetrics {
         close_h: BASE_CLOSE_H_DP * control_scale,
         close_margin: BASE_CLOSE_MARGIN_DP * control_scale,
         close_top: BASE_CLOSE_TOP_DP * control_scale,
+        action_button_w: BASE_ACTION_BUTTON_W_DP * control_scale,
+        action_button_h: BASE_ACTION_BUTTON_H_DP * control_scale,
+        input_h: BASE_INPUT_H_DP * control_scale,
+        content_padding: BASE_CONTENT_PADDING_DP * control_scale,
+        ime_key_gap: BASE_IME_KEY_GAP_DP * control_scale,
         title_text_scale,
         body_text_scale,
         body_line_step,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RectF {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl RectF {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UiLayout {
+    close_button: RectF,
+    submit_button: RectF,
+    input_box: RectF,
+}
+
+fn compute_ui_layout(window: WindowState, metrics: UiMetrics) -> UiLayout {
+    let button_gap = metrics.ime_key_gap.max(2.0);
+    let button_w = metrics.action_button_w.max(metrics.close_w).max(60.0);
+    let button_h = metrics.action_button_h.max(metrics.close_h).max(24.0);
+
+    let close_button = RectF {
+        x: window.x + window.w - metrics.close_margin - button_w,
+        y: window.y + metrics.close_top,
+        w: button_w,
+        h: button_h,
+    };
+    let submit_button = RectF {
+        x: close_button.x - button_gap - button_w,
+        y: close_button.y,
+        w: button_w,
+        h: button_h,
+    };
+
+    let content_left = window.x + metrics.content_padding;
+    let content_right = window.x + window.w - metrics.content_padding;
+    let content_w = (content_right - content_left).max(40.0);
+    let input_top = window.y + metrics.title_height + metrics.content_padding;
+    let input_box = RectF {
+        x: content_left,
+        y: input_top,
+        w: content_w,
+        h: metrics.input_h.max(22.0),
+    };
+
+    UiLayout {
+        close_button,
+        submit_button,
+        input_box,
     }
 }
 
@@ -493,8 +602,8 @@ fn usage() {
     eprintln!("  --run-seconds <n>         auto stop after n seconds");
     eprintln!("  --window-x <n>            initial window x");
     eprintln!("  --window-y <n>            initial window y");
-    eprintln!("  --window-w <n>            initial window width (default: 520)");
-    eprintln!("  --window-h <n>            initial window height (default: 360)");
+    eprintln!("  --window-w <n>            initial window width (default: 620)");
+    eprintln!("  --window-h <n>            initial window height (default: 440)");
     eprintln!("  --no-touch-router         render only, do not capture touch");
     eprintln!("  --quiet                   suppress runtime logs");
     eprintln!("  -h, --help                show this help");
@@ -529,8 +638,8 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut quiet = false;
     let mut window_x: Option<f32> = None;
     let mut window_y: Option<f32> = None;
-    let mut window_w = 520.0f32;
-    let mut window_h = 360.0f32;
+    let mut window_w = 620.0f32;
+    let mut window_h = 440.0f32;
 
     let mut i = 1usize;
     while i < args.len() {
@@ -693,15 +802,6 @@ impl WindowState {
             && x >= self.x + self.w - metrics.resize_hit
             && y >= self.y + self.h - metrics.resize_hit
     }
-
-    fn close_hit(&self, x: f32, y: f32, metrics: UiMetrics) -> bool {
-        if !self.visible {
-            return false;
-        }
-        let left = self.x + self.w - metrics.close_w - metrics.close_margin;
-        let top = self.y + metrics.close_top;
-        x >= left && x <= left + metrics.close_w && y >= top && y <= top + metrics.close_h
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -709,11 +809,17 @@ struct RouteSnapshot {
     window: WindowState,
     scale_x: f32,
     scale_y: f32,
+    exclusive_input: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Interaction {
     Idle,
+    Press {
+        pointer_id: i32,
+        target: PressTarget,
+        active: bool,
+    },
     Drag {
         pointer_id: i32,
         start_x: f32,
@@ -734,8 +840,30 @@ impl Interaction {
     fn label(&self) -> &'static str {
         match self {
             Self::Idle => "idle",
+            Self::Press { .. } => "press",
             Self::Drag { .. } => "drag",
             Self::Resize { .. } => "resize",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PressTarget {
+    CloseButton,
+    SubmitButton,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ButtonAction {
+    Close,
+    Submit,
+}
+
+impl ButtonAction {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Close => "close",
+            Self::Submit => "submit",
         }
     }
 }
@@ -747,6 +875,18 @@ struct DemoState {
     running: bool,
     ui_event_count: u64,
     last_latency_ms: f32,
+    input_text: String,
+    input_focused: bool,
+    ime_visible: bool,
+    cursor_visible: bool,
+    cursor_last_toggle: Instant,
+    submit_count: u64,
+    button_callback_count: u64,
+    last_submit_text: String,
+    last_button_action: Option<ButtonAction>,
+    close_flash_until: Option<Instant>,
+    submit_flash_until: Option<Instant>,
+    pending_focus_signal: Option<u32>,
 }
 
 impl DemoState {
@@ -757,20 +897,160 @@ impl DemoState {
             running: true,
             ui_event_count: 0,
             last_latency_ms: 0.0,
+            input_text: String::new(),
+            input_focused: false,
+            ime_visible: false,
+            cursor_visible: false,
+            cursor_last_toggle: Instant::now(),
+            submit_count: 0,
+            button_callback_count: 0,
+            last_submit_text: String::new(),
+            last_button_action: None,
+            close_flash_until: None,
+            submit_flash_until: None,
+            pending_focus_signal: None,
+        }
+    }
+
+    fn tick(&mut self, now: Instant) {
+        if self.input_focused {
+            if now.duration_since(self.cursor_last_toggle).as_millis() as u64 >= CURSOR_BLINK_MS {
+                self.cursor_last_toggle = now;
+                self.cursor_visible = !self.cursor_visible;
+            }
+        } else {
+            self.cursor_visible = false;
+            self.cursor_last_toggle = now;
+        }
+    }
+
+    fn input_exclusive(&self) -> bool {
+        self.input_focused
+    }
+
+    fn flash_active(flash_until: Option<Instant>, now: Instant) -> bool {
+        flash_until.map(|deadline| now < deadline).unwrap_or(false)
+    }
+
+    fn press_active(&self, target: PressTarget) -> bool {
+        matches!(
+            self.interaction,
+            Interaction::Press {
+                target: current,
+                active: true,
+                ..
+            } if current == target
+        )
+    }
+
+    fn hit_press_target(&self, x: f32, y: f32, layout: &UiLayout) -> Option<PressTarget> {
+        if layout.close_button.contains(x, y) {
+            return Some(PressTarget::CloseButton);
+        }
+        if layout.submit_button.contains(x, y) {
+            return Some(PressTarget::SubmitButton);
+        }
+        None
+    }
+
+    fn set_focus(&mut self, focused: bool, now: Instant, emit_signal: bool) {
+        let changed = self.input_focused != focused;
+        self.input_focused = focused;
+        self.ime_visible = focused;
+        self.cursor_visible = focused;
+        self.cursor_last_toggle = now;
+        if emit_signal && changed {
+            self.pending_focus_signal = Some(if focused {
+                KEYBOARD_EVENT_KIND_FOCUS_ON
+            } else {
+                KEYBOARD_EVENT_KIND_FOCUS_OFF
+            });
+        }
+    }
+
+    fn take_pending_focus_signal(&mut self) -> Option<u32> {
+        self.pending_focus_signal.take()
+    }
+
+    fn apply_core_keyboard_event(&mut self, event: CoreKeyboardEvent, now: Instant) {
+        match event.kind {
+            KEYBOARD_EVENT_KIND_CHAR => {
+                if self.input_focused {
+                    if let Some(ch) = char::from_u32(event.codepoint) {
+                        if self.input_text.chars().count() < 64 {
+                            self.input_text.push(ch);
+                        }
+                    }
+                }
+            }
+            KEYBOARD_EVENT_KIND_BACKSPACE => {
+                if self.input_focused {
+                    self.input_text.pop();
+                }
+            }
+            KEYBOARD_EVENT_KIND_DONE => {
+                self.set_focus(false, now, false);
+            }
+            KEYBOARD_EVENT_KIND_FOCUS_ON => {
+                self.set_focus(true, now, false);
+            }
+            KEYBOARD_EVENT_KIND_FOCUS_OFF => {
+                self.set_focus(false, now, false);
+            }
+            _ => {}
+        }
+    }
+
+    fn invoke_button_action(&mut self, action: ButtonAction, now: Instant) {
+        self.button_callback_count = self.button_callback_count.saturating_add(1);
+        self.last_button_action = Some(action);
+        match action {
+            ButtonAction::Close => {
+                self.close_flash_until = Some(now + Duration::from_millis(140));
+                self.running = false;
+            }
+            ButtonAction::Submit => {
+                self.submit_flash_until = Some(now + Duration::from_millis(140));
+                self.submit_count = self.submit_count.saturating_add(1);
+                self.last_submit_text = self.input_text.clone();
+            }
         }
     }
 
     fn apply_touch(&mut self, msg: TouchMessage, display: DisplayInfo) {
         let metrics = ui_metrics(display);
+        let now = Instant::now();
         self.last_latency_ms = msg.latency_ms;
+        let layout = compute_ui_layout(self.window, metrics);
         match msg.phase {
             TouchPhase::Clear => {
                 self.interaction = Interaction::Idle;
             }
             TouchPhase::Down => {
                 self.ui_event_count = self.ui_event_count.saturating_add(1);
-                if self.window.close_hit(msg.x, msg.y, metrics) {
-                    self.running = false;
+                if let Some(target) = self.hit_press_target(msg.x, msg.y, &layout) {
+                    // Close should respond immediately to avoid missed Up events on some devices.
+                    if target == PressTarget::CloseButton {
+                        self.interaction = Interaction::Idle;
+                        self.invoke_button_action(ButtonAction::Close, now);
+                        return;
+                    }
+                    self.interaction = Interaction::Press {
+                        pointer_id: msg.pointer_id,
+                        target,
+                        active: true,
+                    };
+                    return;
+                }
+
+                if layout.input_box.contains(msg.x, msg.y) {
+                    self.set_focus(true, now, true);
+                    self.interaction = Interaction::Idle;
+                    return;
+                }
+
+                if self.input_exclusive() && !self.window.contains(msg.x, msg.y) {
+                    self.interaction = Interaction::Idle;
                     return;
                 }
 
@@ -798,6 +1078,18 @@ impl DemoState {
             TouchPhase::Move => {
                 self.ui_event_count = self.ui_event_count.saturating_add(1);
                 match self.interaction {
+                    Interaction::Press {
+                        pointer_id,
+                        target,
+                        mut active,
+                    } if pointer_id == msg.pointer_id => {
+                        active = self.hit_press_target(msg.x, msg.y, &layout) == Some(target);
+                        self.interaction = Interaction::Press {
+                            pointer_id,
+                            target,
+                            active,
+                        };
+                    }
                     Interaction::Drag {
                         pointer_id,
                         start_x,
@@ -826,6 +1118,25 @@ impl DemoState {
             TouchPhase::Up => {
                 self.ui_event_count = self.ui_event_count.saturating_add(1);
                 match self.interaction {
+                    Interaction::Press {
+                        pointer_id,
+                        target,
+                        active,
+                    } if pointer_id == msg.pointer_id => {
+                        let released_on_target =
+                            active && self.hit_press_target(msg.x, msg.y, &layout) == Some(target);
+                        self.interaction = Interaction::Idle;
+                        if released_on_target {
+                            match target {
+                                PressTarget::CloseButton => {
+                                    self.invoke_button_action(ButtonAction::Close, now);
+                                }
+                                PressTarget::SubmitButton => {
+                                    self.invoke_button_action(ButtonAction::Submit, now);
+                                }
+                            }
+                        }
+                    }
                     Interaction::Drag { pointer_id, .. }
                     | Interaction::Resize { pointer_id, .. }
                         if pointer_id == msg.pointer_id =>
@@ -989,10 +1300,32 @@ fn rescale_window_for_render_change(
     }
     let sx = new_render.width as f32 / old_render.width as f32;
     let sy = new_render.height as f32 / old_render.height as f32;
-    window.x *= sx;
-    window.y *= sy;
-    window.w *= sx;
-    window.h *= sy;
+    if !sx.is_finite() || !sy.is_finite() || sx <= 0.0 || sy <= 0.0 {
+        return;
+    }
+
+    // 尺寸使用统一缩放，避免旋转后按 x/y 不同比例拉伸窗口。
+    let uniform_scale = (sx * sy).sqrt();
+    let old_cx = window.x + window.w * 0.5;
+    let old_cy = window.y + window.h * 0.5;
+    let new_cx = old_cx * sx;
+    let new_cy = old_cy * sy;
+    let new_w = window.w * uniform_scale;
+    let new_h = window.h * uniform_scale;
+
+    window.w = new_w;
+    window.h = new_h;
+    window.x = new_cx - new_w * 0.5;
+    window.y = new_cy - new_h * 0.5;
+}
+
+fn submit_clear_frame(submitter: &mut ShmSubmitClient) -> io::Result<()> {
+    let width = 1u32;
+    let height = 1u32;
+    let frame_len = frame_byte_len(width, height)?;
+    let frame_buf = submitter.frame_buffer_mut(width, height)?;
+    frame_buf.fill(0);
+    submitter.submit_rendered_frame(width, height, frame_len, 0, 0)
 }
 
 fn map_touch_to_render(
@@ -1034,7 +1367,7 @@ fn spawn_display_watch(
 
         let mut last_seq = 0u64;
         while running.load(Ordering::SeqCst) {
-            match client.display_wait_after(last_seq, 800) {
+            match client.display_wait_after(last_seq, WATCH_EVENT_TIMEOUT_MS) {
                 Ok(Some((next_seq, info))) => {
                     last_seq = next_seq.max(last_seq);
                     if tx.send(info).is_err() {
@@ -1051,6 +1384,100 @@ fn spawn_display_watch(
             }
         }
     })
+}
+
+fn spawn_keyboard_watch(
+    control_socket: String,
+    quiet: bool,
+    tx: mpsc::Sender<CoreKeyboardEvent>,
+    running: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut client = match BinaryControlClient::connect(&control_socket) {
+            Ok(v) => v,
+            Err(e) => {
+                if !quiet {
+                    eprintln!(
+                        "touch_demo_warn=keyboard_wait_connect_failed socket={} err={}",
+                        control_socket, e
+                    );
+                }
+                return;
+            }
+        };
+
+        let mut last_seq = 0u64;
+        while running.load(Ordering::SeqCst) {
+            match client.keyboard_wait_after(last_seq, WATCH_EVENT_TIMEOUT_MS) {
+                Ok(Some(evt)) => {
+                    last_seq = evt.seq.max(last_seq);
+                    if tx.send(evt).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    if !quiet {
+                        eprintln!("touch_demo_warn=keyboard_wait_failed err={}", e);
+                    }
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn read_pid_file(path: &str) -> Option<i32> {
+    let raw = fs::read_to_string(path).ok()?;
+    raw.trim().parse::<i32>().ok()
+}
+
+fn cmdline_contains_any(pid: i32, tokens: &[&str]) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    let path = format!("/proc/{}/cmdline", pid);
+    let data = match fs::read(path) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if data.is_empty() {
+        return false;
+    }
+    let mut merged = String::with_capacity(data.len());
+    for b in data {
+        if b == 0 {
+            merged.push(' ');
+        } else {
+            merged.push(b as char);
+        }
+    }
+    tokens.iter().any(|token| merged.contains(token))
+}
+
+fn stop_pid_quiet(pid: i32) {
+    if pid <= 1 {
+        return;
+    }
+    let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+    thread::sleep(Duration::from_millis(20));
+    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+}
+
+fn cleanup_touch_demo_module_state() {
+    let Some(state_dir) = env_non_empty("DSAPI_MODULE_STATE_DIR") else {
+        return;
+    };
+    let demo_pid_file = format!("{}/touch_demo.pid", state_dir);
+    let presenter_pid_file = format!("{}/presenter.pid", state_dir);
+    let presenter_pid = read_pid_file(&presenter_pid_file);
+    let _ = fs::remove_file(&demo_pid_file);
+    if let Some(pid) = presenter_pid {
+        if cmdline_contains_any(pid, &["DSAPIPresenterDemo", "present-loop"]) {
+            stop_pid_quiet(pid);
+        }
+    }
+    let _ = fs::remove_file(&presenter_pid_file);
 }
 
 fn main() {
@@ -1127,17 +1554,26 @@ fn main() {
         window: state.window,
         scale_x: route_scale_x,
         scale_y: route_scale_y,
+        exclusive_input: state.input_exclusive(),
     }));
     let route_blocked_down = Arc::new(AtomicU64::new(0));
     let route_passed_down = Arc::new(AtomicU64::new(0));
     let (touch_tx, touch_rx) = mpsc::channel::<TouchMessage>();
     let (display_tx, display_rx) = mpsc::channel::<DisplayInfo>();
+    let (keyboard_tx, keyboard_rx) = mpsc::channel::<CoreKeyboardEvent>();
     let display_watch_running = Arc::new(AtomicBool::new(true));
     let display_watch_handle = spawn_display_watch(
         cfg.control_socket.clone(),
         cfg.quiet,
         display_tx,
         Arc::clone(&display_watch_running),
+    );
+    let keyboard_watch_running = Arc::new(AtomicBool::new(true));
+    let keyboard_watch_handle = spawn_keyboard_watch(
+        cfg.control_socket.clone(),
+        cfg.quiet,
+        keyboard_tx,
+        Arc::clone(&keyboard_watch_running),
     );
 
     let mut touch_handle: Option<TouchRouterHandle> = None;
@@ -1180,6 +1616,8 @@ fn main() {
             move |snapshot: RouteSnapshot, x: f32, y: f32| {
                 let mapped_x = x * snapshot.scale_x;
                 let mapped_y = y * snapshot.scale_y;
+                // Keep system interaction available outside the demo window.
+                // Input focus is handled by UI state, not by globally swallowing touches.
                 let blocked = snapshot.window.contains(mapped_x, mapped_y);
                 if blocked {
                     route_blocked_ref.fetch_add(1, Ordering::Relaxed);
@@ -1238,7 +1676,13 @@ fn main() {
             display.rotation,
             target_fps
         );
-        eprintln!("touch_demo_hint=drag_title resize_bottom_right tap_close_button");
+        if cfg.no_touch_router {
+            eprintln!(
+                "touch_demo_hint=touch_router_disabled_window_not_interactive use_ctrl_c_or_--run-seconds"
+            );
+        } else {
+            eprintln!("touch_demo_hint=drag_title resize_bottom_right tap_close_or_send tap_input_for_system_ime");
+        }
     }
 
     let mut fps_counter = FpsCounter::new();
@@ -1257,6 +1701,9 @@ fn main() {
         while let Ok(msg) = touch_rx.try_recv() {
             let mapped = map_touch_to_render(msg, display, render_display);
             state.apply_touch(mapped, render_display);
+        }
+        while let Ok(evt) = keyboard_rx.try_recv() {
+            state.apply_core_keyboard_event(evt, Instant::now());
         }
         while let Ok(next) = display_rx.try_recv() {
             if next.width == 0 || next.height == 0 {
@@ -1304,12 +1751,28 @@ fn main() {
             }
         }
 
+        if !state.running {
+            break;
+        }
+
         if let Ok(mut route) = route_state.lock() {
             route.window = state.window;
             route.scale_x = route_scale_x;
             route.scale_y = route_scale_y;
+            route.exclusive_input = state.input_exclusive();
+        }
+        if let Some(kind) = state.take_pending_focus_signal() {
+            if let Err(e) = control.keyboard_inject(kind, 0) {
+                if !cfg.quiet {
+                    eprintln!(
+                        "touch_demo_warn=keyboard_signal_failed kind={} err={}",
+                        kind, e
+                    );
+                }
+            }
         }
 
+        state.tick(Instant::now());
         let fps = fps_counter.on_frame();
         let blocked = route_blocked_down.load(Ordering::Relaxed);
         let passed = route_passed_down.load(Ordering::Relaxed);
@@ -1378,12 +1841,24 @@ fn main() {
         }
     }
 
-    display_watch_running.store(false, Ordering::SeqCst);
-    let _ = display_watch_handle.join();
+    if let Err(e) = submit_clear_frame(&mut submitter) {
+        if !cfg.quiet {
+            eprintln!("touch_demo_warn=submit_clear_frame_failed err={}", e);
+        }
+    } else {
+        // 给 presenter 最小处理窗口，确保 clear frame 先落地。
+        thread::sleep(Duration::from_millis(CLOSE_CLEAR_SETTLE_MS));
+    }
+    cleanup_touch_demo_module_state();
 
     if let Some(mut handle) = touch_handle {
         handle.shutdown_and_join();
     }
+
+    display_watch_running.store(false, Ordering::SeqCst);
+    let _ = display_watch_handle.join();
+    keyboard_watch_running.store(false, Ordering::SeqCst);
+    let _ = keyboard_watch_handle.join();
 
     if !cfg.quiet {
         eprintln!("touch_demo_status=stopped");
@@ -1436,6 +1911,7 @@ fn render_scene(
 ) {
     frame.fill(0);
     let metrics = ui_metrics(display);
+    let now = Instant::now();
 
     // 窗口内容帧采用局部坐标系：提交 origin 后由 presenter 负责层位置。
     let wx = 0i32;
@@ -1443,10 +1919,14 @@ fn render_scene(
     let ww = display.width.max(1) as i32;
     let wh = display.height.max(1) as i32;
     let title_h = metrics.title_height.round().max(1.0) as i32;
-    let close_w = metrics.close_w.round().max(16.0) as i32;
-    let close_h = metrics.close_h.round().max(14.0) as i32;
-    let close_margin = metrics.close_margin.round().max(2.0) as i32;
-    let close_top = metrics.close_top.round().max(2.0) as i32;
+    let local_window = WindowState {
+        x: wx as f32,
+        y: wy as f32,
+        w: ww as f32,
+        h: wh as f32,
+        visible: true,
+    };
+    let layout = compute_ui_layout(local_window, metrics);
 
     fill_rect(
         frame,
@@ -1480,40 +1960,109 @@ fn render_scene(
         [130, 175, 240, 250],
     );
 
-    let close_x = wx + ww - close_w - close_margin;
-    let close_y = wy + close_top;
+    draw_button(
+        frame,
+        display.width,
+        display.height,
+        layout.close_button,
+        "CLOSE",
+        metrics.body_text_scale.max(1),
+        [198, 76, 74, 244],
+        [255, 220, 220, 255],
+        [255, 248, 248, 255],
+        state.press_active(PressTarget::CloseButton),
+        DemoState::flash_active(state.close_flash_until, now),
+    );
+
+    draw_button(
+        frame,
+        display.width,
+        display.height,
+        layout.submit_button,
+        "SEND",
+        metrics.body_text_scale.max(1),
+        [63, 128, 220, 244],
+        [205, 234, 255, 255],
+        [243, 251, 255, 255],
+        state.press_active(PressTarget::SubmitButton),
+        DemoState::flash_active(state.submit_flash_until, now),
+    );
+
+    let input_x = layout.input_box.x.round() as i32;
+    let input_y = layout.input_box.y.round() as i32;
+    let input_w = layout.input_box.w.round().max(20.0) as i32;
+    let input_h = layout.input_box.h.round().max(16.0) as i32;
+    let input_fill = if state.input_focused {
+        [30, 48, 72, 234]
+    } else {
+        [24, 38, 57, 224]
+    };
+    let input_border = if state.input_focused {
+        [163, 210, 255, 255]
+    } else {
+        [108, 152, 200, 255]
+    };
     fill_rect(
         frame,
         display.width,
         display.height,
-        close_x,
-        close_y,
-        close_w,
-        close_h,
-        [205, 64, 64, 246],
+        input_x,
+        input_y,
+        input_w,
+        input_h,
+        input_fill,
     );
-    let cross_pad_x = ((close_w as f32) * 0.25).round().max(4.0) as i32;
-    let cross_pad_y = ((close_h as f32) * 0.25).round().max(4.0) as i32;
-    draw_line(
+    draw_rect_border(
         frame,
         display.width,
         display.height,
-        close_x + cross_pad_x,
-        close_y + cross_pad_y,
-        close_x + close_w - cross_pad_x - 1,
-        close_y + close_h - cross_pad_y - 1,
-        [255, 255, 255, 255],
+        input_x,
+        input_y,
+        input_w,
+        input_h,
+        input_border,
     );
-    draw_line(
+
+    let input_scale = metrics.body_text_scale.max(1);
+    let char_step = 8 * input_scale + input_scale;
+    let text_left = input_x + 6;
+    let text_baseline = input_y + ((input_h - 8 * input_scale) / 2).max(2);
+    let max_chars = ((input_w - 12).max(8) / char_step.max(1)) as usize;
+    let input_text = tail_chars(&state.input_text, max_chars.max(1));
+    let input_color = if state.input_focused {
+        [239, 248, 255, 255]
+    } else {
+        [203, 219, 236, 255]
+    };
+    draw_text(
         frame,
         display.width,
         display.height,
-        close_x + close_w - cross_pad_x - 1,
-        close_y + cross_pad_y,
-        close_x + cross_pad_x,
-        close_y + close_h - cross_pad_y - 1,
-        [255, 255, 255, 255],
+        text_left,
+        text_baseline,
+        if input_text.is_empty() && !state.input_focused {
+            "tap to type"
+        } else {
+            input_text.as_str()
+        },
+        input_color,
+        input_scale,
     );
+    if state.input_focused && state.cursor_visible {
+        let caret_x = text_left + text_pixel_width(input_text.as_str(), input_scale) + input_scale;
+        let caret_y0 = input_y + 5;
+        let caret_y1 = input_y + input_h - 6;
+        draw_line(
+            frame,
+            display.width,
+            display.height,
+            caret_x,
+            caret_y0,
+            caret_x,
+            caret_y1,
+            [239, 248, 255, 255],
+        );
+    }
 
     let resize_size = metrics.resize_hit.round().max(16.0) as i32;
     let rx = wx + ww - resize_size;
@@ -1549,9 +2098,25 @@ fn render_scene(
         metrics.title_text_scale,
     );
 
+    let ime_state = if state.ime_visible { "shown" } else { "hidden" };
+    let focus_state = if state.input_focused {
+        "focused"
+    } else {
+        "unfocused"
+    };
+    let last_action = state
+        .last_button_action
+        .map(|v| v.as_str())
+        .unwrap_or("none");
     let lines = [
         format!("FPS: {:>5.1}", fps),
         format!("Mode: {}", mode),
+        format!(
+            "Input: {} chars={} ime={}",
+            focus_state,
+            state.input_text.chars().count(),
+            ime_state
+        ),
         format!(
             "Window: x={:.0} y={:.0} w={:.0} h={:.0}",
             state.window.x, state.window.y, state.window.w, state.window.h
@@ -1560,17 +2125,26 @@ fn render_scene(
             "Frame: {}x{} dpi={}",
             display.width, display.height, display.density_dpi
         ),
+        format!(
+            "Buttons: callbacks={} submit_count={} last_action={}",
+            state.button_callback_count, state.submit_count, last_action
+        ),
         format!("Touch block downs: {}", blocked_down),
         format!("Touch passthrough downs: {}", passed_down),
         format!(
             "UI events: {} latency_ms={:.2}",
             state.ui_event_count, state.last_latency_ms
         ),
-        "Drag title, resize corner, tap red button to close.".to_string(),
+        format!("Last submit: {}", state.last_submit_text),
+        "Drag title, resize corner, tap CLOSE/SEND, tap input for system IME.".to_string(),
     ];
 
-    let mut text_y = wy + title_h + 10;
+    let mut text_y = input_y + input_h + 10;
+    let text_limit = wy + wh - 14;
     for line in lines.iter() {
+        if text_y + metrics.body_line_step > text_limit {
+            break;
+        }
         draw_text(
             frame,
             display.width,
@@ -1582,6 +2156,78 @@ fn render_scene(
             metrics.body_text_scale,
         );
         text_y += metrics.body_line_step;
+    }
+
+}
+
+fn tail_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    text.chars().skip(total - max_chars).collect()
+}
+
+fn text_pixel_width(text: &str, scale: i32) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let step = 8 * scale + scale;
+    step * i32::try_from(text.chars().count()).unwrap_or(i32::MAX) - scale
+}
+
+fn adjust_color(color: [u8; 4], mul: f32, add: i16) -> [u8; 4] {
+    let mut out = color;
+    for item in out.iter_mut().take(3) {
+        let base = ((*item as f32) * mul).round() as i16 + add;
+        *item = base.clamp(0, 255) as u8;
+    }
+    out
+}
+
+fn draw_button(
+    frame: &mut [u8],
+    fb_width: u32,
+    fb_height: u32,
+    rect: RectF,
+    label: &str,
+    text_scale: i32,
+    base_color: [u8; 4],
+    border_color: [u8; 4],
+    text_color: [u8; 4],
+    pressed: bool,
+    flash: bool,
+) {
+    let x = rect.x.round() as i32;
+    let y = rect.y.round() as i32;
+    let w = rect.w.round().max(16.0) as i32;
+    let h = rect.h.round().max(12.0) as i32;
+    let mut fill = base_color;
+    if pressed {
+        fill = adjust_color(fill, 0.72, -12);
+    } else if flash {
+        fill = adjust_color(fill, 1.0, 24);
+    }
+    fill_rect(frame, fb_width, fb_height, x, y, w, h, fill);
+    draw_rect_border(frame, fb_width, fb_height, x, y, w, h, border_color);
+    if !label.is_empty() {
+        let text_w = text_pixel_width(label, text_scale.max(1));
+        let text_h = 8 * text_scale.max(1);
+        let text_x = x + ((w - text_w) / 2).max(2);
+        let text_y = y + ((h - text_h) / 2).max(1);
+        draw_text(
+            frame,
+            fb_width,
+            fb_height,
+            text_x,
+            text_y,
+            label,
+            text_color,
+            text_scale.max(1),
+        );
     }
 }
 
@@ -1946,5 +2592,42 @@ fn draw_char(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rescale_window_for_render_change_preserves_aspect_ratio_on_rotation() {
+        let old_display = DisplayInfo {
+            width: 1440,
+            height: 3168,
+            refresh_hz: 120.0,
+            density_dpi: 640,
+            rotation: 0,
+        };
+        let new_display = DisplayInfo {
+            width: 3168,
+            height: 1440,
+            refresh_hz: 120.0,
+            density_dpi: 640,
+            rotation: 1,
+        };
+        let mut window = WindowState {
+            x: 200.0,
+            y: 300.0,
+            w: 520.0,
+            h: 360.0,
+            visible: true,
+        };
+        let old_ratio = window.w / window.h;
+        rescale_window_for_render_change(&mut window, old_display, new_display);
+        let new_ratio = window.w / window.h;
+
+        assert!((old_ratio - new_ratio).abs() < 0.0001);
+        assert!(window.w.is_finite() && window.h.is_finite());
+        assert!(window.w > 1.0 && window.h > 1.0);
     }
 }

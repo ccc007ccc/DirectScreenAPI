@@ -1,0 +1,6 @@
+MODULE_ID=system.ime
+MODULE_NAME=DSAPI IME Proxy
+MODULE_KIND=system
+MODULE_VERSION=1.0.0
+MODULE_DESC=基于 Manager 透明输入代理 Activity 的键盘输入模块（仅服务 DSAPI 窗口输入）。
+MAIN_CAP_ID=inject.ime

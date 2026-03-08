@@ -10,11 +10,12 @@ final class ScreenCaptureStreamer {
     private static final int DEFAULT_TARGET_FPS = 60;
     private static final int VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR = 16;
     private static final int MAX_IMAGES = 3;
-    private static final long DATA_SOCKET_IDLE_KEEPALIVE_NS = 2_000_000_000L;
+    private static final String SUBMIT_MODE_ENV = "DSAPI_SCREEN_SUBMIT_MODE";
 
     private final String controlSocketPath;
-    private final String dataSocketPath;
     private final int targetFps;
+    private final String submitMode;
+    private final boolean dmabufSubmitEnabled;
 
     private final Object runLock = new Object();
 
@@ -24,11 +25,6 @@ final class ScreenCaptureStreamer {
     private Object imageListener;
     private Object imageListenerHandlerThread;
     private Object imageListenerHandler;
-    private Thread keepaliveThread;
-
-    private ByteBuffer tightRgba;
-    private int tightWidth;
-    private int tightHeight;
 
     private volatile boolean stopping;
     private long lastSubmitNs;
@@ -36,17 +32,24 @@ final class ScreenCaptureStreamer {
     private long perfFrames;
     private long perfBytes;
     private long lastFrameSeq;
+    private boolean submitPathLogged;
 
-    ScreenCaptureStreamer(String controlSocketPath, String dataSocketPath, int targetFps) {
+    ScreenCaptureStreamer(String controlSocketPath, int targetFps) {
         this.controlSocketPath = controlSocketPath;
-        this.dataSocketPath = dataSocketPath;
         this.targetFps = targetFps > 0 ? targetFps : DEFAULT_TARGET_FPS;
+        String modeRaw = System.getenv(SUBMIT_MODE_ENV);
+        String mode = modeRaw == null ? "dmabuf" : modeRaw.trim().toLowerCase(Locale.US);
+        if (mode.isEmpty()) {
+            mode = "dmabuf";
+        }
+        this.submitMode = mode;
+        this.dmabufSubmitEnabled = !"shm".equals(mode);
     }
 
     void runLoop() throws Exception {
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "dsapi-screen-stream-shutdown"));
         setup();
-        log("screen_stream_status=started target_fps=" + targetFps);
+        log("screen_stream_status=started target_fps=" + targetFps + " submit_mode=" + submitMode);
         synchronized (runLock) {
             while (!stopping) {
                 runLock.wait();
@@ -61,7 +64,7 @@ final class ScreenCaptureStreamer {
             throw new IOException("screen_stream_display_snapshot_invalid");
         }
 
-        session = new DaemonSession(controlSocketPath, dataSocketPath, false);
+        session = new DaemonSession(controlSocketPath, false);
         String displaySet = String.format(
                 Locale.US,
                 "DISPLAY_SET %d %d %.2f %d %d",
@@ -73,6 +76,9 @@ final class ScreenCaptureStreamer {
         );
         session.command(displaySet);
         session.ensureFrameShmBound();
+        if (dmabufSubmitEnabled && !HardwareBufferBridge.isAvailable()) {
+            throw new IOException("screen_stream_dmabuf_bridge_unavailable");
+        }
 
         Object context = buildSystemContext();
         startImageListenerThread();
@@ -89,7 +95,6 @@ final class ScreenCaptureStreamer {
             throw new IOException("screen_stream_virtual_display_create_failed");
         }
         lastSubmitNs = System.nanoTime();
-        startKeepaliveThread();
     }
 
     void shutdown() {
@@ -135,14 +140,6 @@ final class ScreenCaptureStreamer {
         imageListenerHandler = null;
         imageListener = null;
 
-        if (keepaliveThread != null) {
-            try {
-                keepaliveThread.interrupt();
-            } catch (Throwable ignored) {
-            }
-            keepaliveThread = null;
-        }
-
         if (session != null) {
             session.closeQuietly();
             session = null;
@@ -166,36 +163,6 @@ final class ScreenCaptureStreamer {
         imageListenerHandler = handlerClass
                 .getDeclaredConstructor(looperClass)
                 .newInstance(looper);
-    }
-
-    private void startKeepaliveThread() {
-        keepaliveThread = new Thread(() -> {
-            while (!stopping) {
-                try {
-                    Thread.sleep(1000);
-                    if (stopping || session == null) {
-                        continue;
-                    }
-                    long nowNs = System.nanoTime();
-                    if (lastSubmitNs > 0L && nowNs - lastSubmitNs < DATA_SOCKET_IDLE_KEEPALIVE_NS) {
-                        continue;
-                    }
-                    DaemonSession.MappedFrame frame = session.frameWaitBoundPresent(lastFrameSeq, 1);
-                    if (frame != null) {
-                        lastFrameSeq = Math.max(lastFrameSeq, frame.frameSeq);
-                    }
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    return;
-                } catch (Throwable t) {
-                    log("screen_stream_error=keepalive_failed err=" + t.getClass().getSimpleName() + ":" + t.getMessage());
-                    shutdown();
-                    return;
-                }
-            }
-        }, "dsapi-screen-keepalive");
-        keepaliveThread.setDaemon(true);
-        keepaliveThread.start();
     }
 
     private static Object buildSystemContext() throws Exception {
@@ -327,91 +294,52 @@ final class ScreenCaptureStreamer {
             return;
         }
 
-        ensureTightRgba(width, height);
-        packPlaneToTightRgba(src, rowStride, pixelStride, width, height, tightRgba);
-        tightRgba.rewind();
-
         long nowNs = System.nanoTime();
         long intervalNs = targetFps > 0 ? (1_000_000_000L / (long) targetFps) : 0L;
         if (intervalNs > 0L && lastSubmitNs > 0L && nowNs - lastSubmitNs < intervalNs) {
             return;
         }
 
-        long frameSeq = session.frameSubmitBoundShm(width, height, tightRgba);
+        long frameSeq;
+        if (dmabufSubmitEnabled) {
+            if (!submitPathLogged) {
+                log("screen_stream_submit_path=dmabuf");
+                submitPathLogged = true;
+            }
+            HardwareBufferBridge.NativeFrame nativeFrame = tryExportHardwareBuffer(image);
+            if (nativeFrame == null || nativeFrame.fd == null) {
+                throw new IOException("screen_stream_dmabuf_export_failed");
+            }
+            try {
+                frameSeq = session.frameSubmitDmabuf(
+                        nativeFrame.width,
+                        nativeFrame.height,
+                        nativeFrame.stride,
+                        nativeFrame.format,
+                        nativeFrame.usage,
+                        nativeFrame.byteLen,
+                        nativeFrame.byteOffset,
+                        0,
+                        0,
+                        nativeFrame.fd
+                );
+            } finally {
+                HardwareBufferBridge.closeQuietly(nativeFrame.fd);
+            }
+        } else if (pixelStride >= 4 && rowStride >= width * 4) {
+            if (!submitPathLogged) {
+                log("screen_stream_submit_path=shm_plane");
+                submitPathLogged = true;
+            }
+            frameSeq = session.frameSubmitBoundPlane(width, height, src, rowStride, pixelStride);
+        } else {
+            throw new IOException("screen_stream_plane_layout_unsupported");
+        }
         lastFrameSeq = frameSeq;
         lastSubmitNs = nowNs;
         perfFrames += 1L;
         perfBytes += (long) width * (long) height * 4L;
         logPerf(nowNs);
-    }
-
-    private void ensureTightRgba(int width, int height) throws IOException {
-        if (width <= 0 || height <= 0) {
-            throw new IOException("screen_stream_frame_size_invalid");
-        }
-        if (tightRgba != null && tightWidth == width && tightHeight == height) {
-            tightRgba.clear();
-            return;
-        }
-        long frameLen = (long) width * (long) height * 4L;
-        if (frameLen <= 0L || frameLen > Integer.MAX_VALUE) {
-            throw new IOException("screen_stream_frame_size_overflow");
-        }
-        tightRgba = ByteBuffer.allocateDirect((int) frameLen);
-        tightWidth = width;
-        tightHeight = height;
-        tightRgba.clear();
-    }
-
-    private static void packPlaneToTightRgba(
-            ByteBuffer srcPlane,
-            int rowStride,
-            int pixelStride,
-            int width,
-            int height,
-            ByteBuffer out
-    ) throws IOException {
-        if (pixelStride < 4) {
-            throw new IOException("screen_stream_pixel_stride_unsupported");
-        }
-        out.clear();
-
-        ByteBuffer src = srcPlane.duplicate();
-        int srcBase = src.position();
-        int rowBytes = width * 4;
-        int cap = src.capacity();
-
-        if (pixelStride == 4) {
-            for (int y = 0; y < height; y++) {
-                int rowStart = srcBase + y * rowStride;
-                int rowEnd = rowStart + rowBytes;
-                if (rowStart < 0 || rowEnd < rowStart || rowEnd > cap) {
-                    throw new IOException("screen_stream_plane_bounds_invalid");
-                }
-                src.limit(cap);
-                src.position(rowStart);
-                src.limit(rowEnd);
-                out.put(src);
-            }
-            out.flip();
-            return;
-        }
-
-        for (int y = 0; y < height; y++) {
-            int rowStart = srcBase + y * rowStride;
-            for (int x = 0; x < width; x++) {
-                int px = rowStart + x * pixelStride;
-                int pxEnd = px + 4;
-                if (px < 0 || pxEnd < px || pxEnd > cap) {
-                    throw new IOException("screen_stream_plane_bounds_invalid");
-                }
-                out.put(src.get(px));
-                out.put(src.get(px + 1));
-                out.put(src.get(px + 2));
-                out.put(src.get(px + 3));
-            }
-        }
-        out.flip();
     }
 
     private void logPerf(long nowNs) {
@@ -442,5 +370,20 @@ final class ScreenCaptureStreamer {
 
     private static void log(String line) {
         System.out.println(line);
+    }
+
+    private HardwareBufferBridge.NativeFrame tryExportHardwareBuffer(Object image) {
+        if (image == null) {
+            return null;
+        }
+        try {
+            Object hardwareBuffer = ReflectBridge.invoke(image, "getHardwareBuffer");
+            if (hardwareBuffer == null) {
+                return null;
+            }
+            return HardwareBufferBridge.exportFrame(hardwareBuffer, lastFrameSeq + 1L);
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 }

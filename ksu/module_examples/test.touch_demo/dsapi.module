@@ -1,0 +1,6 @@
+MODULE_ID=test.touch_demo
+MODULE_NAME=Touch Demo Test
+MODULE_KIND=test
+MODULE_VERSION=1.0.0
+MODULE_DESC=触摸窗口测试模块，支持一键启动/停止与 blur 参数调优。
+MAIN_CAP_ID=test.touch_demo

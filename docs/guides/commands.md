@@ -7,7 +7,7 @@
 ```sh
 ./scripts/dsapi.sh daemon start
 ./scripts/dsapi.sh daemon status
-./scripts/dsapi.sh daemon cmd PING
+./scripts/dsapi.sh daemon cmd READY
 ./scripts/dsapi.sh daemon stop
 ```
 
@@ -17,10 +17,12 @@
 - `presenter start|stop|status|run`
 - `screen start|stop|status|run|bench [samples]`
 - `touch start|stop|status|run`
+- `ksu preflight|pack|ctl <args...>|ui-install|ui-start [refresh_ms]|ui-stop|ui-status|zygote-start [service] [daemon_service]|zygote-stop|zygote-status|zygote-policy-list|zygote-policy-set <package|*> <user|-1> <allow|deny>|zygote-policy-clear [package user]`
 - `android probe [display-kv|display-line]`
 - `android sync-display`
 - `frame pull <out_rgba_path>`
-- `build core|android|c-example|framepull`
+- `build core|android|ksu-module|c-example|framepull`
+- `scripts/fetch_android_jar.sh [api]`
 - `check`
 - `fix`
 
@@ -56,6 +58,7 @@ Screen stream（root，全屏采集 -> daemon 当前帧）：
 ```sh
 ./scripts/dsapi.sh android sync-display
 DSAPI_ANDROID_OUT_DIR=artifacts/android_user DSAPI_SCREEN_RUN_AS_ROOT=1 ./scripts/dsapi.sh screen start
+DSAPI_ANDROID_OUT_DIR=artifacts/android_user DSAPI_SCREEN_RUN_AS_ROOT=1 DSAPI_SCREEN_SUBMIT_MODE=dmabuf ./scripts/dsapi.sh screen start
 ./scripts/dsapi.sh screen status
 ./scripts/dsapi.sh frame pull artifacts/frame/screen_latest.rgba
 ./scripts/dsapi.sh screen bench 10
@@ -68,6 +71,21 @@ Touch bridge：
 ./scripts/dsapi.sh touch start
 ./scripts/dsapi.sh touch status
 ./scripts/dsapi.sh touch stop
+```
+
+KSU capability 控制：
+
+```sh
+./scripts/dsapi.sh ksu ctl status
+./scripts/dsapi.sh ksu ctl capability list
+./scripts/dsapi.sh ksu ui-start 1200
+# 可选：自动补装失败时手动补装
+./scripts/dsapi.sh ksu ui-install
+./scripts/dsapi.sh ksu ui-status
+./scripts/dsapi.sh ksu ui-stop
+./scripts/dsapi.sh ksu zygote-status
+./scripts/dsapi.sh ksu zygote-policy-list
+./scripts/dsapi.sh ksu zygote-policy-set com.example.app 0 allow
 ```
 
 取帧：
@@ -118,3 +136,6 @@ DSAPI_FRAME_PULL_ENGINE=rust ./scripts/dsapi.sh frame pull artifacts/frame/lates
   则优先使用轻量 Rust helper；否则自动回退 Python 实现。
 - `frame pull` 默认带重试（`DSAPI_FRAME_PULL_RETRIES=4`、`DSAPI_FRAME_PULL_RETRY_DELAY_MS=80`），
   可通过 `DSAPI_FRAME_WAIT_TIMEOUT_MS` 调整单次等帧超时。
+- `presenter run/start` 默认事件驱动阻塞拉帧，可通过
+  `DSAPI_PRESENTER_WAIT_TIMEOUT_MS` 配置 `RENDER_FRAME_WAIT_SHM_PRESENT` 的超时，
+  其中 `0` 表示无限阻塞等待新帧（默认值）。

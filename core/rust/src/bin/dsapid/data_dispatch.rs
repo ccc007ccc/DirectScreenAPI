@@ -1,16 +1,17 @@
 use directscreen_core::api::Status;
 use directscreen_core::engine::RuntimeEngine;
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::dsapid_frame_fd::{
-    handle_frame_bind_shm, handle_frame_submit_shm, handle_frame_wait_shm_present, BoundFrameFd,
+    handle_frame_bind_shm, handle_frame_submit_dmabuf, handle_frame_submit_shm,
+    handle_frame_wait_shm_present, BoundFrameFd,
 };
 use super::dsapid_parse::{
-    parse_frame_bind_shm_request, parse_frame_submit_shm_request,
-    parse_frame_wait_shm_present_request,
+    parse_frame_bind_shm_request, parse_frame_submit_dmabuf_request,
+    parse_frame_submit_shm_request, parse_frame_wait_shm_present_request,
 };
 use super::{handle_touch_stream_v1, read_command_line, write_internal_error, write_status_error};
 
@@ -20,7 +21,7 @@ pub(super) fn handle_data_client(
     shutdown: Arc<AtomicBool>,
     command_max_bytes: usize,
 ) {
-    let reader_stream = match stream.try_clone() {
+    let mut reader_stream = match stream.try_clone() {
         Ok(v) => v,
         Err(e) => {
             let _ =
@@ -29,14 +30,13 @@ pub(super) fn handle_data_client(
         }
     };
 
-    let mut reader = BufReader::new(reader_stream);
     let mut bound_frame_fd: Option<BoundFrameFd> = None;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
 
-        match read_command_line(&mut reader, command_max_bytes) {
+        match read_command_line(&mut reader_stream, command_max_bytes) {
             Ok(None) => break,
             Ok(Some(line)) => {
                 let bind_shm = match parse_frame_bind_shm_request(&line) {
@@ -101,9 +101,26 @@ pub(super) fn handle_data_client(
                     continue;
                 }
 
+                let submit_dmabuf = match parse_frame_submit_dmabuf_request(&line) {
+                    Ok(v) => v,
+                    Err(status) => {
+                        write_status_error(&mut stream, status);
+                        continue;
+                    }
+                };
+                if let Some(req) = submit_dmabuf {
+                    if let Err(e) =
+                        handle_frame_submit_dmabuf(&mut stream, &reader_stream, &engine, req)
+                    {
+                        write_internal_error(&mut stream, &format!("submit_dmabuf_failed:{}", e));
+                        break;
+                    }
+                    continue;
+                }
+
                 if line.trim().eq_ignore_ascii_case("STREAM_TOUCH_V1") {
                     if let Err(e) =
-                        handle_touch_stream_v1(&mut stream, &mut reader, &engine, &shutdown)
+                        handle_touch_stream_v1(&mut stream, &mut reader_stream, &engine, &shutdown)
                     {
                         write_internal_error(&mut stream, &format!("touch_stream_failed:{}", e));
                     }
