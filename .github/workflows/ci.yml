@@ -1,52 +1,80 @@
-name: CI
+name: KSU Module CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+  workflow_dispatch:
 
 jobs:
-  rust-check:
+  build-ksu-module:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
       CARGO_NET_RETRY: "5"
       CARGO_HTTP_TIMEOUT: "120"
+      RUSTUP_MAX_RETRIES: "5"
+      ANDROID_API_LEVEL: "35"
+      ANDROID_BUILD_TOOLS: "35.0.1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.93.1
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
-          components: rustfmt, clippy
+          distribution: temurin
+          java-version: "21"
 
-      - name: DSAPI check
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
         run: |
-          attempt=1
-          max_attempts=2
-          while [ "$attempt" -le "$max_attempts" ]; do
-            if ./scripts/dsapi.sh check; then
-              exit 0
-            fi
-            if [ "$attempt" -eq "$max_attempts" ]; then
-              exit 1
-            fi
-            echo "ci_warn=dsapi_check_retry attempt=$attempt"
-            attempt=$((attempt + 1))
-            sleep 3
-          done
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
 
-  c-example-build:
-    runs-on: ubuntu-24.04
-    needs: rust-check
-    env:
-      CARGO_NET_RETRY: "5"
-      CARGO_HTTP_TIMEOUT: "120"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Export Android env for DSAPI scripts
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK_ROOT" ]; then
+            echo "ci_error=android_sdk_root_missing"
+            exit 1
+          fi
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.93.1
+          BUILD_TOOLS_DIR="$SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}"
+          ANDROID_JAR_PATH="$SDK_ROOT/platforms/android-${ANDROID_API_LEVEL}/android.jar"
 
-      - name: Build C example
-        run: ./scripts/build_c_example.sh
+          if [ ! -d "$BUILD_TOOLS_DIR" ]; then
+            echo "ci_error=android_build_tools_missing path=$BUILD_TOOLS_DIR"
+            exit 1
+          fi
+          if [ ! -f "$ANDROID_JAR_PATH" ]; then
+            echo "ci_error=android_jar_missing path=$ANDROID_JAR_PATH"
+            exit 1
+          fi
+
+          echo "DSAPI_ANDROID_BUILD_TOOLS_DIR=$BUILD_TOOLS_DIR" >> "$GITHUB_ENV"
+          echo "DSAPI_ANDROID_JAR=$ANDROID_JAR_PATH" >> "$GITHUB_ENV"
+          echo "DSAPI_AAPT2_ANDROID_JAR=$ANDROID_JAR_PATH" >> "$GITHUB_ENV"
+          echo "$BUILD_TOOLS_DIR" >> "$GITHUB_PATH"
+
+      - name: Build KSU module package
+        run: ./scripts/build_ksu_module.sh
+
+      - name: Show outputs
+        run: ls -lah artifacts/ksu_module
+
+      - name: Upload KSU module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: directscreenapi-ksu-module-${{ github.sha }}
+          path: artifacts/ksu_module/directscreenapi-ksu.zip
+          if-no-files-found: error
+          retention-days: 14
