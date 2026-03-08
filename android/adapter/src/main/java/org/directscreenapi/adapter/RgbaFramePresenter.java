@@ -9,6 +9,7 @@ import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class RgbaFramePresenter {
+    private static final int SURFACE_BUFFER_STEP = 64;
     private static final class FrameRatePolicy {
         final String modeLabel;
         final float forcedHz;
@@ -77,9 +78,12 @@ final class RgbaFramePresenter {
     private SurfaceLayerSession surfaceSession;
     private int surfaceWidth = 0;
     private int surfaceHeight = 0;
+    private int surfaceContentWidth = 0;
+    private int surfaceContentHeight = 0;
     private int pendingSurfaceWidth = 0;
     private int pendingSurfaceHeight = 0;
-    private int pendingSurfaceRotation = 0;
+    private int pendingContentWidth = 0;
+    private int pendingContentHeight = 0;
     private SurfaceLayerSession pendingSurfaceSession;
     private Object pendingDestRect;
     private Object displayManager;
@@ -198,12 +202,9 @@ final class RgbaFramePresenter {
 
                 try {
                     maybeSwitchSurfaceForFrame(mappedFrame.width, mappedFrame.height);
-                    if (pendingSurfaceSession != null
-                            && mappedFrame.width == pendingSurfaceWidth
-                            && mappedFrame.height == pendingSurfaceHeight) {
+                    if (pendingSurfaceSession != null && pendingDestRect != null) {
                         drawFrameToTarget(
                                 pendingSurfaceSession,
-                                pendingDestRect,
                                 mappedFrame.rgba8,
                                 mappedFrame.width,
                                 mappedFrame.height,
@@ -217,10 +218,7 @@ final class RgbaFramePresenter {
                         continue;
                     }
 
-                    if (surfaceSession != null
-                            && destRect != null
-                            && mappedFrame.width == surfaceWidth
-                            && mappedFrame.height == surfaceHeight) {
+                    if (surfaceSession != null && destRect != null) {
                         drawFrame(
                                 mappedFrame.width,
                                 mappedFrame.height,
@@ -334,12 +332,16 @@ final class RgbaFramePresenter {
         if (frameWidth <= 0 || frameHeight <= 0) {
             return;
         }
-        if (surfaceSession != null && frameWidth == surfaceWidth && frameHeight == surfaceHeight) {
+        if (surfaceSession != null
+                && frameWidth <= surfaceWidth
+                && frameHeight <= surfaceHeight) {
+            ensureTargetGeometry(surfaceSession, false, frameWidth, frameHeight);
             return;
         }
         if (pendingSurfaceSession != null
-                && frameWidth == pendingSurfaceWidth
-                && frameHeight == pendingSurfaceHeight) {
+                && frameWidth <= pendingSurfaceWidth
+                && frameHeight <= pendingSurfaceHeight) {
+            ensureTargetGeometry(pendingSurfaceSession, true, frameWidth, frameHeight);
             return;
         }
         if (pendingSurfaceSession != null) {
@@ -347,11 +349,12 @@ final class RgbaFramePresenter {
             pendingSurfaceSession = null;
         }
         pendingDestRect = null;
-        pendingSurfaceWidth = frameWidth;
-        pendingSurfaceHeight = frameHeight;
-        pendingSurfaceRotation = 0;
+        pendingContentWidth = 0;
+        pendingContentHeight = 0;
         pendingSurfacePosX = Integer.MIN_VALUE;
         pendingSurfacePosY = Integer.MIN_VALUE;
+        pendingSurfaceWidth = growSurfaceBuffer(surfaceWidth, frameWidth);
+        pendingSurfaceHeight = growSurfaceBuffer(surfaceHeight, frameHeight);
         pendingSurfaceSession = SurfaceLayerSession.create(
                 pendingSurfaceWidth,
                 pendingSurfaceHeight,
@@ -361,13 +364,11 @@ final class RgbaFramePresenter {
                 layerBlurRadius,
                 latestDisplayRefreshHz
         );
-        pendingDestRect = rectClass
-                .getDeclaredConstructor(int.class, int.class, int.class, int.class)
-                .newInstance(0, 0, pendingSurfaceWidth, pendingSurfaceHeight);
+        ensureTargetGeometry(pendingSurfaceSession, true, frameWidth, frameHeight);
         log("presenter_surface=pending_resize from="
                 + surfaceWidth + "x" + surfaceHeight
                 + " to=" + pendingSurfaceWidth + "x" + pendingSurfaceHeight
-                + " rotation=0");
+                + " content=" + frameWidth + "x" + frameHeight);
     }
 
     private void activatePendingSurface() throws Exception {
@@ -380,6 +381,8 @@ final class RgbaFramePresenter {
         surfaceSession = pendingSurfaceSession;
         surfaceWidth = pendingSurfaceWidth;
         surfaceHeight = pendingSurfaceHeight;
+        surfaceContentWidth = pendingContentWidth;
+        surfaceContentHeight = pendingContentHeight;
         destRect = pendingDestRect;
         surfacePosX = pendingSurfacePosX;
         surfacePosY = pendingSurfacePosY;
@@ -388,7 +391,8 @@ final class RgbaFramePresenter {
         pendingDestRect = null;
         pendingSurfaceWidth = 0;
         pendingSurfaceHeight = 0;
-        pendingSurfaceRotation = 0;
+        pendingContentWidth = 0;
+        pendingContentHeight = 0;
         pendingSurfacePosX = Integer.MIN_VALUE;
         pendingSurfacePosY = Integer.MIN_VALUE;
 
@@ -399,7 +403,6 @@ final class RgbaFramePresenter {
 
     private void drawFrameToTarget(
             SurfaceLayerSession targetSession,
-            Object targetRect,
             ByteBuffer rgba,
             int frameWidth,
             int frameHeight,
@@ -407,6 +410,8 @@ final class RgbaFramePresenter {
             int originY,
             boolean pendingTarget
     ) throws Exception {
+        ensureTargetGeometry(targetSession, pendingTarget, frameWidth, frameHeight);
+        Object drawTargetRect = pendingTarget ? pendingDestRect : destRect;
         updateSurfacePosition(targetSession, originX, originY, pendingTarget);
         ensureBitmap(frameWidth, frameHeight);
         rgba.position(0);
@@ -414,14 +419,14 @@ final class RgbaFramePresenter {
 
         Object canvas = targetSession.lockFrame();
         try {
-            canvasDrawBitmapMethod.invoke(canvas, bitmap, null, targetRect, paint);
+            canvasDrawBitmapMethod.invoke(canvas, bitmap, null, drawTargetRect, paint);
         } finally {
             targetSession.unlockFrame(canvas);
         }
     }
 
     private void drawFrame(int frameWidth, int frameHeight, ByteBuffer rgba, int originX, int originY) throws Exception {
-        drawFrameToTarget(surfaceSession, destRect, rgba, frameWidth, frameHeight, originX, originY, false);
+        drawFrameToTarget(surfaceSession, rgba, frameWidth, frameHeight, originX, originY, false);
     }
 
     private void updateSurfacePosition(
@@ -448,6 +453,54 @@ final class RgbaFramePresenter {
         targetSession.setPosition((float) originX, (float) originY);
         surfacePosX = originX;
         surfacePosY = originY;
+    }
+
+    private static int growSurfaceBuffer(int currentBuffer, int requiredContent) {
+        int safeRequired = Math.max(1, requiredContent);
+        int safeCurrent = Math.max(0, currentBuffer);
+        if (safeCurrent >= safeRequired) {
+            return safeCurrent;
+        }
+        int aligned = ((safeRequired + SURFACE_BUFFER_STEP - 1) / SURFACE_BUFFER_STEP) * SURFACE_BUFFER_STEP;
+        return Math.max(aligned, SURFACE_BUFFER_STEP);
+    }
+
+    private void ensureTargetGeometry(
+            SurfaceLayerSession targetSession,
+            boolean pendingTarget,
+            int frameWidth,
+            int frameHeight
+    ) throws Exception {
+        if (targetSession == null) {
+            return;
+        }
+        int safeWidth = Math.max(1, frameWidth);
+        int safeHeight = Math.max(1, frameHeight);
+        if (pendingTarget) {
+            if (pendingDestRect != null
+                    && pendingContentWidth == safeWidth
+                    && pendingContentHeight == safeHeight) {
+                return;
+            }
+            targetSession.setWindowCrop(0, 0, safeWidth, safeHeight);
+            pendingDestRect = rectClass
+                    .getDeclaredConstructor(int.class, int.class, int.class, int.class)
+                    .newInstance(0, 0, safeWidth, safeHeight);
+            pendingContentWidth = safeWidth;
+            pendingContentHeight = safeHeight;
+            return;
+        }
+        if (destRect != null
+                && surfaceContentWidth == safeWidth
+                && surfaceContentHeight == safeHeight) {
+            return;
+        }
+        targetSession.setWindowCrop(0, 0, safeWidth, safeHeight);
+        destRect = rectClass
+                .getDeclaredConstructor(int.class, int.class, int.class, int.class)
+                .newInstance(0, 0, safeWidth, safeHeight);
+        surfaceContentWidth = safeWidth;
+        surfaceContentHeight = safeHeight;
     }
 
     private void initDisplayListener() {

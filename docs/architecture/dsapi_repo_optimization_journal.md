@@ -2,20 +2,20 @@
 
 > 目标：围绕“高性能 + 高稳定性”，对全仓逐目录审查、优化与清理。  
 > 策略：先标注风险与引用，再执行变更，变更后立即构建/测试验证。  
-> 基线：`docs/architecture/_file_inventory.txt` 当前统计 `324` 条。
+> 基线：`docs/architecture/_file_inventory.txt` 当前统计 `165` 条。
 
 ---
 
 ## 1. 目录分布（用于分批推进）
 
-- `third_party/android-sdk`: 171（外部依赖，默认只做版本与来源核验，不做业务改造）
-- `core/rust`: 38（核心稳定性与协议路径，优先级 P0）
+- `core/rust`: 39（核心稳定性与协议路径，优先级 P0）
 - `ksu/module_examples`: 18（示例清理与规范收敛，优先级 P2）
-- `android/adapter`: 13（桥接链路与能力层，优先级 P1）
-- `android/ksu_manager`: 12（现代化 UI 与交互稳定性，优先级 P1）
-- `ksu/module_template`: 10（KSU 可用性与脚本收敛，优先级 P0）
-- `docs/architecture`: 10（方案与追踪文档，持续更新）
+- `android/adapter`: 17（桥接链路与能力层，优先级 P1）
+- `android/ksu_manager`: 13（现代化 UI 与交互稳定性，优先级 P1）
+- `ksu/module_template`: 8（KSU 可用性与脚本收敛，优先级 P0）
+- `docs/architecture`: 14（方案与追踪文档，持续更新）
 - `docs/guides`: 8（用户文档与命令语义对齐）
+- `scripts`: 19（构建/运行控制面，优先级 P0）
 
 ---
 
@@ -114,11 +114,11 @@
 
 ### P0（稳定性）
 
-- [ ] `core/rust/bin/dsapid.rs`：dispatch pool 仍为 `sync_channel(0)+try_send`，高并发长连接场景可能放大拒绝率，需要“长短连接隔离”方案。
-- [x] `core/rust/bin/dsapid.rs`：dispatch busy 增加 overflow thread 兜底，降低饥饿与直接拒绝（后续继续做长短连接隔离）。
-- [ ] `core/rust/bin/dsapid/control_dispatch.rs`：sendmsg/写入路径补齐短写重试与截断可观测性。
+- [ ] `core/rust/src/bin/dsapid.rs`：dispatch pool 仍为 `sync_channel(0)+try_send`，高并发长连接场景可能放大拒绝率，需要“长短连接隔离”方案。
+- [x] `core/rust/src/bin/dsapid.rs`：dispatch busy 增加 overflow thread 兜底，降低饥饿与直接拒绝（后续继续做长短连接隔离）。
+- [ ] `core/rust/src/bin/dsapid/control_dispatch.rs`：sendmsg/写入路径补齐短写重试与截断可观测性。
 - [ ] `core/rust` Vulkan 相关路径：补有界等待与降级策略，避免极端卡死。
-- [ ] `core/rust/engine/module_runtime.rs`：补模块级写锁与 install/reload 并发互斥（当前以单 mutex 保护，仍需细化事务锁）。
+- [ ] `core/rust/src/engine/module_runtime.rs`：补模块级写锁与 install/reload 并发互斥（当前以单 mutex 保护，仍需细化事务锁）。
 
 ### P1（性能与架构）
 

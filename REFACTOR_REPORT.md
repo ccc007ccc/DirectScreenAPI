@@ -72,5 +72,5 @@
 - `android/adapter/.../BridgeControlServer.java`
   - `startManagerHost` 启动前增加自动补装。
   - 新增 manager APK 解析与 install-existing 补装路径，保留 AIDL 主链。
-- `android/ksu_manager/AndroidManifest.xml`
+- `android/ksu_manager/src/main/AndroidManifest.xml`
   - 移除 `android:process="shell"`，回归单 APK 常规进程模型。

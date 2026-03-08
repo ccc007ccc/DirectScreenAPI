@@ -25,6 +25,7 @@ use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
 
 const WINDOW_ARG_MIN_W: f32 = 120.0;
 const WINDOW_ARG_MIN_H: f32 = 90.0;
+const RESIZE_SNAP_PX: f32 = 4.0;
 const BASE_TITLE_HEIGHT_DP: f32 = 44.0;
 const BASE_RESIZE_HIT_DP: f32 = 42.0;
 const BASE_WINDOW_MIN_W_DP: f32 = 240.0;
@@ -804,6 +805,14 @@ impl WindowState {
     }
 }
 
+fn snap_resize_edge(value: f32) -> f32 {
+    if !value.is_finite() {
+        return value;
+    }
+    let step = RESIZE_SNAP_PX.max(1.0);
+    (value / step).round() * step
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RouteSnapshot {
     window: WindowState,
@@ -1108,8 +1117,8 @@ impl DemoState {
                         origin_w,
                         origin_h,
                     } if pointer_id == msg.pointer_id => {
-                        self.window.w = origin_w + (msg.x - start_x);
-                        self.window.h = origin_h + (msg.y - start_y);
+                        self.window.w = snap_resize_edge(origin_w + (msg.x - start_x));
+                        self.window.h = snap_resize_edge(origin_h + (msg.y - start_y));
                         self.window.clamp_to_display(display, metrics);
                     }
                     _ => {}
@@ -2157,7 +2166,6 @@ fn render_scene(
         );
         text_y += metrics.body_line_step;
     }
-
 }
 
 fn tail_chars(text: &str, max_chars: usize) -> String {

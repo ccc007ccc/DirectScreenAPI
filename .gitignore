@@ -13,6 +13,8 @@
 # Runtime artifacts
 artifacts/
 third_party/android-sdk/
+data/local/tmp/
+.codex_tmp_*
 
 # Generated lockfiles outside Rust
 *.log
