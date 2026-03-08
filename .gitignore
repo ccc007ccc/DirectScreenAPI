@@ -12,6 +12,7 @@
 
 # Runtime artifacts
 artifacts/
+third_party/android-sdk/
 
 # Generated lockfiles outside Rust
 *.log
