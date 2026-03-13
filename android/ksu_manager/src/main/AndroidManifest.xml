@@ -48,6 +48,14 @@
             android:noHistory="false"
             android:taskAffinity="org.directscreenapi.manager"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!--
+          LSP 风格：不让 Manager 自己去 ServiceManager.find 自定义 service（可能被 SELinux 拦）。
+          由寄生 host（root/shell）通过 bindService 注入 core binder 句柄到 Manager 进程。
+        -->
+        <service
+            android:name=".HostHandshakeService"
+            android:exported="true" />
     </application>
 
 </manifest>

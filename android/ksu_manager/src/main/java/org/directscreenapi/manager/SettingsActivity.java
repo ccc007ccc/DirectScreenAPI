@@ -346,6 +346,7 @@ public final class SettingsActivity extends Activity {
     private void bindConfigToInputs() {
         subtitleView.setText(
                 "ctl=" + config.ctlPath
+                        + "\ntransport=" + config.transport
                         + "\nbridge_service=" + config.bridgeService
                         + "  refresh=" + config.refreshMs + "ms"
         );
@@ -371,7 +372,10 @@ public final class SettingsActivity extends Activity {
         repo = new ManagerRepository(config);
         bindConfigToInputs();
 
-        setLogText("config_saved=1\nctl=" + config.ctlPath + "\nbridge_service=" + config.bridgeService + "\nrefresh_ms=" + config.refreshMs);
+        setLogText("config_saved=1\nctl=" + config.ctlPath
+                + "\ntransport=" + config.transport
+                + "\nbridge_service=" + config.bridgeService
+                + "\nrefresh_ms=" + config.refreshMs);
     }
 
     private String textOf(EditText et, String fallback) {

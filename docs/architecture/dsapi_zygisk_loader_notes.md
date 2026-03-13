@@ -27,9 +27,22 @@
   - `GET_DAEMON_BINDER`：校验 daemon binder 可达。
 - 若注入裁决失败，loader 走 fail-closed（拒绝注入）并记录日志，不做旧路径降级。
 
+## 3.1 已落地（第三阶段：Manager 注入链）
+
+- Manager 进程默认不再依赖 `ServiceManager.getService("dsapi.core")`（避免 `service_manager find` 被 SELinux 拦截）。
+- Zygisk loader 在 `preAppSpecialize`（zygote 权限阶段）通过 `zygote-agent` 获取 `daemon_binder`：
+  - 若目标进程为 `org.directscreenapi.manager`，则保存 binder 句柄（`GlobalRef`）。
+  - 为保证 `postAppSpecialize` 可继续执行注入线程，Manager 进程不设置 `DLCLOSE_MODULE_LIBRARY`。
+- 为提高冷启动可靠性：当 `zygote-agent` 不可用时，Manager 允许直接 `ServiceManager.getService("dsapi.core")` 获取 binder（仍在 zygote 权限阶段进行）。
+- Zygisk loader 在 `postAppSpecialize` 启动一次性线程：
+  - 等待 `ActivityThread.currentApplication()` 可用。
+  - 获取 `Application.getClassLoader()`，用该 ClassLoader 加载 `InjectedCoreBinder`。
+  - 调用 `InjectedCoreBinder.setFromZygisk(IBinder, "zygisk")` 写入 binder 句柄。
+
 ## 4. 当前边界
 
-- 当前实现完成了“裁决与链路可达性”闭环，尚未在目标进程内消费 daemon binder（后续注入业务逻辑阶段接入）。
+- 当前实现完成了“裁决 + 链路可达性 + Manager 自动注入 binder”闭环。
+- 仍待补齐：在其他目标进程（非 Manager）内消费 daemon binder（窗口/输入等业务注入阶段）。
 - `BridgeControlServer` 的 manager 安装动作仍保留 `pm install` shell 调用（探测链路已迁到系统 API）。
 
 ## 5. 下一步

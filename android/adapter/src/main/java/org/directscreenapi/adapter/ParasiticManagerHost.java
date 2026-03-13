@@ -2,10 +2,14 @@ package org.directscreenapi.adapter;
 
 import android.content.ComponentName;
 import android.content.Context;
+import android.content.ServiceConnection;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.os.IBinder;
+import android.os.Parcel;
 import android.os.Looper;
+import android.os.SystemClock;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -13,9 +17,13 @@ import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 final class ParasiticManagerHost {
     private static final String ATMS_CALLING_PACKAGE = "com.android.shell";
+    private static final String HANDSHAKE_DESCRIPTOR = "org.directscreenapi.manager.IHostHandshake";
+    private static final int HANDSHAKE_SET_CORE = 1;
 
     private final String ctlPath;
     private final String managerComponent;
@@ -52,6 +60,7 @@ final class ParasiticManagerHost {
         Context context = resolveContext();
         ensurePackageInstalled(context, managerPackage);
         launchManagerActivity(context);
+        injectCoreBinderToManager(context);
         writeReadyState("ready", "-");
 
         while (true) {
@@ -123,9 +132,132 @@ final class ParasiticManagerHost {
             intent.putExtra("bridge_service", bridgeService);
         }
         intent.putExtra("refresh_ms", String.valueOf(refreshMs));
+        // LSP 风格：由寄生 host 注入 binder，Manager 不依赖 ServiceManager.find，不需要 root。
+        intent.putExtra("transport", "zygote");
         int result = startActivityViaAtm(intent);
         if (result < 0) {
             throw new IllegalStateException("manager_activity_launch_failed result=" + result);
+        }
+    }
+
+    private void injectCoreBinderToManager(Context context) {
+        if (context == null) {
+            return;
+        }
+        if (bridgeService.isEmpty()) {
+            return;
+        }
+        try {
+            IBinder core = queryServiceBinder(bridgeService);
+            if (core == null) {
+                System.out.println("manager_host_warn=core_binder_missing service=" + sanitizeToken(bridgeService));
+                return;
+            }
+            boolean ok = bindHandshakeAndInject(context, core);
+            System.out.println("manager_host_info=inject_core_binder ok=" + (ok ? "1" : "0")
+                    + " service=" + sanitizeToken(bridgeService));
+        } catch (Throwable t) {
+            System.out.println("manager_host_warn=inject_core_binder_failed error=" + sanitizeToken(t.getClass().getName() + ":" + t.getMessage()));
+        }
+    }
+
+    private static IBinder queryServiceBinder(String serviceName) {
+        if (serviceName == null || serviceName.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            Class<?> serviceManager = Class.forName("android.os.ServiceManager");
+            Method getService = serviceManager.getMethod("getService", String.class);
+            long deadline = SystemClock.uptimeMillis() + 1500L;
+            while (true) {
+                Object binder = getService.invoke(null, serviceName);
+                if (binder instanceof IBinder) {
+                    return (IBinder) binder;
+                }
+                if (SystemClock.uptimeMillis() >= deadline) {
+                    break;
+                }
+                try {
+                    Thread.sleep(50L);
+                } catch (InterruptedException ignored) {
+                    break;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private boolean bindHandshakeAndInject(Context context, final IBinder coreBinder) throws Exception {
+        ComponentName component = new ComponentName(managerPackage, managerPackage + ".HostHandshakeService");
+        Intent intent = new Intent();
+        intent.setComponent(component);
+
+        final CountDownLatch latch = new CountDownLatch(1);
+        final IBinder[] remote = new IBinder[1];
+
+        ServiceConnection conn = new ServiceConnection() {
+            @Override
+            public void onServiceConnected(ComponentName name, IBinder service) {
+                remote[0] = service;
+                latch.countDown();
+            }
+
+            @Override
+            public void onServiceDisconnected(ComponentName name) {
+            }
+        };
+
+        boolean bound = false;
+        try {
+            bound = context.bindService(intent, conn, Context.BIND_AUTO_CREATE);
+            if (!bound) {
+                return false;
+            }
+            if (!latch.await(2500L, TimeUnit.MILLISECONDS)) {
+                return false;
+            }
+            IBinder handshake = remote[0];
+            if (handshake == null) {
+                return false;
+            }
+
+            Parcel data = null;
+            Parcel reply = null;
+            try {
+                data = Parcel.obtain();
+                reply = Parcel.obtain();
+                data.writeInterfaceToken(HANDSHAKE_DESCRIPTOR);
+                data.writeStrongBinder(coreBinder);
+                data.writeString(bridgeService);
+                boolean ok = handshake.transact(HANDSHAKE_SET_CORE, data, reply, 0);
+                if (!ok) {
+                    return false;
+                }
+                reply.readException();
+                int rc = reply.readInt();
+                return rc == 0;
+            } finally {
+                if (reply != null) {
+                    try {
+                        reply.recycle();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                if (data != null) {
+                    try {
+                        data.recycle();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } finally {
+            if (bound) {
+                try {
+                    context.unbindService(conn);
+                } catch (Throwable ignored) {
+                }
+            }
         }
     }
 

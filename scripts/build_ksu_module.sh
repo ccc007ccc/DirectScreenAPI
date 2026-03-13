@@ -112,10 +112,26 @@ if [ ! -x "$DSAPID_BIN" ] || [ ! -x "$DSAPICTL_BIN" ] || [ ! -x "$DSAPI_TOUCH_DE
 fi
 
 if command -v readelf >/dev/null 2>&1; then
-  if readelf -l "$DSAPID_BIN" 2>/dev/null | grep -F -q '/lib/ld-linux'; then
-    echo "ksu_pack_error=core_binary_incompatible interpreter=glibc path=$DSAPID_BIN"
-    exit 2
-  fi
+  read_elf_interp() {
+    readelf -l "$1" 2>/dev/null | sed -n 's/.*Requesting program interpreter: \\(.*\\)]/\\1/p' | head -n 1
+  }
+  check_android_interp_or_static() {
+    bin="$1"
+    interp="$(read_elf_interp "$bin")"
+    if [ -z "$interp" ]; then
+      return 0
+    fi
+    case "$interp" in
+      /system/bin/linker|/system/bin/linker64) return 0 ;;
+      *)
+        echo "ksu_pack_error=core_binary_incompatible interpreter=$interp path=$bin"
+        exit 2
+        ;;
+    esac
+  }
+  check_android_interp_or_static "$DSAPID_BIN"
+  check_android_interp_or_static "$DSAPICTL_BIN"
+  check_android_interp_or_static "$DSAPI_TOUCH_DEMO_BIN"
 fi
 
 ANDROID_OUT_DIR="$OUT_ROOT/android_adapter"
@@ -149,7 +165,7 @@ VERSION="${DSAPI_KSU_VERSION:-$(date +%Y.%m.%d-%H%M%S)}"
 VERSION_CODE="$(date +%s)"
 # V3：runtime release 目录保持稳定（避免每次构建在 /data/adb/dsapi/runtime/releases 产生新目录）。
 # 变更检测由运行时 seed sync marker（包含 module.prop versionCode）负责。
-RELEASE_ID_DEFAULT="r0"
+RELEASE_ID_DEFAULT="stable"
 RELEASE_ID="${DSAPI_KSU_RELEASE_ID:-$RELEASE_ID_DEFAULT}"
 ZIP_PATH="$OUT_ROOT/${KSU_MODULE_ID}-ksu.zip"
 
@@ -323,6 +339,9 @@ rm -rf "$STAGE_DIR"
 mkdir -p "$MOD_DIR/bin"
 
 cp -a "$TEMPLATE_DIR/." "$MOD_DIR/"
+# 不随模块分发任何 SELinux policy/context 文件。
+# 说明：部分设备/软件会检测 sepolicy 改动；同时 V3 的控制面不依赖 sepolicy 放行。
+rm -f "$MOD_DIR/sepolicy.rule" "$MOD_DIR/service_contexts" >/dev/null 2>&1 || true
 cp "$DSAPID_BIN" "$MOD_DIR/bin/dsapid"
 cp "$DSAPICTL_BIN" "$MOD_DIR/bin/dsapictl"
 cp "$DSAPI_TOUCH_DEMO_BIN" "$MOD_DIR/bin/dsapi_touch_demo"

@@ -349,6 +349,7 @@ public final class MainActivity extends Activity implements View.OnClickListener
 
         subtitleView.setText(
                 "ctl=" + config.ctlPath
+                        + "\ntransport=" + config.transport
                         + "\nbridge_service=" + config.bridgeService
                         + " zygote=" + snapshot.zygoteState
                         + "\nrefresh=" + config.refreshMs + "ms status_exit=" + snapshot.status.exitCode

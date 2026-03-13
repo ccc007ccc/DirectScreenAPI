@@ -9,14 +9,17 @@ final class ManagerConfig {
     static final String KEY_CTL_PATH = "ctl_path";
     static final String KEY_BRIDGE_SERVICE = "bridge_service";
     static final String KEY_REFRESH_MS = "refresh_ms";
+    static final String KEY_TRANSPORT = "transport";
 
     static final String DEFAULT_CTL_PATH = "/data/adb/modules/directscreenapi/bin/dsapi_service_ctl.sh";
     static final String DEFAULT_BRIDGE_SERVICE = "dsapi.core";
     static final int DEFAULT_REFRESH_MS = 1000;
+    static final String DEFAULT_TRANSPORT = "zygote";
 
     String ctlPath = DEFAULT_CTL_PATH;
     String bridgeService = DEFAULT_BRIDGE_SERVICE;
     int refreshMs = DEFAULT_REFRESH_MS;
+    String transport = DEFAULT_TRANSPORT;
 
     static ManagerConfig load(Context context, Intent intent) {
         ManagerConfig cfg = new ManagerConfig();
@@ -28,6 +31,7 @@ final class ManagerConfig {
                 DEFAULT_BRIDGE_SERVICE
         );
         cfg.refreshMs = clampInt(sp.getInt(KEY_REFRESH_MS, DEFAULT_REFRESH_MS), 250, 60000, DEFAULT_REFRESH_MS);
+        cfg.transport = normalizeTransport(sp.getString(KEY_TRANSPORT, DEFAULT_TRANSPORT), DEFAULT_TRANSPORT);
 
         if (intent != null) {
             String ctl = intent.getStringExtra(KEY_CTL_PATH);
@@ -45,6 +49,10 @@ final class ManagerConfig {
                 } catch (Throwable ignored) {
                 }
             }
+            String transport = intent.getStringExtra(KEY_TRANSPORT);
+            if (transport != null && !transport.trim().isEmpty()) {
+                cfg.transport = normalizeTransport(transport, cfg.transport);
+            }
         }
 
         return cfg;
@@ -56,6 +64,7 @@ final class ManagerConfig {
         editor.putString(KEY_CTL_PATH, normalizeString(ctlPath, DEFAULT_CTL_PATH));
         editor.putString(KEY_BRIDGE_SERVICE, normalizeServiceName(bridgeService, DEFAULT_BRIDGE_SERVICE));
         editor.putInt(KEY_REFRESH_MS, clampInt(refreshMs, 250, 60000, DEFAULT_REFRESH_MS));
+        editor.putString(KEY_TRANSPORT, normalizeTransport(transport, DEFAULT_TRANSPORT));
         editor.apply();
     }
 
@@ -66,6 +75,7 @@ final class ManagerConfig {
         intent.putExtra(KEY_CTL_PATH, ctlPath);
         intent.putExtra(KEY_BRIDGE_SERVICE, bridgeService);
         intent.putExtra(KEY_REFRESH_MS, String.valueOf(refreshMs));
+        intent.putExtra(KEY_TRANSPORT, normalizeTransport(transport, DEFAULT_TRANSPORT));
         return intent;
     }
 
@@ -97,6 +107,14 @@ final class ManagerConfig {
             return fallback;
         }
         return v;
+    }
+
+    private static String normalizeTransport(String raw, String fallback) {
+        String v = normalizeString(raw, fallback).toLowerCase();
+        if ("zygote".equals(v) || "binder".equals(v)) {
+            return v;
+        }
+        return fallback;
     }
 
 }

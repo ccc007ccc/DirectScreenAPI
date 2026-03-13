@@ -6,13 +6,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
+#include <chrono>
 #include <string>
 
 namespace {
 
 constexpr const char* kLogPath = "/data/adb/dsapi/log/zygisk_loader.log";
 constexpr const char* kDefaultAgentService = "dsapi.zygote.injector";
+constexpr const char* kDefaultDaemonService = "dsapi.core";
 constexpr const char* kAgentDescriptor = "org.directscreenapi.daemon.IZygoteAgent";
+constexpr const char* kManagerPackage = "org.directscreenapi.manager";
+constexpr const char* kManagerInjectedBinderClass = "org.directscreenapi.manager.InjectedCoreBinder";
+constexpr const char* kManagerInjectedBinderMethod = "setFromZygisk";
 constexpr const char* kAgentFeatureDaemonBinder = "daemon_binder";
 constexpr const char* kAgentFeatureScopeDecider = "scope_decider";
 constexpr jint kTransGetInfo = 1;
@@ -417,13 +423,13 @@ cleanup:
   return allow;
 }
 
-bool transact_get_daemon_binder(JNIEnv* env, jobject agent_binder) {
+jobject transact_get_daemon_binder(JNIEnv* env, jobject agent_binder) {
   if (env == nullptr || agent_binder == nullptr) {
-    return false;
+    return nullptr;
   }
   ParcelApi api;
   if (!resolve_parcel_api(env, &api)) {
-    return false;
+    return nullptr;
   }
 
   jobject data = env->CallStaticObjectMethod(api.parcel_cls, api.parcel_obtain);
@@ -438,10 +444,10 @@ bool transact_get_daemon_binder(JNIEnv* env, jobject agent_binder) {
       env->DeleteLocalRef(reply);
     }
     release_parcel_api(env, &api);
-    return false;
+    return nullptr;
   }
 
-  bool ok = false;
+  jobject daemon_binder = nullptr;
   jstring jdesc = env->NewStringUTF(kAgentDescriptor);
   if (jdesc == nullptr) {
     clear_exception(env, "NewStringUTF(get_daemon_binder)");
@@ -467,14 +473,10 @@ bool transact_get_daemon_binder(JNIEnv* env, jobject agent_binder) {
     goto cleanup;
   }
   {
-    jobject daemon_binder = env->CallObjectMethod(reply, api.read_strong_binder);
+    daemon_binder = env->CallObjectMethod(reply, api.read_strong_binder);
     if (env->ExceptionCheck()) {
       clear_exception(env, "Parcel.readStrongBinder(get_daemon_binder)");
       goto cleanup;
-    }
-    ok = (daemon_binder != nullptr);
-    if (daemon_binder != nullptr) {
-      env->DeleteLocalRef(daemon_binder);
     }
   }
 
@@ -489,7 +491,7 @@ cleanup:
   env->DeleteLocalRef(data);
   env->DeleteLocalRef(reply);
   release_parcel_api(env, &api);
-  return ok;
+  return daemon_binder;
 }
 
 bool has_feature(JNIEnv* env, jobjectArray features, const char* expected) {
@@ -646,6 +648,9 @@ class DsapiZygiskModule : public zygisk::ModuleBase {
   void onLoad(zygisk::Api* api, JNIEnv* env) override {
     api_ = api;
     env_ = env;
+    if (env_ != nullptr) {
+      env_->GetJavaVM(&java_vm_);
+    }
     append_log("zygisk_loader_state=loaded api=5");
   }
 
@@ -656,28 +661,57 @@ class DsapiZygiskModule : public zygisk::ModuleBase {
     }
 
     AppMeta app = read_app_meta(env_, args);
+    const bool is_manager = (app.package_name == kManagerPackage);
     std::string reason;
-    bool allow = false;
+    bool allow = false;  // allow means "do not FORCE_DENYLIST_UNMOUNT"
+    jobject daemon_binder = nullptr;
 
     std::string service_name = read_env_service_name();
     jobject agent_binder = query_service_binder(env_, service_name);
     if (agent_binder == nullptr) {
       reason = "zygote_agent_missing";
-      allow = false;
+      allow = is_manager;
+      // Manager 主路径不依赖 zygote-agent：允许直接拿 dsapi.core（若已启动）。
+      if (is_manager) {
+        daemon_binder = query_service_binder(env_, kDefaultDaemonService);
+        if (daemon_binder != nullptr) {
+          reason = "direct_daemon_binder_ok";
+        } else {
+          reason = "direct_daemon_binder_missing";
+        }
+      }
     } else {
       if (!transact_get_info(env_, agent_binder, &reason)) {
-        allow = false;
+        allow = is_manager;
       } else {
         allow = transact_should_inject(env_, agent_binder, app, &reason);
-        if (allow && !transact_get_daemon_binder(env_, agent_binder)) {
-          allow = false;
+        daemon_binder = transact_get_daemon_binder(env_, agent_binder);
+        if (daemon_binder == nullptr) {
+          // 对 Manager：即使核心未启动，也不要强制 denylist unmount（保证 UI 可见并给出错误提示）。
+          if (!is_manager) {
+            allow = false;
+          }
           reason = "daemon_binder_missing";
         }
       }
       env_->DeleteLocalRef(agent_binder);
     }
 
-    api_->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+    // 默认行为：非 manager 进程尽量释放模块映射，降低常驻特征与内存占用。
+    // Manager 进程需要在 postAppSpecialize 后继续运行注入线程，因此不能 dlclose。
+    if (!is_manager) {
+      api_->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+    } else {
+      // 记录 manager 注入状态：daemon binder 仅在 preAppSpecialize 拿到（zygote 权限）。
+      inject_manager_ = true;
+      if (daemon_binder != nullptr) {
+        if (core_binder_global_ != nullptr) {
+          env_->DeleteGlobalRef(core_binder_global_);
+          core_binder_global_ = nullptr;
+        }
+        core_binder_global_ = env_->NewGlobalRef(daemon_binder);
+      }
+    }
     if (!allow) {
       api_->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
     }
@@ -693,11 +727,151 @@ class DsapiZygiskModule : public zygisk::ModuleBase {
     line += " reason=" + sanitize_token(reason.empty() ? "-" : reason);
     line += " agent_service=" + sanitize_token(service_name);
     append_log(line);
+
+    if (daemon_binder != nullptr) {
+      env_->DeleteLocalRef(daemon_binder);
+    }
+  }
+
+  void postAppSpecialize(const zygisk::AppSpecializeArgs* /*args*/) override {
+    if (!inject_manager_ || java_vm_ == nullptr || core_binder_global_ == nullptr) {
+      return;
+    }
+    jobject binder_ref = core_binder_global_;
+    core_binder_global_ = nullptr;
+
+    JavaVM* vm = java_vm_;
+    std::thread([vm, binder_ref]() {
+      if (vm == nullptr || binder_ref == nullptr) {
+        return;
+      }
+      JNIEnv* env = nullptr;
+      if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK || env == nullptr) {
+        return;
+      }
+
+      auto detach = [&]() {
+        vm->DetachCurrentThread();
+      };
+
+      // 等待 Application 创建完成，获取 app ClassLoader 并注入 binder。
+      // 注意：此逻辑必须在 postAppSpecialize 返回后执行，否则会阻塞应用启动。
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+      jobject app = nullptr;
+      jclass at_cls = env->FindClass("android/app/ActivityThread");
+      clear_exception(env, "FindClass(ActivityThread)");
+      jmethodID current_app = nullptr;
+      if (at_cls != nullptr) {
+        current_app = env->GetStaticMethodID(at_cls, "currentApplication", "()Landroid/app/Application;");
+        clear_exception(env, "GetStaticMethodID(currentApplication)");
+      }
+      while (std::chrono::steady_clock::now() < deadline) {
+        if (at_cls != nullptr && current_app != nullptr) {
+          jobject cur = env->CallStaticObjectMethod(at_cls, current_app);
+          clear_exception(env, "CallStaticObjectMethod(currentApplication)");
+          if (cur != nullptr) {
+            app = cur;
+            break;
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+
+      if (at_cls != nullptr) {
+        env->DeleteLocalRef(at_cls);
+      }
+
+      if (app == nullptr) {
+        // 无法拿到 app context：直接退出，避免对进程造成额外开销。
+        append_log("zygisk_loader_inject_manager=0 reason=app_null");
+        env->DeleteGlobalRef(binder_ref);
+        detach();
+        return;
+      }
+
+      jobject loader = nullptr;
+      {
+        jclass app_cls = env->GetObjectClass(app);
+        jmethodID get_cl = (app_cls == nullptr) ? nullptr
+            : env->GetMethodID(app_cls, "getClassLoader", "()Ljava/lang/ClassLoader;");
+        clear_exception(env, "GetMethodID(getClassLoader)");
+        if (get_cl != nullptr) {
+          loader = env->CallObjectMethod(app, get_cl);
+          clear_exception(env, "CallObjectMethod(getClassLoader)");
+        }
+        if (app_cls != nullptr) {
+          env->DeleteLocalRef(app_cls);
+        }
+      }
+
+      if (loader == nullptr) {
+        append_log("zygisk_loader_inject_manager=0 reason=classloader_null");
+        env->DeleteLocalRef(app);
+        env->DeleteGlobalRef(binder_ref);
+        detach();
+        return;
+      }
+
+      jclass injected_cls = nullptr;
+      {
+        jclass cl_cls = env->FindClass("java/lang/ClassLoader");
+        clear_exception(env, "FindClass(ClassLoader)");
+        jmethodID load_class = (cl_cls == nullptr) ? nullptr
+            : env->GetMethodID(cl_cls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+        clear_exception(env, "GetMethodID(loadClass)");
+        jstring name = env->NewStringUTF(kManagerInjectedBinderClass);
+        clear_exception(env, "NewStringUTF(InjectedCoreBinder)");
+        if (load_class != nullptr && name != nullptr) {
+          jobject klass = env->CallObjectMethod(loader, load_class, name);
+          clear_exception(env, "CallObjectMethod(loadClass)");
+          if (klass != nullptr) {
+            injected_cls = static_cast<jclass>(klass);
+          }
+        }
+        if (name != nullptr) {
+          env->DeleteLocalRef(name);
+        }
+        if (cl_cls != nullptr) {
+          env->DeleteLocalRef(cl_cls);
+        }
+      }
+
+      if (injected_cls != nullptr) {
+        jmethodID set_mid = env->GetStaticMethodID(
+            injected_cls,
+            kManagerInjectedBinderMethod,
+            "(Landroid/os/IBinder;Ljava/lang/String;)V");
+        clear_exception(env, "GetStaticMethodID(setFromZygisk)");
+        if (set_mid != nullptr) {
+          jstring src = env->NewStringUTF("zygisk");
+          clear_exception(env, "NewStringUTF(src)");
+          env->CallStaticVoidMethod(injected_cls, set_mid, binder_ref, src);
+          clear_exception(env, "CallStaticVoidMethod(setFromZygisk)");
+          if (src != nullptr) {
+            env->DeleteLocalRef(src);
+          }
+          append_log("zygisk_loader_inject_manager=1 reason=ok");
+        } else {
+          append_log("zygisk_loader_inject_manager=0 reason=set_method_missing");
+        }
+        env->DeleteLocalRef(injected_cls);
+      } else {
+        append_log("zygisk_loader_inject_manager=0 reason=injected_class_missing");
+      }
+
+      env->DeleteLocalRef(loader);
+      env->DeleteLocalRef(app);
+      env->DeleteGlobalRef(binder_ref);
+      detach();
+    }).detach();
   }
 
  private:
   zygisk::Api* api_ = nullptr;
   JNIEnv* env_ = nullptr;
+  JavaVM* java_vm_ = nullptr;
+  bool inject_manager_ = false;
+  jobject core_binder_global_ = nullptr;
 };
 
 }  // namespace

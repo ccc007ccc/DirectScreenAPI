@@ -886,6 +886,9 @@ dsapi_manager_is_foreground() {
 
 dsapi_manager_force_foreground() {
   dsapi_comp="${1:-$(dsapi_manager_main_component)}"
+  dsapi_bridge_service="${2:-$(dsapi_manager_bridge_service_get)}"
+  dsapi_refresh_ms="${3:-${DSAPI_MANAGER_UI_REFRESH_MS:-1200}}"
+  dsapi_transport="${4:-zygote}"
   case "$dsapi_comp" in
     ''|*' '*|*$'\t'*|*$'\r'*|*$'\n'*) return 2 ;;
   esac
@@ -897,6 +900,10 @@ dsapi_manager_force_foreground() {
       -W \
       -a org.directscreenapi.manager.OPEN \
       -n "$dsapi_comp" \
+      --es ctl_path "$MODROOT/bin/dsapi_service_ctl.sh" \
+      --es bridge_service "$dsapi_bridge_service" \
+      --es refresh_ms "$dsapi_refresh_ms" \
+      --es transport "$dsapi_transport" \
       -f 0x14000000 >/dev/null 2>&1 && return 0
   fi
   if command -v am >/dev/null 2>&1; then
@@ -906,6 +913,10 @@ dsapi_manager_force_foreground() {
       -W \
       -a org.directscreenapi.manager.OPEN \
       -n "$dsapi_comp" \
+      --es ctl_path "$MODROOT/bin/dsapi_service_ctl.sh" \
+      --es bridge_service "$dsapi_bridge_service" \
+      --es refresh_ms "$dsapi_refresh_ms" \
+      --es transport "$dsapi_transport" \
       -f 0x14000000 >/dev/null 2>&1 && return 0
   fi
   return 2
@@ -991,7 +1002,7 @@ dsapi_manager_host_start() {
   [ -n "$dsapi_cur_bridge" ] || dsapi_cur_bridge="$dsapi_bridge_service"
   if [ "$dsapi_state" = "running" ] && [ "$dsapi_cur_bridge" = "$dsapi_bridge_service" ]; then
     if ! dsapi_manager_is_foreground "$dsapi_pkg"; then
-      dsapi_manager_force_foreground "$dsapi_comp" >/dev/null 2>&1 || true
+      dsapi_manager_force_foreground "$dsapi_comp" "$dsapi_bridge_service" "$dsapi_refresh_ms" zygote >/dev/null 2>&1 || true
     fi
     if [ -f "$MANAGER_HOST_PID_FILE" ]; then
       dsapi_pid="$(cat "$MANAGER_HOST_PID_FILE" 2>/dev/null || true)"

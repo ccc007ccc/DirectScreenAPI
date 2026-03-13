@@ -538,6 +538,7 @@ public final class ModulesActivity extends Activity {
                         + "  last_error=" + lastError
                         + "  z_scope=" + (snapshot.home == null ? "0" : snapshot.home.zygoteScopeCount)
                         + "  " + (fromCache ? "cache=hit" : "cache=miss")
+                        + "\ntransport=" + config.transport
                         + "\nbridge_service=" + config.bridgeService
                         + "  zygote=" + (snapshot.home == null ? "unknown" : snapshot.home.zygoteState)
                         + "  refresh=" + config.refreshMs + "ms"

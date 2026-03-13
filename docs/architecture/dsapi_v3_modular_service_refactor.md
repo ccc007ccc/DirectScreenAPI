@@ -68,6 +68,22 @@ Core 提供 `ServiceRegistry`：
   - 服务注册表
   - UI 数据拼装
 
+### 2.3 SELinux（不修改 policy 的路线）
+
+约束：不随 DSAPI 模块分发 `sepolicy.rule/service_contexts`，避免被软件检测或造成系统侧策略变化。
+
+影响：普通 app 进程可能无法直接 `ServiceManager.getService("dsapi.core")`。
+
+路线：对齐 LSPosed 的思路，避免让 untrusted_app 去查找自定义 service：
+
+1. Manager 默认不做 `ServiceManager.getService("dsapi.core")` 作为唯一路径
+1. 走 zygote：Zygisk 在 zygote 权限阶段拿到 `dsapi.core` 的 binder 句柄，并在 Manager 进程内写入：
+   - `preAppSpecialize` 获取 binder 并保存
+   - `postAppSpecialize` 等待 ClassLoader 就绪后调用 `InjectedCoreBinder.setFromZygisk(...)`
+1. `parasitic host + HostHandshakeService` 仅作为诊断/辅助路径（例如某些 ROM Zygisk 行为异常时排查用）
+
+说明：这不是降级，而是把“特权能力”固定在特权域内，UI 只做展示与交互。
+
 
 ## 3. 状态模型（单一状态源）
 
@@ -159,4 +175,8 @@ Core 提供 `ServiceRegistry`：
   - 规范：Binder Core serviceName 固定为 `dsapi.core`，并在 KSU/Manager 两端限制 bridge service 必须为 `dsapi.*` 命名空间，避免遗留配置（例如 `assetatlas`）导致 UI/模块互相不一致。
   - 收敛：GPU demo 控制面统一走 bridge Binder（`demo aidl ...` 以及 `demo start/stop/status/cmd` 均转发到 Binder），删除旧的独立进程 demo 路线，避免“双模式”。
   - 性能：`TouchUiGpuPresenter` 渲染线程改为 `Choreographer` VSync 驱动（替代 sleep 限帧），并支持 `frame_rate=current/auto` 跟随系统刷新率。
-  - 稳定：runtime release 目录默认固定为 `r0`（避免 /data/adb/dsapi/runtime/releases 目录累积），seed sync marker 引入 `module.prop versionCode` 作为变更检测来源，保证内容更新可被同步。
+  - 稳定：runtime release 目录默认固定为 `stable`（避免 /data/adb/dsapi/runtime/releases 目录累积且避免被旧 releaseId 覆盖），seed sync marker 引入 `module.prop versionCode` 作为变更检测来源，保证内容更新可被同步。
+  - 走 zygote：Manager 核心 binder 注入改为 Zygisk 主路径：
+    - `preAppSpecialize` 获取 `daemon_binder` 并保存。
+    - `postAppSpecialize` 等待 Application 与 ClassLoader 就绪后调用 `InjectedCoreBinder.setFromZygisk(...)`。
+    - Manager 不再依赖 `ServiceManager.find`，无需修改 SELinux policy。

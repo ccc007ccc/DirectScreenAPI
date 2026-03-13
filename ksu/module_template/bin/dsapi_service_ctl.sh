@@ -117,7 +117,7 @@ ui_start() {
     return 0
   fi
   if [ "$ui_state" = "running" ] && [ "$ui_visible" != "1" ]; then
-    dsapi_manager_force_foreground "$(dsapi_manager_main_component)" >/dev/null 2>&1 || true
+    dsapi_manager_force_foreground "$(dsapi_manager_main_component)" "$bridge_service" "$refresh_ms" zygote >/dev/null 2>&1 || true
     ui_status="$(ui_status_kv)"
     ui_visible="$(dsapi_kv_get visible "$ui_status")"
     [ -n "$ui_visible" ] || ui_visible="0"
@@ -151,7 +151,7 @@ ui_start() {
   fi
 
   if ! dsapi_manager_is_foreground "$ui_pkg"; then
-    dsapi_manager_force_foreground "$ui_comp" >/dev/null 2>&1 || true
+    dsapi_manager_force_foreground "$ui_comp" "$bridge_service" "$refresh_ms" zygote >/dev/null 2>&1 || true
   fi
 
   ui_retry=0

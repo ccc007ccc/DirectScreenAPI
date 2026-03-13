@@ -18,6 +18,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 final class ZygoteAgentServer {
+    private static final String MANAGER_PACKAGE = "org.directscreenapi.manager";
     private final String zygoteServiceName;
     private final String daemonServiceName;
     private final String readyFilePath;
@@ -256,6 +257,11 @@ final class ZygoteAgentServer {
         if (pkg.isEmpty()) {
             pkg = "*";
         }
+        // 默认 fail-closed：仅允许白名单 scope，避免注入所有进程带来稳定性/性能风险。
+        // Manager 例外：必须可注入，否则 UI 无法拿到核心 Binder 做控制面。
+        if (MANAGER_PACKAGE.equals(pkg)) {
+            return new Decision(true, "allow_manager");
+        }
 
         ScopeRule best = null;
         for (ScopeRule rule : loadScopeRules()) {
@@ -267,7 +273,7 @@ final class ZygoteAgentServer {
             }
         }
         if (best == null) {
-            return new Decision(true, "allow_default");
+            return new Decision(false, "deny_default");
         }
         if (best.allow) {
             return new Decision(true, "allow_scope");

@@ -15,24 +15,23 @@ final class DsapiCtlClient {
     }
 
     CmdResult run(String... args) {
-        BridgeExecAttempt bridgeAttempt = runViaBridge(args);
-        if (bridgeAttempt.result != null) {
-            return withFriendlyHint(bridgeAttempt.result);
+        BridgeExecAttempt attempt = runViaBridge(args);
+        if (attempt.result != null) {
+            return withFriendlyHint(attempt.result);
         }
 
         StringBuilder out = new StringBuilder();
         out.append("bridge_offline=1");
-        if (bridgeAttempt.error != null) {
+        if (attempt.error != null) {
             out.append("\nbridge_error=")
-                    .append(bridgeAttempt.error.getClass().getName())
+                    .append(attempt.error.getClass().getName())
                     .append(':')
-                    .append(bridgeAttempt.error.getMessage());
+                    .append(attempt.error.getMessage());
         }
-        out.append("\nfix_hint=当前管理器仅支持 LSP 风格单契约: ICoreService + exec_v2");
-        out.append("\nfix_hint2=请确认 bridge 已升级并重启: /data/adb/modules/directscreenapi/bin/dsapi_service_ctl.sh bridge restart ")
-                .append(config.bridgeService);
+        out.append("\nfix_hint=当前管理器走 zygote 注入：Zygisk 在 Manager 启动时注入 core binder（不改 SELinux、无需 root）");
+        out.append("\nfix_hint2=请确认 KSU 已启用 Zygisk，并重启 zygote/系统后再打开管理器");
         out.append("\nfix_hint_service=当前 binder_service=").append(config.bridgeService);
-        out.append("\nfix_hint3=查看桥接日志: /data/adb/dsapi/log/manager_bridge.log");
+        out.append("\nfix_hint3=查看注入日志: /data/adb/dsapi/log/zygisk_loader.log");
         return withFriendlyHint(new CmdResult(255, out.toString()));
     }
 
@@ -108,21 +107,15 @@ final class DsapiCtlClient {
             }
         }
 
-        String serviceName = config.bridgeService == null ? "" : config.bridgeService.trim();
-        if (serviceName.isEmpty()) {
-            return BridgeExecAttempt.failure(new IOException("bridge_service_missing"));
+        IBinder injected = InjectedCoreBinder.get();
+        if (injected == null) {
+            return BridgeExecAttempt.failure(new IOException("bridge_binder_not_injected"));
         }
-
-        return runViaBinder(serviceName, args);
+        return runViaBinder(injected, args);
     }
 
-    private BridgeExecAttempt runViaBinder(String serviceName, String... args) {
+    private BridgeExecAttempt runViaBinder(IBinder binder, String... args) {
         try {
-            IBinder binder = queryServiceBinder(serviceName);
-            if (binder == null) {
-                return BridgeExecAttempt.failure(new IOException("bridge_service_not_found"));
-            }
-
             BridgeInfo info = transactGetInfo(binder);
             if (info == null) {
                 return BridgeExecAttempt.failure(new IOException("bridge_contract_info_unavailable"));
@@ -241,16 +234,6 @@ final class DsapiCtlClient {
                 }
             }
         }
-    }
-
-    private static IBinder queryServiceBinder(String serviceName) throws Exception {
-        Class<?> serviceManager = Class.forName("android.os.ServiceManager");
-        java.lang.reflect.Method getService = serviceManager.getMethod("getService", String.class);
-        Object binder = getService.invoke(null, serviceName);
-        if (binder instanceof IBinder) {
-            return (IBinder) binder;
-        }
-        return null;
     }
 
     static String joinSpace(String[] array) {

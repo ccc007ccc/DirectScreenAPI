@@ -1,6 +1,7 @@
 package org.directscreenapi.adapter;
 
 import android.content.Context;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.os.Binder;
@@ -8,6 +9,7 @@ import android.os.IBinder;
 import android.os.Parcel;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
+import android.os.SystemClock;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -72,6 +74,8 @@ final class BridgeControlServer {
 
     private static final String MANAGER_PACKAGE = "org.directscreenapi.manager";
     private static final String MANAGER_MAIN_COMPONENT = "org.directscreenapi.manager/.MainActivity";
+    private static final String PACKAGES_LIST_FILE = "/data/system/packages.list";
+    private static final int SHELL_UID = 2000;
 
     private final String ctlPath;
     private final String serviceName;
@@ -81,6 +85,9 @@ final class BridgeControlServer {
     private final Object demoLock = new Object();
     private GpuVsyncDemoExperiment gpuDemoRuntime;
     private final DsapiServiceRegistry serviceRegistry = new DsapiServiceRegistry();
+    // Binder 调用方校验：即便 SELinux 放行 untrusted_app_all，也只允许 Manager 自身 UID 调用敏感接口。
+    private volatile int managerAppId = -1;
+    private volatile long managerAppIdLastProbeUptimeMs = 0L;
 
     BridgeControlServer(String ctlPath, String serviceName, String readyFilePath) {
         this.ctlPath = ctlPath;
@@ -2272,6 +2279,105 @@ final class BridgeControlServer {
         return null;
     }
 
+    private int resolveManagerAppId() {
+        int cached = managerAppId;
+        if (cached > 0) {
+            return cached;
+        }
+        long now = SystemClock.uptimeMillis();
+        if (now - managerAppIdLastProbeUptimeMs < 2000L) {
+            return cached;
+        }
+        managerAppIdLastProbeUptimeMs = now;
+
+        int appId = -1;
+        try {
+            Context context = resolveBridgeContext();
+            if (context != null) {
+                PackageManager pm = context.getPackageManager();
+                if (pm != null) {
+                    ApplicationInfo ai = pm.getApplicationInfo(MANAGER_PACKAGE, 0);
+                    if (ai != null && ai.uid > 0) {
+                        appId = ai.uid % 100000;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        if (appId <= 0) {
+            int uidFromList = readAppIdFromPackagesList(MANAGER_PACKAGE);
+            if (uidFromList > 0) {
+                appId = uidFromList % 100000;
+            }
+        }
+
+        if (appId > 0) {
+            managerAppId = appId;
+        }
+        return managerAppId;
+    }
+
+    private static int readAppIdFromPackagesList(String pkg) {
+        if (pkg == null || pkg.trim().isEmpty()) {
+            return -1;
+        }
+        File f = new File(PACKAGES_LIST_FILE);
+        if (!f.isFile()) {
+            return -1;
+        }
+        BufferedReader br = null;
+        try {
+            br = new BufferedReader(new InputStreamReader(new FileInputStream(f), StandardCharsets.UTF_8));
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (!line.startsWith(pkg)) {
+                    continue;
+                }
+                // packages.list 典型格式：
+                // <pkg> <uid/appId> <debug> <dataDir> <seinfo> <gids...>
+                // 这里只需要第二列。
+                String[] parts = line.split("\\s+");
+                if (parts.length < 2) {
+                    continue;
+                }
+                if (!pkg.equals(parts[0])) {
+                    continue;
+                }
+                try {
+                    return Integer.parseInt(parts[1]);
+                } catch (Throwable ignored) {
+                    return -1;
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (br != null) {
+                try {
+                    br.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return -1;
+    }
+
+    private void enforceManagerOrRootCaller(String op) {
+        int uid = Binder.getCallingUid();
+        if (uid == 0) {
+            return;
+        }
+        if (uid == SHELL_UID) {
+            return;
+        }
+        int appId = uid % 100000;
+        int expected = resolveManagerAppId();
+        if (expected > 0 && expected == appId) {
+            return;
+        }
+        throw new SecurityException("permission_denied op=" + sanitizeToken(op) + " uid=" + uid + " expected_app_id=" + expected);
+    }
+
     private boolean isPackageInstalled(String pkg) {
         if (pkg == null || pkg.trim().isEmpty()) {
             return false;
@@ -2421,35 +2527,27 @@ final class BridgeControlServer {
         syncRuntimeSeedReleases();
         File currentDsapid = new File(CURRENT_DIR + "/bin/dsapid");
         boolean currentReady = currentDsapid.isFile() && currentDsapid.canExecute();
-        String activeId = resolveActiveReleaseId();
-
-        File latest = resolveLatestRuntimeRelease();
-        if (latest != null) {
-            String latestId = latest.getName();
-            if (!currentReady || !latestId.equals(activeId)) {
-                if (switchCurrentRelease(latest)) {
-                    writeText(new File(ACTIVE_RELEASE_FILE), latestId + "\n");
-                    return;
-                }
-            }
-        }
-
-        if (currentReady) {
-            return;
-        }
-
-        if (!activeId.isEmpty()) {
-            File activeDir = new File(RELEASES_DIR, activeId);
+        String activeIdFile = readFirstLine(new File(ACTIVE_RELEASE_FILE));
+        if (!activeIdFile.isEmpty()) {
+            File activeDir = new File(RELEASES_DIR, activeIdFile);
             if (hasRuntimeBins(activeDir) && switchCurrentRelease(activeDir)) {
-                writeText(new File(ACTIVE_RELEASE_FILE), activeId + "\n");
+                writeText(new File(ACTIVE_RELEASE_FILE), activeIdFile + "\n");
                 return;
             }
         }
 
-        if (latest == null) {
+        // 若 current 已可用，优先保持不变（避免被旧 releases 目录中的“字典序更大”条目覆盖）。
+        if (currentReady) {
+            String inferred = resolveActiveReleaseId();
+            if (!inferred.isEmpty()) {
+                writeText(new File(ACTIVE_RELEASE_FILE), inferred + "\n");
+            }
             return;
         }
-        if (switchCurrentRelease(latest)) {
+
+        // current 不可用时再退化到 latest。
+        File latest = resolveLatestRuntimeRelease();
+        if (latest != null && switchCurrentRelease(latest)) {
             writeText(new File(ACTIVE_RELEASE_FILE), latest.getName() + "\n");
         }
     }
@@ -2878,6 +2976,10 @@ final class BridgeControlServer {
                     reply.writeString(BridgeContract.DESCRIPTOR_MANAGER);
                 }
                 return true;
+            }
+            // 除了纯接口探测，其它事务都要求调用方是 root 或 Manager。
+            if (code != BridgeContract.TRANSACTION_GET_INFO && code != CoreContract.TRANSACTION_CORE_GET_INFO) {
+                enforceManagerOrRootCaller("transact:" + code);
             }
             if (code == CoreContract.TRANSACTION_CORE_GET_INFO) {
                 if (data == null || reply == null || !enforceBridgeInterface(data)) {

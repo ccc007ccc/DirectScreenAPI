@@ -312,6 +312,7 @@ public final class LogsActivity extends Activity {
                         + "  module_count=" + (home == null ? "0" : home.moduleCount)
                         + "  daemon_registry=" + (home == null ? "0" : home.daemonModuleCount)
                         + "  z_scope=" + (home == null ? "0" : home.zygoteScopeCount)
+                        + "\ntransport=" + config.transport
                         + "\nbridge_service=" + config.bridgeService
                         + "  zygote=" + (home == null ? "unknown" : home.zygoteState)
                         + "  refresh=" + config.refreshMs + "ms"
