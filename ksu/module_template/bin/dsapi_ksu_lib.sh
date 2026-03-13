@@ -42,7 +42,7 @@ MANAGER_BRIDGE_PID_FILE="$RUN_DIR/manager_bridge.pid"
 MANAGER_BRIDGE_SERVICE_FILE="$RUN_DIR/manager_bridge.service"
 MANAGER_BRIDGE_READY_FILE="$RUN_DIR/manager_bridge.ready"
 MANAGER_BRIDGE_LOG_FILE="$LOG_DIR/manager_bridge.log"
-MANAGER_BRIDGE_DEFAULT_SERVICE="assetatlas"
+MANAGER_BRIDGE_DEFAULT_SERVICE="dsapi.core"
 ZYGOTE_AGENT_PID_FILE="$RUN_DIR/zygote_agent.pid"
 ZYGOTE_AGENT_SERVICE_FILE="$RUN_DIR/zygote_agent.service"
 ZYGOTE_AGENT_DAEMON_FILE="$RUN_DIR/zygote_agent.daemon_service"
@@ -54,6 +54,7 @@ LAST_ERROR_FILE="$STATE_DIR/last_error.kv"
 MANAGER_PACKAGE_DEFAULT="org.directscreenapi.manager"
 MANAGER_MAIN_ACTIVITY_DEFAULT=".MainActivity"
 MANAGER_APK_FILE="$MODROOT/manager.apk"
+MANAGER_APK_STAMP_FILE="$STATE_DIR/manager_apk.stamp"
 
 dsapi_now() {
   date '+%Y-%m-%d %H:%M:%S'
@@ -195,15 +196,40 @@ dsapi_manager_pkg_installed() {
   return 1
 }
 
+dsapi_file_fingerprint() {
+  dsapi_file="$1"
+  [ -f "$dsapi_file" ] || return 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$dsapi_file" 2>/dev/null | awk '{print $1}' | tr -d '\r'
+    return 0
+  fi
+  if command -v cksum >/dev/null 2>&1; then
+    cksum "$dsapi_file" 2>/dev/null | awk '{print $1 ":" $2}' | tr -d '\r'
+    return 0
+  fi
+  ls -ln "$dsapi_file" 2>/dev/null | awk '{print $5 ":" $6 ":" $7 ":" $8}' | tr -d '\r'
+}
+
 dsapi_manager_ensure_installed() {
   dsapi_pkg="${1:-$(dsapi_manager_package_name)}"
   dsapi_apk="${2:-$MANAGER_APK_FILE}"
+  dsapi_installed=0
   if dsapi_manager_pkg_installed "$dsapi_pkg"; then
-    return 0
+    dsapi_installed=1
   fi
+
   if [ ! -f "$dsapi_apk" ]; then
+    if [ "$dsapi_installed" = "1" ]; then
+      return 0
+    fi
     dsapi_log "ksu_dsapi_error=manager_apk_missing_for_auto_install package=$dsapi_pkg path=$dsapi_apk"
     return 2
+  fi
+
+  dsapi_apk_fp="$(dsapi_file_fingerprint "$dsapi_apk" 2>/dev/null || true)"
+  dsapi_prev_fp="$(cat "$MANAGER_APK_STAMP_FILE" 2>/dev/null | tr -d '\r' || true)"
+  if [ "$dsapi_installed" = "1" ] && [ -n "$dsapi_apk_fp" ] && [ "$dsapi_apk_fp" = "$dsapi_prev_fp" ]; then
+    return 0
   fi
 
   if command -v pm >/dev/null 2>&1; then
@@ -222,6 +248,9 @@ dsapi_manager_ensure_installed() {
   fi
 
   if dsapi_manager_pkg_installed "$dsapi_pkg"; then
+    if [ -n "$dsapi_apk_fp" ]; then
+      echo "$dsapi_apk_fp" >"$MANAGER_APK_STAMP_FILE" 2>/dev/null || true
+    fi
     return 0
   fi
   dsapi_log "ksu_dsapi_error=manager_auto_install_failed package=$dsapi_pkg path=$dsapi_apk"
@@ -467,13 +496,17 @@ dsapi_runtime_seed_sync() {
     fi
   done
 
-  dsapi_seed_fp="$(dsapi_runtime_seed_fingerprint "$dsapi_seed_root")"
   dsapi_marker_file="$STATE_DIR/runtime_seed_sync.marker"
-  dsapi_marker_want="$MODROOT|$dsapi_latest|$dsapi_seed_count|$dsapi_seed_fp"
+  # 仅基于 release 目录元信息做增量判断，避免每次 action 都遍历大文件做 cksum。
+  dsapi_mod_vc="$(dsapi_file_kv_get "$MODROOT/module.prop" versionCode)"
+  [ -n "$dsapi_mod_vc" ] || dsapi_mod_vc="-"
+  dsapi_marker_want="$MODROOT|$dsapi_latest|$dsapi_seed_count|$dsapi_mod_vc"
   dsapi_marker_cur="$(cat "$dsapi_marker_file" 2>/dev/null || true)"
+  dsapi_active_now="$(dsapi_runtime_active_release_id)"
   if [ -n "$dsapi_latest" ] \
     && [ "$dsapi_marker_cur" = "$dsapi_marker_want" ] \
-    && [ -d "$RELEASES_DIR/$dsapi_latest" ]; then
+    && [ -d "$RELEASES_DIR/$dsapi_latest" ] \
+    && [ "$dsapi_active_now" = "$dsapi_latest" ]; then
     trap - EXIT INT TERM
     rmdir "$dsapi_lock_dir" >/dev/null 2>&1 || true
     return 0
@@ -492,6 +525,7 @@ dsapi_runtime_seed_sync() {
       return 2
     fi
     chmod 0755 "$dsapi_tmp/bin/dsapid" "$dsapi_tmp/bin/dsapictl" 2>/dev/null || true
+    chmod 0755 "$dsapi_tmp/bin/dsapi_touch_demo" 2>/dev/null || true
     chmod 0755 "$dsapi_tmp/capabilities/"*.sh 2>/dev/null || true
 
     if [ -d "$dsapi_dst" ]; then
@@ -566,9 +600,72 @@ dsapi_find_app_process() {
   return 1
 }
 
+dsapi_bridge_exec_ctl() {
+  dsapi_service="${1:-$(dsapi_manager_bridge_service_get)}"
+  shift || true
+  case "$dsapi_service" in
+    ''|*' '*|*$'\t'*|*$'\r'*|*$'\n'*) dsapi_service="$(dsapi_manager_bridge_service_get)" ;;
+  esac
+
+  dsapi_adapter_dex="$(dsapi_active_android_dex)"
+  dsapi_app_process="$(dsapi_find_app_process 2>/dev/null || true)"
+  dsapi_main_class="org.directscreenapi.adapter.AndroidAdapterMain"
+  if [ -z "$dsapi_adapter_dex" ] || [ ! -f "$dsapi_adapter_dex" ]; then
+    dsapi_log "ksu_dsapi_error=bridge_exec_adapter_dex_missing path=$dsapi_adapter_dex"
+    return 2
+  fi
+  if [ -z "$dsapi_app_process" ] || [ ! -x "$dsapi_app_process" ]; then
+    dsapi_log "ksu_dsapi_error=bridge_exec_app_process_missing"
+    return 2
+  fi
+
+  CLASSPATH="$dsapi_adapter_dex" "$dsapi_app_process" /system/bin "$dsapi_main_class" bridge-exec "$dsapi_service" "$@"
+}
+
+dsapi_demo_status_via_bridge_kv() {
+  dsapi_bridge_status="$(dsapi_manager_bridge_status_kv)"
+  dsapi_bridge_state="$(dsapi_kv_get state "$dsapi_bridge_status")"
+  dsapi_bridge_service="$(dsapi_kv_get service "$dsapi_bridge_status")"
+  [ -n "$dsapi_bridge_service" ] || dsapi_bridge_service="$MANAGER_BRIDGE_DEFAULT_SERVICE"
+  if [ "$dsapi_bridge_state" != "running" ] && [ "$dsapi_bridge_state" != "starting" ]; then
+    return 1
+  fi
+
+  dsapi_reply="$(dsapi_bridge_exec_ctl "$dsapi_bridge_service" demo status 2>/dev/null || true)"
+  dsapi_line="$(printf '%s\n' "$dsapi_reply" | grep '^ksu_dsapi_demo ' | tail -n 1 || true)"
+  [ -n "$dsapi_line" ] || return 1
+  echo "${dsapi_line#ksu_dsapi_demo }"
+}
+
+dsapi_demo_status_kv() {
+  dsapi_bridge_demo="$(dsapi_demo_status_via_bridge_kv 2>/dev/null || true)"
+  if [ -n "$dsapi_bridge_demo" ]; then
+    echo "$dsapi_bridge_demo"
+    return 0
+  fi
+  echo "state=stopped pid=- mode=gpu_demo"
+}
+
 dsapi_daemon_start() {
-  dsapi_bin="$(dsapi_active_bin dsapid)"
-  if [ -z "$dsapi_bin" ] || [ ! -x "$dsapi_bin" ]; then
+  dsapi_runtime_bin=""
+  dsapi_active_dir="$(dsapi_runtime_active_dir)"
+  if [ -n "$dsapi_active_dir" ] && [ -x "$dsapi_active_dir/bin/dsapid" ]; then
+    dsapi_runtime_bin="$dsapi_active_dir/bin/dsapid"
+  fi
+
+  dsapi_module_bin=""
+  if [ -x "$MODROOT/bin/dsapid" ]; then
+    dsapi_module_bin="$MODROOT/bin/dsapid"
+  fi
+
+  dsapi_candidates=""
+  if [ -n "$dsapi_runtime_bin" ]; then
+    dsapi_candidates="$dsapi_runtime_bin"
+  fi
+  if [ -n "$dsapi_module_bin" ] && [ "$dsapi_module_bin" != "$dsapi_runtime_bin" ]; then
+    dsapi_candidates="$dsapi_candidates $dsapi_module_bin"
+  fi
+  if [ -z "$dsapi_candidates" ]; then
     dsapi_log "ksu_dsapi_error=dsapid_missing"
     return 2
   fi
@@ -582,22 +679,34 @@ dsapi_daemon_start() {
 
   rm -f "$DAEMON_SOCKET" "$RUN_DIR/dsapi.data.sock"
 
-  nohup "$dsapi_bin" \
-    --control-socket "$DAEMON_SOCKET" \
-    --data-socket "$DAEMON_SOCKET" \
-    --unified-socket 1 \
-    --render-output-dir "$BASE_DIR/render" \
-    --module-root-dir "$MODULES_DIR" \
-    --module-state-root-dir "$MODULE_STATE_ROOT" \
-    --module-disabled-dir "$MODULE_DISABLED_DIR" \
-    --module-registry-file "$STATE_DIR/module_registry.db" \
-    --module-scope-file "$STATE_DIR/module_scope.db" \
-    --module-action-timeout-sec "${DSAPI_MODULE_ACTION_TIMEOUT_SEC:-60}" \
-    >>"$DAEMON_LOG_FILE" 2>&1 &
-  dsapi_pid="$!"
-  echo "$dsapi_pid" >"$DAEMON_PID_FILE"
-  sleep 0.1
-  dsapi_is_running "$dsapi_pid"
+  dsapi_last_err=""
+  for dsapi_bin in $dsapi_candidates; do
+    nohup "$dsapi_bin" \
+      --control-socket "$DAEMON_SOCKET" \
+      --data-socket "$DAEMON_SOCKET" \
+      --unified-socket 1 \
+      --render-output-dir "$BASE_DIR/render" \
+      --module-root-dir "$MODULES_DIR" \
+      --module-state-root-dir "$MODULE_STATE_ROOT" \
+      --module-disabled-dir "$MODULE_DISABLED_DIR" \
+      --module-registry-file "$STATE_DIR/module_registry.db" \
+      --module-scope-file "$STATE_DIR/module_scope.db" \
+      --module-action-timeout-sec "${DSAPI_MODULE_ACTION_TIMEOUT_SEC:-60}" \
+      >>"$DAEMON_LOG_FILE" 2>&1 &
+    dsapi_pid="$!"
+    sleep 0.12
+    if dsapi_is_running "$dsapi_pid"; then
+      echo "$dsapi_pid" >"$DAEMON_PID_FILE"
+      return 0
+    fi
+    # 启动失败，避免残留脏 pidfile。
+    dsapi_stop_pid "$dsapi_pid" >/dev/null 2>&1 || true
+    dsapi_last_err="bin_failed=$dsapi_bin"
+  done
+
+  rm -f "$DAEMON_PID_FILE"
+  dsapi_log "ksu_dsapi_error=daemon_start_failed attempted=$(dsapi_value_tokenize "$dsapi_candidates") detail=${dsapi_last_err:-unknown}"
+  return 2
 }
 
 dsapi_daemon_stop() {
@@ -620,12 +729,15 @@ dsapi_manager_bridge_stop() {
 }
 
 dsapi_manager_bridge_service_get() {
+  # 仅允许 dsapi.* 命名空间，避免误用系统 service（例如 assetatlas）导致 UI/模块互相不一致。
   if [ -f "$MANAGER_BRIDGE_SERVICE_FILE" ]; then
-    dsapi_service="$(cat "$MANAGER_BRIDGE_SERVICE_FILE" 2>/dev/null || true)"
-    if [ -n "$dsapi_service" ]; then
-      echo "$dsapi_service"
-      return 0
-    fi
+    dsapi_service="$(head -n 1 "$MANAGER_BRIDGE_SERVICE_FILE" 2>/dev/null | tr -d '\r' || true)"
+    case "$dsapi_service" in
+      dsapi.*)
+        echo "$dsapi_service"
+        return 0
+        ;;
+    esac
   fi
   echo "$MANAGER_BRIDGE_DEFAULT_SERVICE"
 }
@@ -655,8 +767,8 @@ dsapi_manager_bridge_status_kv() {
       echo "state=starting pid=$dsapi_pid reason=ready_not_confirmed service=$dsapi_service"
       return 0
     fi
-    rm -f "$MANAGER_BRIDGE_READY_FILE"
-    echo "state=error pid=$dsapi_pid reason=stale_pid service=$dsapi_service"
+    rm -f "$MANAGER_BRIDGE_PID_FILE" "$MANAGER_BRIDGE_READY_FILE"
+    echo "state=stopped pid=- reason=stale_pid_cleaned service=$dsapi_service"
     return 0
   fi
   echo "state=stopped pid=- service=$dsapi_service"
@@ -682,7 +794,7 @@ EOF
     return 0
   fi
   case "$dsapi_line" in
-    *org.directscreenapi.daemon.IDaemonService*) return 0 ;;
+    *org.directscreenapi.core.ICoreService*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -693,7 +805,7 @@ dsapi_manager_bridge_start() {
     ''|*' '*|*$'\t'*|*$'\r'*|*$'\n'*) return 2 ;;
   esac
   if ! dsapi_manager_bridge_is_name_usable "$dsapi_service"; then
-    dsapi_log "ksu_dsapi_error=manager_bridge_service_conflict service=$dsapi_service expected=org.directscreenapi.daemon.IDaemonService"
+    dsapi_log "ksu_dsapi_error=manager_bridge_service_conflict service=$dsapi_service expected=org.directscreenapi.core.ICoreService"
     return 2
   fi
 
@@ -829,7 +941,7 @@ dsapi_manager_host_status_kv() {
       return 0
     fi
     rm -f "$MANAGER_HOST_PID_FILE" "$MANAGER_HOST_READY_FILE"
-    echo "state=error pid=$dsapi_pid mode=parasitic_host reason=stale_pid bridge_service=$dsapi_bridge_service visible=$dsapi_visible"
+    echo "state=stopped pid=- mode=parasitic_host reason=stale_pid_cleaned bridge_service=$dsapi_bridge_service visible=$dsapi_visible"
     return 0
   fi
   echo "state=stopped pid=- mode=parasitic_host bridge_service=$dsapi_bridge_service visible=$dsapi_visible"
@@ -875,11 +987,22 @@ dsapi_manager_host_start() {
 
   dsapi_status="$(dsapi_manager_host_status_kv)"
   dsapi_state="$(dsapi_kv_get state "$dsapi_status")"
-  if [ "$dsapi_state" = "running" ]; then
-    dsapi_manager_host_stop >/dev/null 2>&1 || true
+  dsapi_cur_bridge="$(dsapi_kv_get bridge_service "$dsapi_status")"
+  [ -n "$dsapi_cur_bridge" ] || dsapi_cur_bridge="$dsapi_bridge_service"
+  if [ "$dsapi_state" = "running" ] && [ "$dsapi_cur_bridge" = "$dsapi_bridge_service" ]; then
+    if ! dsapi_manager_is_foreground "$dsapi_pkg"; then
+      dsapi_manager_force_foreground "$dsapi_comp" >/dev/null 2>&1 || true
+    fi
+    if [ -f "$MANAGER_HOST_PID_FILE" ]; then
+      dsapi_pid="$(cat "$MANAGER_HOST_PID_FILE" 2>/dev/null || true)"
+      [ -n "$dsapi_pid" ] && echo "$dsapi_pid" >"$CAP_UI_PID_FILE"
+    fi
+    return 0
   fi
 
-  dsapi_manager_host_stop >/dev/null 2>&1 || true
+  if [ "$dsapi_state" = "running" ] || [ "$dsapi_state" = "starting" ]; then
+    dsapi_manager_host_stop >/dev/null 2>&1 || true
+  fi
   rm -f "$MANAGER_HOST_READY_FILE"
   CLASSPATH="$dsapi_adapter_dex" nohup "$dsapi_app_process" /system/bin --nice-name=DSAPIManagerHost "$dsapi_main_class" \
     manager-host "$dsapi_ctl" "$dsapi_comp" "$dsapi_pkg" "$dsapi_bridge_service" "$dsapi_refresh_ms" "$MANAGER_HOST_READY_FILE" \
@@ -925,11 +1048,13 @@ dsapi_zygote_agent_service_get() {
 
 dsapi_zygote_agent_daemon_get() {
   if [ -f "$ZYGOTE_AGENT_DAEMON_FILE" ]; then
-    dsapi_service="$(cat "$ZYGOTE_AGENT_DAEMON_FILE" 2>/dev/null || true)"
-    [ -n "$dsapi_service" ] && {
-      echo "$dsapi_service"
-      return 0
-    }
+    dsapi_service="$(head -n 1 "$ZYGOTE_AGENT_DAEMON_FILE" 2>/dev/null | tr -d '\r' || true)"
+    case "$dsapi_service" in
+      dsapi.*)
+        echo "$dsapi_service"
+        return 0
+        ;;
+    esac
   fi
   dsapi_manager_bridge_service_get
 }
@@ -957,7 +1082,7 @@ dsapi_zygote_agent_status_kv() {
       return 0
     fi
     rm -f "$ZYGOTE_AGENT_PID_FILE" "$ZYGOTE_AGENT_READY_FILE"
-    echo "state=error pid=$dsapi_pid reason=stale_pid service=$dsapi_service daemon_service=$dsapi_daemon_service"
+    echo "state=stopped pid=- reason=stale_pid_cleaned service=$dsapi_service daemon_service=$dsapi_daemon_service"
     return 0
   fi
   echo "state=stopped pid=- service=$dsapi_service daemon_service=$dsapi_daemon_service"
@@ -1710,14 +1835,6 @@ dsapi_module_install_zip() {
   echo "$dsapi_id"
 }
 
-dsapi_module_zip_entries() {
-  for dsapi_zip in "$MODROOT/module_zips"/*.zip; do
-    [ -f "$dsapi_zip" ] || continue
-    dsapi_name="$(basename "$dsapi_zip" .zip)"
-    echo "$dsapi_name|$dsapi_zip"
-  done | sort
-}
-
 dsapi_kv_get() {
   dsapi_key="$1"
   dsapi_line="$2"
@@ -1739,11 +1856,14 @@ dsapi_daemon_status_kv() {
       echo "state=running pid=$dsapi_pid reason=-"
       return 0
     fi
-    echo "state=error pid=$dsapi_pid reason=stale_pid"
+    rm -f "$DAEMON_PID_FILE"
+    rm -f "$DAEMON_SOCKET" "$RUN_DIR/dsapi.data.sock" 2>/dev/null || true
+    echo "state=stopped pid=- reason=stale_pid_cleaned"
     return 0
   fi
   if [ -S "$DAEMON_SOCKET" ]; then
-    echo "state=error pid=- reason=pid_missing"
+    rm -f "$DAEMON_SOCKET" "$RUN_DIR/dsapi.data.sock" 2>/dev/null || true
+    echo "state=stopped pid=- reason=stale_socket_cleaned"
     return 0
   fi
   echo "state=stopped pid=- reason=-"

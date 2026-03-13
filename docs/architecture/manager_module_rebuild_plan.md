@@ -62,7 +62,7 @@
   - `android/ksu_manager/src/main/java/org/directscreenapi/manager/CtlParsers.java`
   - `android/ksu_manager/src/main/java/org/directscreenapi/manager/UiStyles.java`
 - 标准模块示例：
-  - `ksu/module_examples/test.touch_demo/*`
+  - `ksu/module_examples/dsapi.demo.touch_ui/*`（MODULE_ID=`dsapi.demo.touch_ui`）
   - `ksu/module_examples/system.ime/*`
 - 构建与默认策略：
   - `scripts/build_ksu_module.sh`

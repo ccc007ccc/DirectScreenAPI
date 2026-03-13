@@ -67,11 +67,11 @@ ime_proxy_mode() {
 }
 
 ime_bridge_service() {
-  svc="${IME_PROXY_BRIDGE_SERVICE:-${DSAPI_MANAGER_BRIDGE_SERVICE:-assetatlas}}"
+  svc="${IME_PROXY_BRIDGE_SERVICE:-${DSAPI_MANAGER_BRIDGE_SERVICE:-dsapi.core}}"
   if [ -n "$svc" ]; then
     echo "$svc"
   else
-    echo "assetatlas"
+    echo "dsapi.core"
   fi
 }
 

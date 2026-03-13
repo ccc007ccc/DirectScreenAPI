@@ -1,0 +1,6 @@
+MODULE_ID=dsapi.demo.hello_consumer
+MODULE_NAME=Hello Consumer Demo
+MODULE_KIND=demo
+MODULE_VERSION=1.0.0
+MODULE_DESC=模块即接口：从 ServiceRegistry 获取 Binder 并调用 echo。
+MAIN_CAP_ID=dsapi.demo.hello_consumer

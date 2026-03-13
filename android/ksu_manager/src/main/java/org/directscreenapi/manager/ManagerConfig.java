@@ -11,7 +11,7 @@ final class ManagerConfig {
     static final String KEY_REFRESH_MS = "refresh_ms";
 
     static final String DEFAULT_CTL_PATH = "/data/adb/modules/directscreenapi/bin/dsapi_service_ctl.sh";
-    static final String DEFAULT_BRIDGE_SERVICE = "assetatlas";
+    static final String DEFAULT_BRIDGE_SERVICE = "dsapi.core";
     static final int DEFAULT_REFRESH_MS = 1000;
 
     String ctlPath = DEFAULT_CTL_PATH;
@@ -90,6 +90,10 @@ final class ManagerConfig {
     private static String normalizeServiceName(String raw, String fallback) {
         String v = normalizeString(raw, fallback);
         if (v.indexOf(' ') >= 0 || v.indexOf('\t') >= 0 || v.indexOf('\r') >= 0 || v.indexOf('\n') >= 0) {
+            return fallback;
+        }
+        // 仅允许 dsapi.* 命名空间，避免误配置系统 service（例如 assetatlas）导致桥接失效。
+        if (!v.startsWith("dsapi.")) {
             return fallback;
         }
         return v;

@@ -26,7 +26,10 @@ if [ "$(dsapi_enabled_get)" = "1" ]; then
   if ! dsapi_cap_start_by_id core.daemon >/dev/null 2>&1; then
     dsapi_log "ksu_dsapi_error=service_daemon_start_failed capability=core.daemon"
   fi
+  # 同步 display 状态到 daemon，保证触摸/坐标在旋转时自动更新。
+  dsapi_cap_start_by_id core.display_watch >/dev/null 2>&1 || true
 else
+  dsapi_cap_stop_by_id core.display_watch >/dev/null 2>&1 || true
   if ! dsapi_cap_stop_by_id core.daemon >/dev/null 2>&1; then
     dsapi_log "ksu_dsapi_error=service_daemon_stop_failed capability=core.daemon"
   fi

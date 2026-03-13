@@ -15,6 +15,11 @@ artifacts/
 third_party/android-sdk/
 data/local/tmp/
 .codex_tmp_*
+.cache/
+
+# Local debug screenshots
+dsapi_shot*.png
+dsapi_title_zoom*.png
 
 # Generated lockfiles outside Rust
 *.log

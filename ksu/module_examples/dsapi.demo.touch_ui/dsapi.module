@@ -1,0 +1,6 @@
+MODULE_ID=dsapi.demo.touch_ui
+MODULE_NAME=Touch UI Demo
+MODULE_KIND=demo
+MODULE_VERSION=1.0.0
+MODULE_DESC=GPU 触摸窗口演示模块：渲染 + 触摸 + blur + 横竖屏。
+MAIN_CAP_ID=dsapi.demo.touch_ui

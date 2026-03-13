@@ -221,7 +221,7 @@ bool resolve_parcel_api(JNIEnv* env, ParcelApi* api) {
   if (env == nullptr || api == nullptr) {
     return false;
   }
-  std::memset(api, 0, sizeof(ParcelApi));
+  *api = ParcelApi{};
   api->parcel_cls = env->FindClass("android/os/Parcel");
   if (api->parcel_cls == nullptr) {
     clear_exception(env, "FindClass(Parcel)");

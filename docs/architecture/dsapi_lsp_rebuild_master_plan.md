@@ -248,11 +248,12 @@ DSAPI 对应重构方向：
   - 完成：移除 `ksu/module_template/bin/dsapi_manager_bridge_handler.sh` 与 `dsapi_manager_bridge_server.sh` 旧 socket/nc 桥接脚本链。
   - 完成：控制面状态输出去 socket 字段（`status` / `core.daemon detail`）。
   - 完成：Manager 侧移除页面自动轮询（`Main/Modules/Logs` 不再 `postDelayed` 周期刷新）。
-  - 完成：Bridge descriptor 统一到 `org.directscreenapi.daemon.IDaemonService`，并同步 KSU service 名称可用性校验。
-  - 完成：Bridge 控制面去 shell 化（Java 直连实现 `module zip-list/install-zip/install-builtin` 与 `runtime activate/install/remove`）。
+- 完成：Core descriptor 统一到 `org.directscreenapi.core.ICoreService`，并同步 KSU service 名称可用性校验。
+  - 完成：Bridge 控制面去 shell 化（Java 直连实现 `module install-zip/install` 与 `runtime activate/install/remove`）。
+  - 完成：外置模块化收敛，移除 `module zip-list/install-builtin` 与核心包内置 `module_zips`。
   - 完成：移除 `BridgeControlServer` 中 `execCtlV2ViaShell` 与 v2 包络反解析 dead code。
-  - 完成：`DsapiCtlClient` 契约提示同步为 `IDaemonService + exec_v2`。
-  - 完成：新增 `ParasiticManagerHost`，`ui start/stop/status` 主路径切换为 `app_process --nice-name=shell` 宿主启动。
+- 完成：`DsapiCtlClient` 契约提示同步为 `ICoreService + exec_v2`。
+  - 完成：新增 `ParasiticManagerHost`，`ui start/stop/status` 主路径切换为 `app_process --nice-name=DSAPIManagerHost` 宿主启动。
   - 完成：新增 `ZygoteAgentServer` + `ZygoteAgentContract`，提供 `daemon_binder` 代理服务（`zygote-agent`）。
   - 完成：`dsapi_service_ctl.sh` 增加 `zygote start|stop|restart|status`，`status` 输出纳入 `ksu_dsapi_zygote`。
   - 完成：zygote scope 裁决链（`policy-list/set/clear`）落地，统一持久化 `state/zygote_scope.db` 并接入 `should_inject` 事务。

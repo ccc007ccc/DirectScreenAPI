@@ -663,19 +663,17 @@ fn dispatch_accepted_client(
                         socket_kind
                     }
                 );
-                match thread::Builder::new()
-                    .name(overflow_name)
-                    .spawn(move || {
-                        let _active_guard = ActiveConnectionGuard::new(active_connections_ref);
-                        dispatch_worker_job(
-                            rejected,
-                            &engine_ref,
-                            &shutdown_ref,
-                            &shutdown_waker_ref,
-                            &lifecycle_ref,
-                            command_max_bytes,
-                        );
-                    }) {
+                match thread::Builder::new().name(overflow_name).spawn(move || {
+                    let _active_guard = ActiveConnectionGuard::new(active_connections_ref);
+                    dispatch_worker_job(
+                        rejected,
+                        &engine_ref,
+                        &shutdown_ref,
+                        &shutdown_waker_ref,
+                        &lifecycle_ref,
+                        command_max_bytes,
+                    );
+                }) {
                     Ok(_) => {
                         eprintln!(
                             "daemon_warn=dispatch_queue_busy socket_kind={} active={} limit={} fallback=overflow_thread",

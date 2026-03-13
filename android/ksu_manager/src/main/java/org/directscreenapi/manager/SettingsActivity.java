@@ -182,7 +182,7 @@ public final class SettingsActivity extends Activity {
     private View buildConfigCard() {
         LinearLayout card = UiStyles.makeCard(this);
         card.addView(UiStyles.makeSectionTitle(this, "管理器配置"));
-        TextView desc = UiStyles.makeSectionDesc(this, "保存 ctl/binder bridge/刷新参数，供主页与模块页复用");
+        TextView desc = UiStyles.makeSectionDesc(this, "保存 ctl/binder bridge/刷新参数，供管理器页面复用");
         card.addView(desc, UiStyles.topMargin(this, 2));
 
         ctlPathEdit = makeLabeledInput(card, "ctl 路径", "例如 /data/adb/modules/directscreenapi/bin/dsapi_service_ctl.sh", false);
@@ -484,7 +484,7 @@ public final class SettingsActivity extends Activity {
         spinnerUpdating = false;
 
         if (modules.isEmpty()) {
-            envHintView.setText("暂无模块，可去“模块页”导入 ZIP 或安装内置模块。");
+            envHintView.setText("暂无模块，请先安装外部模块 ZIP。");
         } else {
             envHintView.setText("当前模块: " + selectedModuleId);
         }
@@ -501,7 +501,7 @@ public final class SettingsActivity extends Activity {
         }
 
         if (envRows.isEmpty()) {
-            TextView empty = UiStyles.makeSectionDesc(this, "该模块未定义 env.spec。\n如果是测试模块，请先安装最新内置 ZIP。");
+            TextView empty = UiStyles.makeSectionDesc(this, "该模块未定义 env.spec。\n请检查模块包内是否包含 env.spec。");
             envContainer.addView(empty);
             return;
         }

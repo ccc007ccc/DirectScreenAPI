@@ -1,0 +1,6 @@
+MODULE_ID=dsapi.demo.gpu_window
+MODULE_NAME=GPU Window Demo
+MODULE_KIND=demo
+MODULE_VERSION=1.0.0
+MODULE_DESC=GPU 窗口演示模块：通过 Core(Binder) 直连控制 in-proc demo。
+MAIN_CAP_ID=dsapi.demo.gpu_window

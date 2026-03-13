@@ -106,7 +106,7 @@
     - `sh -n ksu/module_template/bin/dsapi_ksu_lib.sh`
     - 设备侧 `ui start/status/stop` 全链路通过
     - 设备侧 `zygote start/status/stop` 全链路通过
-    - 设备侧 `module action-run test.touch_demo start/status/stop/status` 全链路通过
+    - 设备侧 `module action-run dsapi.demo.touch_ui start/status/stop/status` 全链路通过
 
 ---
 

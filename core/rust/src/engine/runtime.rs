@@ -136,10 +136,7 @@ pub struct RuntimeEngine {
 
 impl Default for RuntimeEngine {
     fn default() -> Self {
-        Self::new_with_config(
-            "artifacts/render",
-            ModuleRuntimeConfig::default(),
-        )
+        Self::new_with_config("artifacts/render", ModuleRuntimeConfig::default())
     }
 }
 
@@ -896,10 +893,9 @@ impl RuntimeEngine {
         request: &str,
         peer_uid: u32,
     ) -> Result<String, ModuleRuntimeRpcError> {
-        let mut guard = self
-            .module_runtime
-            .lock()
-            .map_err(|_| ModuleRuntimeRpcError::internal("ksu_dsapi_error=module_runtime_poisoned"))?;
+        let mut guard = self.module_runtime.lock().map_err(|_| {
+            ModuleRuntimeRpcError::internal("ksu_dsapi_error=module_runtime_poisoned")
+        })?;
         guard.handle_rpc(request, peer_uid)
     }
 }
@@ -1012,17 +1008,17 @@ mod tests {
     #[test]
     fn module_registry_roundtrip_in_runtime_engine() {
         let engine = RuntimeEngine::default();
-        let mut record = crate::engine::ModuleRecord::new("test.touch_demo");
+        let mut record = crate::engine::ModuleRecord::new("dsapi.demo.touch_ui");
         record.state = ModuleState::Running;
         record.reason = "-".to_string();
         engine.module_registry_upsert(record).expect("upsert");
 
         let listed = engine.module_registry_list().expect("list");
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, "test.touch_demo");
+        assert_eq!(listed[0].id, "dsapi.demo.touch_ui");
 
         let reloaded = engine
-            .module_registry_reload("test.touch_demo")
+            .module_registry_reload("dsapi.demo.touch_ui")
             .expect("reload");
         assert_eq!(reloaded.state, ModuleState::Ready);
     }

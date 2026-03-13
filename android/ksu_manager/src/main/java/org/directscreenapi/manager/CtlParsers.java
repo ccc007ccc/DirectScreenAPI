@@ -85,28 +85,6 @@ final class CtlParsers {
         return out;
     }
 
-    static List<ModuleZipRow> parseModuleZipRows(String output) {
-        List<ModuleZipRow> out = new ArrayList<ModuleZipRow>();
-        if (output == null || output.isEmpty()) {
-            return out;
-        }
-        String[] lines = output.split("\\r?\\n");
-        for (String line : lines) {
-            if (!line.startsWith("module_zip_row=")) {
-                continue;
-            }
-            String[] parts = line.substring("module_zip_row=".length()).split("\\|", -1);
-            if (parts.length < 2) {
-                continue;
-            }
-            ModuleZipRow row = new ModuleZipRow();
-            row.name = parts[0];
-            row.path = parts[1];
-            out.add(row);
-        }
-        return out;
-    }
-
     static final class ModuleRow {
         String id = "";
         String name = "";
@@ -139,8 +117,4 @@ final class CtlParsers {
         String description = "";
     }
 
-    static final class ModuleZipRow {
-        String name = "";
-        String path = "";
-    }
 }

@@ -8,7 +8,7 @@
 
 ## 2. 当前基线（2026-03-08）
 
-- Bridge 契约已统一为 `org.directscreenapi.daemon.IDaemonService`。
+- Core 契约已统一为 `org.directscreenapi.core.ICoreService`。
 - Manager 与 Bridge 已通过 `exec_v2` 进行 AIDL 控制面通信。
 - Bridge 侧已去除 `module install/runtime activate` 的 shell 回落，改为 Java 直连文件事务 + daemon RPC。
 - 仍待替换的 shell 依赖：
@@ -16,7 +16,7 @@
 
 ## 2.1 本轮推进（2026-03-08 夜）
 
-- `ui start/stop` 主链已切换为 `ParasiticManagerHost`（`app_process --nice-name=shell`）。
+- `ui start/stop` 主链已切换为 `ParasiticManagerHost`（`app_process --nice-name=DSAPIManagerHost`）。
 - 新增 `zygote-agent` Binder 代理服务：
   - descriptor: `org.directscreenapi.daemon.IZygoteAgent`
   - transact: `get_info` / `get_daemon_binder` / `should_inject`

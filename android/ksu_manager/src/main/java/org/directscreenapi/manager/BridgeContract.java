@@ -3,7 +3,8 @@ package org.directscreenapi.manager;
 import android.os.IBinder;
 
 final class BridgeContract {
-    static final String DESCRIPTOR_MANAGER = "org.directscreenapi.daemon.IDaemonService";
+    // V3：Manager 只认 Core 契约（稳定标识）。
+    static final String DESCRIPTOR_MANAGER = "org.directscreenapi.core.ICoreService";
 
     static final int TRANSACTION_GET_INFO = IBinder.FIRST_CALL_TRANSACTION;
     static final int TRANSACTION_EXEC_V2 = IBinder.FIRST_CALL_TRANSACTION + 1;

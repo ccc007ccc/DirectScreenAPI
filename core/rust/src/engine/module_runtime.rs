@@ -188,13 +188,10 @@ impl ModuleRuntime {
                 .registry
                 .get(module_id)
                 .unwrap_or_else(|| ModuleRecord::new(module_id));
-            rec.name = module_meta_with_alias(
-                &meta_file,
-                "MODULE_NAME",
-                "DSAPI_MODULE_NAME",
-                module_id,
-            );
-            rec.kind = module_meta_with_alias(&meta_file, "MODULE_KIND", "DSAPI_MODULE_KIND", "module");
+            rec.name =
+                module_meta_with_alias(&meta_file, "MODULE_NAME", "DSAPI_MODULE_NAME", module_id);
+            rec.kind =
+                module_meta_with_alias(&meta_file, "MODULE_KIND", "DSAPI_MODULE_KIND", "module");
             rec.version =
                 module_meta_with_alias(&meta_file, "MODULE_VERSION", "DSAPI_MODULE_VERSION", "0");
             rec.main_cap =
@@ -443,7 +440,11 @@ impl ModuleRuntime {
                 Ok(format!("module_env=unset id={} key={}", module_id, key))
             }
             "MODULE_SCOPE_LIST" => {
-                let module_id = if tokens.is_empty() { None } else { Some(tokens[0]) };
+                let module_id = if tokens.is_empty() {
+                    None
+                } else {
+                    Some(tokens[0])
+                };
                 self.scope_list_lines(module_id)
             }
             "MODULE_SCOPE_SET" => {
@@ -454,9 +455,9 @@ impl ModuleRuntime {
                 }
                 let module_id = tokens[0];
                 let pkg = tokens[1];
-                let user_id = tokens[2]
-                    .parse::<i32>()
-                    .map_err(|_| ModuleRuntimeRpcError::invalid("ksu_dsapi_error=scope_user_invalid"))?;
+                let user_id = tokens[2].parse::<i32>().map_err(|_| {
+                    ModuleRuntimeRpcError::invalid("ksu_dsapi_error=scope_user_invalid")
+                })?;
                 let allow = parse_scope_allow(tokens[3]).ok_or_else(|| {
                     ModuleRuntimeRpcError::invalid("ksu_dsapi_error=scope_action_invalid")
                 })?;
@@ -497,9 +498,10 @@ impl ModuleRuntime {
 
     fn module_status_line(&mut self, module_id: &str) -> Result<String, ModuleRuntimeRpcError> {
         self.refresh_status(module_id)?;
-        let rec = self.registry.get(module_id).ok_or_else(|| {
-            ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found")
-        })?;
+        let rec = self
+            .registry
+            .get(module_id)
+            .ok_or_else(|| ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found"))?;
         let pid = module_last_pid(module_id, &self.cfg.module_state_root_dir);
         Ok(format!(
             "state={} pid={} reason={} enabled={} main_cap={}",
@@ -513,9 +515,10 @@ impl ModuleRuntime {
 
     fn module_row_line(&mut self, module_id: &str) -> Result<String, ModuleRuntimeRpcError> {
         self.refresh_status(module_id)?;
-        let rec = self.registry.get(module_id).ok_or_else(|| {
-            ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found")
-        })?;
+        let rec = self
+            .registry
+            .get(module_id)
+            .ok_or_else(|| ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found"))?;
         Ok(format!(
             "module_row={}|{}|{}|{}|{}|{}|{}|{}|{}",
             rec.id,
@@ -532,9 +535,10 @@ impl ModuleRuntime {
 
     fn module_detail_lines(&mut self, module_id: &str) -> Result<String, ModuleRuntimeRpcError> {
         self.refresh_status(module_id)?;
-        let rec = self.registry.get(module_id).ok_or_else(|| {
-            ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found")
-        })?;
+        let rec = self
+            .registry
+            .get(module_id)
+            .ok_or_else(|| ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found"))?;
         let meta_file = self.module_dir(module_id).join("dsapi.module");
         let desc = module_meta_with_alias(&meta_file, "MODULE_DESC", "DSAPI_MODULE_DESC", "-");
 
@@ -547,7 +551,8 @@ impl ModuleRuntime {
             format!("status={}", self.module_status_line(module_id)?),
         ];
 
-        let actions = action_entries(&self.module_dir(module_id).join("actions")).unwrap_or_default();
+        let actions =
+            action_entries(&self.module_dir(module_id).join("actions")).unwrap_or_default();
         for act in actions {
             lines.push(format!(
                 "module_action_row={}|{}|{}",
@@ -574,11 +579,17 @@ impl ModuleRuntime {
 
     fn module_start(&mut self, module_id: &str) -> Result<(), ModuleRuntimeRpcError> {
         self.ensure_module_exists(module_id)?;
-        let rec = self.registry.get(module_id).ok_or_else(|| {
-            ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found")
-        })?;
+        let rec = self
+            .registry
+            .get(module_id)
+            .ok_or_else(|| ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found"))?;
         if !rec.enabled {
-            self.record_error(module_id, "E_MODULE_DISABLED", "module_disabled", "op=start");
+            self.record_error(
+                module_id,
+                "E_MODULE_DISABLED",
+                "module_disabled",
+                "op=start",
+            );
             return Err(ModuleRuntimeRpcError::invalid(
                 "ksu_dsapi_error=module_disabled",
             ));
@@ -638,13 +649,17 @@ impl ModuleRuntime {
     fn module_disable(&mut self, module_id: &str) -> Result<(), ModuleRuntimeRpcError> {
         self.ensure_module_exists(module_id)?;
         let _ = self.module_stop(module_id);
-        let flag = self.cfg.module_disabled_dir.join(format!("{}.disabled", module_id));
+        let flag = self
+            .cfg
+            .module_disabled_dir
+            .join(format!("{}.disabled", module_id));
         write_atomic_text(&flag, "1\n").map_err(|_| {
             ModuleRuntimeRpcError::internal("ksu_dsapi_error=module_disable_write_failed")
         })?;
-        let mut rec = self.registry.get(module_id).ok_or_else(|| {
-            ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found")
-        })?;
+        let mut rec = self
+            .registry
+            .get(module_id)
+            .ok_or_else(|| ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found"))?;
         rec.enabled = false;
         rec.state = ModuleState::Disabled;
         rec.reason = "disabled".to_string();
@@ -655,11 +670,15 @@ impl ModuleRuntime {
 
     fn module_enable(&mut self, module_id: &str) -> Result<(), ModuleRuntimeRpcError> {
         self.ensure_module_exists(module_id)?;
-        let flag = self.cfg.module_disabled_dir.join(format!("{}.disabled", module_id));
+        let flag = self
+            .cfg
+            .module_disabled_dir
+            .join(format!("{}.disabled", module_id));
         let _ = fs::remove_file(flag);
-        let mut rec = self.registry.get(module_id).ok_or_else(|| {
-            ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found")
-        })?;
+        let mut rec = self
+            .registry
+            .get(module_id)
+            .ok_or_else(|| ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found"))?;
         rec.enabled = true;
         if rec.state == ModuleState::Disabled {
             rec.state = ModuleState::Installed;
@@ -675,7 +694,11 @@ impl ModuleRuntime {
         let _ = self.module_stop(module_id);
         let _ = fs::remove_dir_all(self.module_dir(module_id));
         let _ = fs::remove_dir_all(self.module_state_dir(module_id));
-        let _ = fs::remove_file(self.cfg.module_disabled_dir.join(format!("{}.disabled", module_id)));
+        let _ = fs::remove_file(
+            self.cfg
+                .module_disabled_dir
+                .join(format!("{}.disabled", module_id)),
+        );
         let _ = self.registry.remove(module_id);
         self.scope_rules.remove(module_id);
         self.persist_registry_best_effort();
@@ -686,7 +709,8 @@ impl ModuleRuntime {
     fn module_action_list_lines(&self, module_id: &str) -> Result<String, ModuleRuntimeRpcError> {
         self.ensure_module_exists_ro(module_id)?;
         let mut lines: Vec<String> = Vec::new();
-        let actions = action_entries(&self.module_dir(module_id).join("actions")).unwrap_or_default();
+        let actions =
+            action_entries(&self.module_dir(module_id).join("actions")).unwrap_or_default();
         for act in actions {
             lines.push(format!(
                 "module_action_row={}|{}|{}",
@@ -748,12 +772,17 @@ impl ModuleRuntime {
         let env_file = self.module_dir(module_id).join("env.values");
         let mut map = read_env_values_map(&env_file).unwrap_or_default();
         map.insert(key.to_string(), value.to_string());
-        write_env_values_map(&env_file, &map)
-            .map_err(|_| ModuleRuntimeRpcError::internal("ksu_dsapi_error=module_env_set_failed"))?;
+        write_env_values_map(&env_file, &map).map_err(|_| {
+            ModuleRuntimeRpcError::internal("ksu_dsapi_error=module_env_set_failed")
+        })?;
         Ok(())
     }
 
-    fn module_env_unset(&mut self, module_id: &str, key: &str) -> Result<(), ModuleRuntimeRpcError> {
+    fn module_env_unset(
+        &mut self,
+        module_id: &str,
+        key: &str,
+    ) -> Result<(), ModuleRuntimeRpcError> {
         self.ensure_module_exists(module_id)?;
         if !env_key_valid(key) {
             return Err(ModuleRuntimeRpcError::invalid(
@@ -893,9 +922,10 @@ impl ModuleRuntime {
     }
 
     fn refresh_status(&mut self, module_id: &str) -> Result<(), ModuleRuntimeRpcError> {
-        let mut rec = self.registry.get(module_id).ok_or_else(|| {
-            ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found")
-        })?;
+        let mut rec = self
+            .registry
+            .get(module_id)
+            .ok_or_else(|| ModuleRuntimeRpcError::invalid("ksu_dsapi_error=module_not_found"))?;
         rec.enabled = !self.is_module_disabled(module_id);
         if !rec.enabled {
             rec.state = ModuleState::Disabled;
@@ -950,7 +980,12 @@ impl ModuleRuntime {
         }
 
         if out.timed_out {
-            self.record_error(module_id, "E_ACTION_TIMEOUT", "module_action_timeout", "timeout");
+            self.record_error(
+                module_id,
+                "E_ACTION_TIMEOUT",
+                "module_action_timeout",
+                "timeout",
+            );
         } else {
             self.record_error(
                 module_id,
@@ -983,7 +1018,11 @@ impl ModuleRuntime {
         self.persist_registry_best_effort();
     }
 
-    fn exec_action(&self, module_id: &str, action_id: &str) -> Result<ExecOutput, ModuleRuntimeRpcError> {
+    fn exec_action(
+        &self,
+        module_id: &str,
+        action_id: &str,
+    ) -> Result<ExecOutput, ModuleRuntimeRpcError> {
         let action_file = self.action_file(module_id, action_id);
         if !action_file.exists() {
             return Err(ModuleRuntimeRpcError::invalid(format!(
@@ -1000,10 +1039,14 @@ impl ModuleRuntime {
         })
     }
 
-    fn exec_main_cap(&self, module_id: &str, func_name: &str) -> Result<ExecOutput, ModuleRuntimeRpcError> {
-        let cap_file = self.main_cap_file(module_id).ok_or_else(|| {
-            ModuleRuntimeRpcError::invalid("ksu_dsapi_error=main_cap_missing")
-        })?;
+    fn exec_main_cap(
+        &self,
+        module_id: &str,
+        func_name: &str,
+    ) -> Result<ExecOutput, ModuleRuntimeRpcError> {
+        let cap_file = self
+            .main_cap_file(module_id)
+            .ok_or_else(|| ModuleRuntimeRpcError::invalid("ksu_dsapi_error=main_cap_missing"))?;
         let script = format!(
             ". {}; if command -v {} >/dev/null 2>&1; then {} ; else exit 127; fi",
             shell_quote(cap_file.to_string_lossy().as_ref()),
@@ -1014,9 +1057,8 @@ impl ModuleRuntime {
         cmd.arg("-c").arg(script);
         cmd.current_dir(self.module_dir(module_id));
         self.apply_module_env(module_id, func_name, &mut cmd);
-        run_command_capture(cmd, self.cfg.action_timeout_sec).map_err(|_| {
-            ModuleRuntimeRpcError::internal("ksu_dsapi_error=module_cap_exec_failed")
-        })
+        run_command_capture(cmd, self.cfg.action_timeout_sec)
+            .map_err(|_| ModuleRuntimeRpcError::internal("ksu_dsapi_error=module_cap_exec_failed"))
     }
 
     fn apply_module_env(&self, module_id: &str, action_id: &str, cmd: &mut Command) {
@@ -1728,10 +1770,7 @@ fn find_app_process_bin() -> Option<String> {
 }
 
 fn trim_shell_value(raw: &str) -> String {
-    raw.trim()
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_string()
+    raw.trim().trim_matches('"').trim_matches('\'').to_string()
 }
 
 fn sanitize_token(raw: &str) -> String {

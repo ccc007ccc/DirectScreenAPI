@@ -47,6 +47,7 @@ final class BridgeControlServer {
     private static final String DAEMON_LOG_FILE = LOG_DIR + "/dsapid.log";
 
     private static final String UI_PID_FILE = RUN_DIR + "/cap_ui.pid";
+    private static final String DEMO_GPU_PID_FILE = RUN_DIR + "/gpu_demo.pid";
     private static final String MANAGER_HOST_PID_FILE = RUN_DIR + "/manager_host.pid";
     private static final String MANAGER_HOST_READY_FILE = RUN_DIR + "/manager_host.ready";
     private static final String MANAGER_HOST_LOG_FILE = LOG_DIR + "/manager_host.log";
@@ -77,6 +78,9 @@ final class BridgeControlServer {
     private final String readyFilePath;
     private Context bridgeContext;
     private Object serviceNotificationCallback;
+    private final Object demoLock = new Object();
+    private GpuVsyncDemoExperiment gpuDemoRuntime;
+    private final DsapiServiceRegistry serviceRegistry = new DsapiServiceRegistry();
 
     BridgeControlServer(String ctlPath, String serviceName, String readyFilePath) {
         this.ctlPath = ctlPath;
@@ -118,6 +122,23 @@ final class BridgeControlServer {
                 || value.indexOf('\t') >= 0
                 || value.indexOf('\r') >= 0
                 || value.indexOf('\n') >= 0;
+    }
+
+    private static String joinComma(List<String> items) {
+        if (items == null || items.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < items.size(); i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            String v = items.get(i);
+            if (v != null) {
+                sb.append(v);
+            }
+        }
+        return sb.toString();
     }
 
     private boolean registerService(String name, IBinder binder) {
@@ -313,6 +334,8 @@ final class BridgeControlServer {
                     return handleZygote(args);
                 case "capability":
                     return handleCapability(args);
+                case "demo":
+                    return handleDemo(args);
                 case "cmd":
                     return handleDaemonCmd(args);
                 default:
@@ -329,8 +352,25 @@ final class BridgeControlServer {
             return ok("ctl.start", "ksu_dsapi_status=running pid=" + readPid(DAEMON_PID_FILE) + " reason=-");
         }
 
-        String dsapidBin = resolveDsapidBin();
-        if (dsapidBin.isEmpty()) {
+        // Runtime/current 可能因为旧 release、损坏二进制或构建产物不兼容导致无法执行。
+        // 这里必须同时尝试 runtime 与 moduleRoot 里的 dsapid，保证 fail-closed 但不误伤可用路径。
+        ensureRuntimeCurrentRelease();
+        String runtimeBin = "";
+        File current = new File(CURRENT_DIR + "/bin/dsapid");
+        if (current.isFile() && current.canExecute()) {
+            runtimeBin = current.getAbsolutePath();
+        }
+        String moduleBin = resolveModuleDsapidBin();
+
+        List<String> candidates = new ArrayList<String>();
+        if (!runtimeBin.isEmpty()) {
+            candidates.add(runtimeBin);
+        }
+        if (!moduleBin.isEmpty() && !moduleBin.equals(runtimeBin)) {
+            candidates.add(moduleBin);
+        }
+
+        if (candidates.isEmpty()) {
             return error("ctl.start", 2, "ksu_dsapi_error=dsapid_missing");
         }
 
@@ -338,7 +378,7 @@ final class BridgeControlServer {
         new File(RUN_DIR + "/dsapi.data.sock").delete();
 
         List<String> cmd = new ArrayList<String>();
-        cmd.add(dsapidBin);
+        cmd.add(candidates.get(0));
         cmd.add("--control-socket");
         cmd.add(DAEMON_SOCKET);
         cmd.add("--data-socket");
@@ -366,15 +406,33 @@ final class BridgeControlServer {
             parent.mkdirs();
         }
 
-        Process p;
-        try {
-            ProcessBuilder pb = new ProcessBuilder(cmd);
-            pb.redirectErrorStream(true);
-            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile));
-            p = pb.start();
-        } catch (Throwable t) {
+        Process p = null;
+        Throwable lastErr = null;
+        String startedBin = cmd.get(0);
+        for (int i = 0; i < candidates.size(); i++) {
+            String bin = candidates.get(i);
+            cmd.set(0, bin);
+            try {
+                ProcessBuilder pb = new ProcessBuilder(cmd);
+                pb.redirectErrorStream(true);
+                pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile));
+                p = pb.start();
+                startedBin = bin;
+                lastErr = null;
+                break;
+            } catch (Throwable t) {
+                lastErr = t;
+            }
+        }
+        if (p == null) {
+            if (lastErr != null) {
+                return error("ctl.start", 2,
+                        "ksu_dsapi_error=daemon_start_failed"
+                                + " attempted=" + joinComma(candidates)
+                                + " error=" + lastErr.getClass().getName() + ":" + lastErr.getMessage());
+            }
             return error("ctl.start", 2,
-                    "ksu_dsapi_error=daemon_start_failed error=" + t.getClass().getName() + ":" + t.getMessage());
+                    "ksu_dsapi_error=daemon_start_failed attempted=" + joinComma(candidates));
         }
 
         int pid = getProcessPid(p);
@@ -385,7 +443,7 @@ final class BridgeControlServer {
         sleepSilently(120L);
         if (!isDaemonRunning()) {
             new File(DAEMON_PID_FILE).delete();
-            return error("ctl.start", 2, "ksu_dsapi_error=daemon_start_failed");
+            return error("ctl.start", 2, "ksu_dsapi_error=daemon_start_failed attempted=" + joinComma(candidates) + " bin=" + startedBin);
         }
 
         CmdResult sync = execDsapictl("MODULE_SYNC");
@@ -416,6 +474,7 @@ final class BridgeControlServer {
         new File(DAEMON_PID_FILE).delete();
         new File(DAEMON_SOCKET).delete();
         new File(RUN_DIR + "/dsapi.data.sock").delete();
+        stopGpuDemo();
         stopZygoteAgent();
         return ok("ctl.stop", "ksu_dsapi_status=stopped pid=- reason=manual_stop");
     }
@@ -519,19 +578,12 @@ final class BridgeControlServer {
                     return error("ctl.module.scope_clear", 2, "ksu_dsapi_error=module_id_missing");
                 }
                 return fromDsapictl("ctl.module.scope_clear", new String[]{"MODULE_SCOPE_CLEAR", args[2]});
-            case "zip-list":
-                return moduleZipList();
             case "install":
             case "install-zip":
                 if (args.length < 3) {
                     return error("ctl.module.install", 2, "ksu_dsapi_error=module_zip_missing");
                 }
                 return moduleInstallZip(args[2]);
-            case "install-builtin":
-                if (args.length < 3) {
-                    return error("ctl.module.install_builtin", 2, "ksu_dsapi_error=module_zip_name_missing");
-                }
-                return moduleInstallBuiltin(args[2]);
             default:
                 return error("ctl.module", 1, "ksu_dsapi_error=module_subcommand_invalid");
         }
@@ -761,47 +813,268 @@ final class BridgeControlServer {
         return error("ctl.capability", 1, "ksu_dsapi_error=capability_subcommand_invalid");
     }
 
-    private CtlV2Envelope moduleZipList() {
-        File zipDir = new File(moduleRootDir(), "module_zips");
-        File[] entries = zipDir.listFiles();
-        if (entries == null || entries.length == 0) {
-            return ok("ctl.module.zip_list", "");
+    private CtlV2Envelope handleDemo(String[] args) {
+        String sub = args.length >= 2 ? args[1] : "status";
+        if ("status".equals(sub)) {
+            return ok("ctl.demo.status", "ksu_dsapi_demo " + demoStatusLine());
         }
-        List<String> rows = new ArrayList<String>();
-        for (File file : entries) {
-            if (file == null || !file.isFile()) {
-                continue;
-            }
-            String name = file.getName();
-            if (!name.endsWith(".zip")) {
-                continue;
-            }
-            String shortName = name.substring(0, name.length() - 4);
-            rows.add("module_zip_row=" + shortName + "|" + file.getAbsolutePath());
+        if ("stop".equals(sub)) {
+            stopGpuDemo();
+            return ok("ctl.demo.stop", "ksu_dsapi_demo " + demoStatusLine());
         }
-        Collections.sort(rows);
-        StringBuilder body = new StringBuilder();
-        for (String row : rows) {
-            if (body.length() > 0) {
-                body.append('\n');
+        if ("start".equals(sub) || "run".equals(sub)) {
+            int width = parseUnsignedIntArg(args, 2, 0);
+            int height = parseUnsignedIntArg(args, 3, 0);
+            int zLayer = parseUnsignedIntArg(args, 4, 1_000_000);
+            String layerName = args.length >= 6 ? sanitizeLayerName(args[5]) : "DirectScreenAPI-GPU";
+            String runSeconds = args.length >= 7 ? args[6] : "0";
+            if (!isUnsignedFloat(runSeconds)) {
+                return error("ctl.demo.start", 2, "ksu_dsapi_error=demo_run_seconds_invalid");
             }
-            body.append(row);
+            CtlV2Envelope start = startGpuDemo(width, height, zLayer, layerName, runSeconds);
+            if (start.resultCode != 0) {
+                return start;
+            }
+            return ok("ctl.demo.start", "ksu_dsapi_demo " + demoStatusLine());
         }
-        return ok("ctl.module.zip_list", body.toString());
+        if ("cmd".equals(sub)) {
+            if (args.length < 3) {
+                return error("ctl.demo.cmd", 2, "ksu_dsapi_error=demo_cmd_missing");
+            }
+            StringBuilder cmd = new StringBuilder();
+            for (int i = 2; i < args.length; i++) {
+                if (i > 2) {
+                    cmd.append(' ');
+                }
+                cmd.append(args[i] == null ? "" : args[i]);
+            }
+            return demoCommand(cmd.toString());
+        }
+        if ("set-pos".equals(sub)) {
+            if (args.length < 4) {
+                return error("ctl.demo.set_pos", 2, "ksu_dsapi_error=demo_set_pos_args_missing");
+            }
+            return demoCommand("SET_POS " + args[2] + " " + args[3]);
+        }
+        if ("set-view".equals(sub)) {
+            if (args.length < 4) {
+                return error("ctl.demo.set_view", 2, "ksu_dsapi_error=demo_set_view_args_missing");
+            }
+            return demoCommand("SET_VIEW " + args[2] + " " + args[3]);
+        }
+        if ("set-color".equals(sub)) {
+            if (args.length < 5) {
+                return error("ctl.demo.set_color", 2, "ksu_dsapi_error=demo_set_color_args_missing");
+            }
+            String alpha = args.length >= 6 ? (" " + args[5]) : "";
+            return demoCommand("SET_COLOR " + args[2] + " " + args[3] + " " + args[4] + alpha);
+        }
+        if ("set-speed".equals(sub)) {
+            if (args.length < 3) {
+                return error("ctl.demo.set_speed", 2, "ksu_dsapi_error=demo_set_speed_args_missing");
+            }
+            return demoCommand("SET_SPEED " + args[2]);
+        }
+        return error("ctl.demo", 1, "ksu_dsapi_error=demo_subcommand_invalid");
     }
 
-    private CtlV2Envelope moduleInstallBuiltin(String zipName) {
-        String base = zipName == null ? "" : zipName.trim();
-        if (base.isEmpty()) {
-            return error("ctl.module.install_builtin", 2, "ksu_dsapi_error=module_zip_name_missing");
+    private CtlV2Envelope startGpuDemo(
+            int width,
+            int height,
+            int zLayer,
+            String layerName,
+            String runSeconds
+    ) {
+        synchronized (demoLock) {
+            if (gpuDemoRuntime != null && gpuDemoRuntime.isRunning()) {
+                return ok("ctl.demo.start", "ksu_dsapi_demo " + demoStatusLineLocked());
+            }
+
+            stopGpuDemoLocked();
+
+            float runSec = 0.0f;
+            try {
+                runSec = Float.parseFloat(runSeconds);
+            } catch (Throwable ignored) {
+            }
+            if (!Float.isFinite(runSec) || runSec < 0.0f) {
+                runSec = 0.0f;
+            }
+
+            GpuVsyncDemoExperiment runtime = new GpuVsyncDemoExperiment(
+                    Math.max(0, width),
+                    Math.max(0, height),
+                    Math.max(0, zLayer),
+                    sanitizeLayerName(layerName),
+                    runSec
+            );
+            try {
+                runtime.start();
+            } catch (Throwable t) {
+                runtime.stop();
+                return error(
+                        "ctl.demo.start",
+                        2,
+                        "ksu_dsapi_error=demo_start_failed error="
+                                + t.getClass().getName()
+                                + ":"
+                                + sanitizeToken(t.getMessage())
+                );
+            }
+            gpuDemoRuntime = runtime;
+            return ok("ctl.demo.start", "ksu_dsapi_demo " + demoStatusLineLocked());
         }
-        String fileName = base.endsWith(".zip") ? base : base + ".zip";
-        File zip = new File(new File(moduleRootDir(), "module_zips"), fileName);
-        if (!zip.isFile()) {
-            return error("ctl.module.install_builtin", 2,
-                    "ksu_dsapi_error=module_zip_not_found path=" + zip.getAbsolutePath());
+    }
+
+    private CtlV2Envelope demoCommand(String rawCommand) {
+        String cmd = normalizeDemoCommand(rawCommand);
+        if (cmd.isEmpty()) {
+            return error("ctl.demo.cmd", 2, "ksu_dsapi_error=demo_cmd_invalid");
         }
-        return moduleInstallZipInternal(zip, "ctl.module.install_builtin");
+        synchronized (demoLock) {
+            if (gpuDemoRuntime == null || !gpuDemoRuntime.isRunning()) {
+                return error("ctl.demo.cmd", 2, "ksu_dsapi_error=demo_not_running");
+            }
+            try {
+                String reply = gpuDemoRuntime.command(cmd);
+                if (!gpuDemoRuntime.isRunning()) {
+                    gpuDemoRuntime = null;
+                }
+                return ok(
+                        "ctl.demo.cmd",
+                        "demo_reply=" + sanitizeToken(reply) + "\nksu_dsapi_demo " + demoStatusLineLocked()
+                );
+            } catch (Throwable t) {
+                return error(
+                        "ctl.demo.cmd",
+                        2,
+                        "ksu_dsapi_error=demo_cmd_failed cmd="
+                                + sanitizeToken(cmd)
+                                + " error="
+                                + t.getClass().getName()
+                                + ":"
+                                + sanitizeToken(t.getMessage())
+                );
+            }
+        }
+    }
+
+    private void stopGpuDemo() {
+        synchronized (demoLock) {
+            stopGpuDemoLocked();
+        }
+    }
+
+    private void stopGpuDemoLocked() {
+        GpuVsyncDemoExperiment runtime = gpuDemoRuntime;
+        gpuDemoRuntime = null;
+        if (runtime != null) {
+            runtime.stop();
+        }
+        new File(DEMO_GPU_PID_FILE).delete();
+    }
+
+    private String demoStatusLine() {
+        synchronized (demoLock) {
+            return demoStatusLineLocked();
+        }
+    }
+
+    private String demoStatusLineLocked() {
+        if (gpuDemoRuntime != null && gpuDemoRuntime.isRunning()) {
+            String detail = gpuDemoRuntime.statusLine();
+            return detail + " pid=" + android.os.Process.myPid() + " mode=inproc";
+        }
+        new File(DEMO_GPU_PID_FILE).delete();
+        return "state=stopped pid=- mode=gpu_demo";
+    }
+
+    private static int parseUnsignedIntArg(String[] args, int index, int fallback) {
+        if (args == null || index >= args.length) {
+            return fallback;
+        }
+        String raw = args[index] == null ? "" : args[index].trim();
+        if (raw.isEmpty() || !isUint(raw)) {
+            return fallback;
+        }
+        try {
+            return Integer.parseInt(raw);
+        } catch (Throwable ignored) {
+            return fallback;
+        }
+    }
+
+    private static boolean isUnsignedFloat(String text) {
+        if (text == null || text.trim().isEmpty()) {
+            return false;
+        }
+        String v = text.trim();
+        boolean dotSeen = false;
+        for (int i = 0; i < v.length(); i++) {
+            char c = v.charAt(i);
+            if (c == '.') {
+                if (dotSeen) {
+                    return false;
+                }
+                dotSeen = true;
+                continue;
+            }
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String sanitizeLayerName(String raw) {
+        String v = raw == null ? "" : raw.trim();
+        if (v.isEmpty()) {
+            return "DirectScreenAPI-GPU";
+        }
+        if (v.length() > 80) {
+            v = v.substring(0, 80);
+        }
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < v.length(); i++) {
+            char c = v.charAt(i);
+            boolean safe = (c >= 'a' && c <= 'z')
+                    || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9')
+                    || c == '.'
+                    || c == '_'
+                    || c == '-';
+            out.append(safe ? c : '_');
+        }
+        String result = out.toString();
+        return result.isEmpty() ? "DirectScreenAPI-GPU" : result;
+    }
+
+    private static String normalizeDemoCommand(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String out = raw.replace('\n', ' ')
+                .replace('\r', ' ')
+                .replace('\t', ' ')
+                .trim();
+        if (out.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        boolean prevSpace = false;
+        for (int i = 0; i < out.length(); i++) {
+            char c = out.charAt(i);
+            if (c == ' ') {
+                if (!prevSpace) {
+                    sb.append(c);
+                }
+                prevSpace = true;
+            } else {
+                sb.append(c);
+                prevSpace = false;
+            }
+        }
+        return sb.toString().trim();
     }
 
     private CtlV2Envelope moduleInstallZip(String zipPath) {
@@ -1335,7 +1608,15 @@ final class BridgeControlServer {
         cmd.add("--socket");
         cmd.add(DAEMON_SOCKET);
         cmd.addAll(Arrays.asList(daemonArgs));
-        return runProcess(cmd, 15_000L);
+        CmdResult result = runProcess(cmd, 15_000L);
+        if (result.exitCode == 255 && bin.startsWith(CURRENT_DIR + "/")) {
+            String fallback = resolveModuleDsapictlBin();
+            if (!fallback.isEmpty() && !fallback.equals(bin)) {
+                cmd.set(0, fallback);
+                result = runProcess(cmd, 15_000L);
+            }
+        }
+        return result;
     }
 
     private String buildStatusBody() {
@@ -1345,6 +1626,7 @@ final class BridgeControlServer {
                 .append(" reason=").append(daemonReasonToken());
 
         out.append("\nksu_dsapi_ui ").append(uiStatusLine());
+        out.append("\nksu_dsapi_demo ").append(demoStatusLine());
         out.append("\nksu_dsapi_zygote ").append(zygoteAgentStatusLine());
         out.append("\nzygote_scope_count=").append(String.valueOf(countZygoteScopeRules()));
 
@@ -1576,7 +1858,7 @@ final class BridgeControlServer {
         List<String> cmd = new ArrayList<String>();
         cmd.add(appProcessBin);
         cmd.add("/system/bin");
-        cmd.add("--nice-name=shell");
+        cmd.add("--nice-name=DSAPIManagerHost");
         cmd.add("org.directscreenapi.adapter.AndroidAdapterMain");
         cmd.add("manager-host");
         cmd.add(ctlPath);
@@ -1854,7 +2136,7 @@ final class BridgeControlServer {
         List<String> cmd = new ArrayList<String>();
         cmd.add(appProcessBin);
         cmd.add("/system/bin");
-        cmd.add("--nice-name=shell");
+        cmd.add("--nice-name=DSAPIZygoteAgent");
         cmd.add("org.directscreenapi.adapter.AndroidAdapterMain");
         cmd.add("zygote-agent");
         cmd.add(zygoteService);
@@ -2105,11 +2387,15 @@ final class BridgeControlServer {
 
     private String resolveDsapictlBin() {
         File current = new File(CURRENT_DIR + "/bin/dsapictl");
-        if (current.isFile()) {
+        if (current.isFile() && current.canExecute()) {
             return current.getAbsolutePath();
         }
+        return resolveModuleDsapictlBin();
+    }
+
+    private String resolveModuleDsapictlBin() {
         File module = new File(moduleRootDir() + "/bin/dsapictl");
-        if (module.isFile()) {
+        if (module.isFile() && module.canExecute()) {
             return module.getAbsolutePath();
         }
         return "";
@@ -2117,14 +2403,117 @@ final class BridgeControlServer {
 
     private String resolveDsapidBin() {
         File current = new File(CURRENT_DIR + "/bin/dsapid");
-        if (current.isFile()) {
+        if (current.isFile() && current.canExecute()) {
             return current.getAbsolutePath();
         }
+        return resolveModuleDsapidBin();
+    }
+
+    private String resolveModuleDsapidBin() {
         File module = new File(moduleRootDir() + "/bin/dsapid");
-        if (module.isFile()) {
+        if (module.isFile() && module.canExecute()) {
             return module.getAbsolutePath();
         }
         return "";
+    }
+
+    private void ensureRuntimeCurrentRelease() {
+        syncRuntimeSeedReleases();
+        File currentDsapid = new File(CURRENT_DIR + "/bin/dsapid");
+        boolean currentReady = currentDsapid.isFile() && currentDsapid.canExecute();
+        String activeId = resolveActiveReleaseId();
+
+        File latest = resolveLatestRuntimeRelease();
+        if (latest != null) {
+            String latestId = latest.getName();
+            if (!currentReady || !latestId.equals(activeId)) {
+                if (switchCurrentRelease(latest)) {
+                    writeText(new File(ACTIVE_RELEASE_FILE), latestId + "\n");
+                    return;
+                }
+            }
+        }
+
+        if (currentReady) {
+            return;
+        }
+
+        if (!activeId.isEmpty()) {
+            File activeDir = new File(RELEASES_DIR, activeId);
+            if (hasRuntimeBins(activeDir) && switchCurrentRelease(activeDir)) {
+                writeText(new File(ACTIVE_RELEASE_FILE), activeId + "\n");
+                return;
+            }
+        }
+
+        if (latest == null) {
+            return;
+        }
+        if (switchCurrentRelease(latest)) {
+            writeText(new File(ACTIVE_RELEASE_FILE), latest.getName() + "\n");
+        }
+    }
+
+    private void syncRuntimeSeedReleases() {
+        File seedRoot = new File(moduleRootDir() + "/runtime_seed/releases");
+        if (!seedRoot.isDirectory()) {
+            return;
+        }
+        File releasesRoot = new File(RELEASES_DIR);
+        if (!releasesRoot.exists() && !releasesRoot.mkdirs()) {
+            return;
+        }
+        File[] entries = seedRoot.listFiles();
+        if (entries == null || entries.length == 0) {
+            return;
+        }
+        for (File src : entries) {
+            if (src == null || !src.isDirectory() || !hasRuntimeBins(src)) {
+                continue;
+            }
+            File dst = new File(releasesRoot, src.getName());
+            if (hasRuntimeBins(dst)) {
+                continue;
+            }
+            if (dst.exists() && !deleteTree(dst)) {
+                continue;
+            }
+            if (!copyTree(src, dst)) {
+                deleteTree(dst);
+                continue;
+            }
+            new File(dst, "bin/dsapid").setExecutable(true, false);
+            new File(dst, "bin/dsapictl").setExecutable(true, false);
+            new File(dst, "bin/dsapi_touch_demo").setExecutable(true, false);
+            setExecutableScripts(new File(dst, "capabilities"));
+        }
+    }
+
+    private File resolveLatestRuntimeRelease() {
+        File releasesRoot = new File(RELEASES_DIR);
+        File[] entries = releasesRoot.listFiles();
+        if (entries == null || entries.length == 0) {
+            return null;
+        }
+        File best = null;
+        for (File entry : entries) {
+            if (entry == null || !entry.isDirectory() || !hasRuntimeBins(entry)) {
+                continue;
+            }
+            if (best == null || entry.getName().compareTo(best.getName()) > 0) {
+                best = entry;
+            }
+        }
+        return best;
+    }
+
+    private static boolean hasRuntimeBins(File releaseDir) {
+        if (releaseDir == null || !releaseDir.isDirectory()) {
+            return false;
+        }
+        File dsapid = new File(releaseDir, "bin/dsapid");
+        File dsapictl = new File(releaseDir, "bin/dsapictl");
+        return dsapid.isFile() && dsapid.canExecute() && dsapictl.isFile() && dsapictl.canExecute();
     }
 
     private String resolveActiveReleaseId() {
@@ -2437,12 +2826,34 @@ final class BridgeControlServer {
     }
 
     private static boolean enforceBridgeInterface(Parcel data) {
-        if (data == null) {
+        return enforceAnyInterface(data, BridgeContract.DESCRIPTOR_MANAGER, CoreContract.DESCRIPTOR_CORE);
+    }
+
+    private static boolean enforceAnyInterface(Parcel data, String... descriptors) {
+        if (data == null || descriptors == null || descriptors.length == 0) {
             return false;
         }
+        int pos = 0;
         try {
-            data.enforceInterface(BridgeContract.DESCRIPTOR_MANAGER);
-            return true;
+            pos = data.dataPosition();
+        } catch (Throwable ignored) {
+        }
+        for (String desc : descriptors) {
+            if (desc == null || desc.trim().isEmpty()) {
+                continue;
+            }
+            try {
+                data.setDataPosition(pos);
+            } catch (Throwable ignored) {
+            }
+            try {
+                data.enforceInterface(desc);
+                return true;
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            data.setDataPosition(pos);
         } catch (Throwable ignored) {
         }
         return false;
@@ -2466,6 +2877,87 @@ final class BridgeControlServer {
                 if (reply != null) {
                     reply.writeString(BridgeContract.DESCRIPTOR_MANAGER);
                 }
+                return true;
+            }
+            if (code == CoreContract.TRANSACTION_CORE_GET_INFO) {
+                if (data == null || reply == null || !enforceBridgeInterface(data)) {
+                    return false;
+                }
+                reply.writeNoException();
+                reply.writeInt(CoreContract.CORE_INTERFACE_VERSION);
+                reply.writeString(CoreContract.CORE_INTERFACE_NAME);
+                reply.writeStringArray(new String[]{
+                        CoreContract.FEATURE_SERVICE_REGISTRY
+                });
+                return true;
+            }
+            if (code == CoreContract.TRANSACTION_REGISTRY_REGISTER) {
+                if (data == null || reply == null || !enforceBridgeInterface(data)) {
+                    return false;
+                }
+                String serviceId = data.readString();
+                int version = data.readInt();
+                IBinder binder = data.readStrongBinder();
+                String meta = data.readString();
+                int uid = Binder.getCallingUid();
+                int pid = Binder.getCallingPid();
+                int rc = 0;
+                String msg = "ok";
+                try {
+                    serviceRegistry.register(serviceId, version, binder, meta, uid, pid);
+                } catch (Throwable t) {
+                    rc = 2;
+                    msg = "registry_register_failed:" + t.getClass().getName() + ":" + t.getMessage();
+                }
+                reply.writeNoException();
+                reply.writeInt(rc);
+                reply.writeString(msg);
+                return true;
+            }
+            if (code == CoreContract.TRANSACTION_REGISTRY_GET) {
+                if (data == null || reply == null || !enforceBridgeInterface(data)) {
+                    return false;
+                }
+                String serviceId = data.readString();
+                DsapiServiceRegistry.Record rec = serviceRegistry.get(serviceId);
+                int rc = 0;
+                String msg = "ok";
+                if (rec == null || rec.binder == null) {
+                    rc = 1;
+                    msg = "not_found";
+                }
+                reply.writeNoException();
+                reply.writeInt(rc);
+                reply.writeString(msg);
+                reply.writeStrongBinder(rec == null ? null : rec.binder);
+                reply.writeInt(rec == null ? 0 : rec.version);
+                reply.writeString(rec == null ? "" : rec.meta);
+                return true;
+            }
+            if (code == CoreContract.TRANSACTION_REGISTRY_LIST) {
+                if (data == null || reply == null || !enforceBridgeInterface(data)) {
+                    return false;
+                }
+                List<String> rows = serviceRegistry.listRows();
+                reply.writeNoException();
+                reply.writeInt(0);
+                reply.writeString("ok");
+                reply.writeStringArray(rows.toArray(new String[0]));
+                return true;
+            }
+            if (code == CoreContract.TRANSACTION_REGISTRY_UNREGISTER) {
+                if (data == null || reply == null || !enforceBridgeInterface(data)) {
+                    return false;
+                }
+                String serviceId = data.readString();
+                boolean removed = false;
+                try {
+                    removed = serviceRegistry.unregister(serviceId);
+                } catch (Throwable ignored) {
+                }
+                reply.writeNoException();
+                reply.writeInt(removed ? 0 : 1);
+                reply.writeString(removed ? "ok" : "not_found");
                 return true;
             }
             if (code == BridgeContract.TRANSACTION_GET_INFO) {

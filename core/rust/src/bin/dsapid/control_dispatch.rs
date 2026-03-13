@@ -376,11 +376,8 @@ pub(super) fn handle_control_client(
                 resp
             }
             BinaryCommand::ModuleRpc { seq, payload } => {
-                let mut resp = BinaryResponse::with_status(
-                    seq,
-                    BinaryOpcode::ModuleRpc as u16,
-                    Status::Ok,
-                );
+                let mut resp =
+                    BinaryResponse::with_status(seq, BinaryOpcode::ModuleRpc as u16, Status::Ok);
                 match engine.module_rpc(&payload, peer_uid) {
                     Ok(body) => {
                         if !body.is_empty() {

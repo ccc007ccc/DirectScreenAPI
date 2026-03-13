@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class MainActivity extends Activity implements View.OnClickListener {
     private static final long START_BACK_GUARD_MS = 1500L;
+    private static final long BOOTSTRAP_REFRESH_DELAY_MS = 900L;
     private static final int ID_NAV_MODULES = 1001;
     private static final int ID_NAV_SETTINGS = 1002;
     private static final int ID_NAV_LOGS = 1003;
@@ -51,6 +52,15 @@ public final class MainActivity extends Activity implements View.OnClickListener
     private long createdUptimeMs;
 
     private volatile boolean destroyed;
+    private final Runnable bootstrapRefreshTask = new Runnable() {
+        @Override
+        public void run() {
+            if (destroyed) {
+                return;
+            }
+            refreshNow();
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -63,6 +73,7 @@ public final class MainActivity extends Activity implements View.OnClickListener
         setContentView(buildContentView());
 
         refreshNow();
+        scheduleBootstrapRefresh();
     }
 
     @Override
@@ -79,11 +90,16 @@ public final class MainActivity extends Activity implements View.OnClickListener
         config = ManagerConfig.load(this, getIntent());
         repo = new ManagerRepository(config);
         refreshNow();
+        scheduleBootstrapRefresh();
     }
 
     @Override
     protected void onPause() {
         super.onPause();
+        try {
+            handler.removeCallbacks(bootstrapRefreshTask);
+        } catch (Throwable ignored) {
+        }
     }
 
     @Override
@@ -357,13 +373,24 @@ public final class MainActivity extends Activity implements View.OnClickListener
         if (s.startsWith("running") || s.startsWith("ok") || s.startsWith("ready") || s.startsWith("started")) {
             return UiStyles.C_OK_CONTAINER;
         }
-        if (s.startsWith("stop") || s.startsWith("error") || s.startsWith("fail") || s.startsWith("missing")) {
+        if (s.startsWith("stop")) {
+            return UiStyles.C_WARNING_CONTAINER;
+        }
+        if (s.startsWith("error") || s.startsWith("fail") || s.startsWith("missing")) {
             return UiStyles.C_ERROR_CONTAINER;
         }
         if (s.startsWith("disabled")) {
             return UiStyles.C_WARNING_CONTAINER;
         }
         return UiStyles.C_SECONDARY_CONTAINER;
+    }
+
+    private void scheduleBootstrapRefresh() {
+        try {
+            handler.removeCallbacks(bootstrapRefreshTask);
+            handler.postDelayed(bootstrapRefreshTask, BOOTSTRAP_REFRESH_DELAY_MS);
+        } catch (Throwable ignored) {
+        }
     }
 
     private void updateChip(TextView chip, String text, int bgColor) {

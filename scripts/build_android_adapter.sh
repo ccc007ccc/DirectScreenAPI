@@ -65,28 +65,26 @@ fi
 
 DEX_MODE=""
 DEX_BIN="${DSAPI_DEX_TOOL_BIN:-}"
-if [ -n "$DEX_BIN" ]; then
-  DEX_MODE="${DSAPI_DEX_MODE:-d8}"
-elif [ -x "$BUILD_TOOLS_DIR/d8" ]; then
-  DEX_MODE="d8"
-  DEX_BIN="$BUILD_TOOLS_DIR/d8"
-elif command -v d8 >/dev/null 2>&1; then
-  DEX_MODE="d8"
-  DEX_BIN="d8"
-elif command -v dalvik-exchange >/dev/null 2>&1; then
-  DEX_MODE="dx"
-  DEX_BIN="dalvik-exchange"
-else
-  echo "android_adapter_error=dex_tool_not_found"
+DEX_MODE="${DSAPI_DEX_MODE:-d8}"
+if [ "$DEX_MODE" != "d8" ]; then
+  echo "android_adapter_error=unsupported_dex_mode mode=$DEX_MODE required=d8"
+  exit 2
+fi
+if [ -z "$DEX_BIN" ]; then
+  ensure_d8_output="$(./scripts/ensure_d8_from_r8.sh 2>&1)" || {
+    [ -n "$ensure_d8_output" ] && printf '%s\n' "$ensure_d8_output"
+    echo "android_adapter_error=ensure_d8_failed"
+    exit 2
+  }
+  [ -n "$ensure_d8_output" ] && printf '%s\n' "$ensure_d8_output" | sed -n '/^ensure_d8_/p'
+  DEX_BIN="$(printf '%s\n' "$ensure_d8_output" | awk -F= '/^d8_tool=/{print $2}' | tail -n 1)"
+fi
+if [ -z "$DEX_BIN" ]; then
+  echo "android_adapter_error=d8_tool_not_found"
   exit 2
 fi
 
 JAVA_RELEASE="${DSAPI_ANDROID_JAVA_RELEASE:-21}"
-
-if [ "$DEX_MODE" = "dx" ] && [ "$JAVA_RELEASE" -gt 8 ]; then
-  echo "android_adapter_error=dx_requires_java8 java_release=$JAVA_RELEASE"
-  exit 2
-fi
 
 if [ ! -d "$SRC_DIR" ]; then
   echo "android_adapter_error=source_dir_missing path=$SRC_DIR"
@@ -102,15 +100,23 @@ case "$BUILD_MODE" in
 org/directscreenapi/adapter/DisplayAdapter.java
 org/directscreenapi/adapter/AndroidDisplayAdapter.java
 org/directscreenapi/adapter/AndroidAdapterMain.java
+org/directscreenapi/adapter/DisplayStateWatcher.java
 org/directscreenapi/adapter/ReflectBridge.java
 org/directscreenapi/adapter/DaemonSession.java
 org/directscreenapi/adapter/HardwareBufferBridge.java
 org/directscreenapi/adapter/SurfaceLayerSession.java
 org/directscreenapi/adapter/RgbaFramePresenter.java
+org/directscreenapi/adapter/TouchUiGpuPresenter.java
+org/directscreenapi/adapter/GpuVsyncDemo.java
+org/directscreenapi/adapter/experimental/GpuVsyncDemoExperiment.java
 org/directscreenapi/adapter/ScreenCaptureStreamer.java
 org/directscreenapi/adapter/CapabilityManagerUi.java
 org/directscreenapi/adapter/BridgeContract.java
+org/directscreenapi/adapter/CoreContract.java
+org/directscreenapi/adapter/BridgeExecCli.java
+org/directscreenapi/adapter/DsapiServiceRegistry.java
 org/directscreenapi/adapter/BridgeControlServer.java
+org/directscreenapi/adapter/HelloServiceDemo.java
 org/directscreenapi/adapter/ParasiticManagerHost.java
 org/directscreenapi/adapter/ZygoteAgentContract.java
 org/directscreenapi/adapter/ZygoteAgentServer.java
@@ -121,15 +127,23 @@ org/directscreenapi/adapter/ZygoteAgentServer.java
 org/directscreenapi/adapter/DisplayAdapter.java
 org/directscreenapi/adapter/AndroidDisplayAdapter.java
 org/directscreenapi/adapter/AndroidAdapterMain.java
+org/directscreenapi/adapter/DisplayStateWatcher.java
 org/directscreenapi/adapter/ReflectBridge.java
 org/directscreenapi/adapter/DaemonSession.java
 org/directscreenapi/adapter/HardwareBufferBridge.java
 org/directscreenapi/adapter/SurfaceLayerSession.java
 org/directscreenapi/adapter/RgbaFramePresenter.java
+org/directscreenapi/adapter/TouchUiGpuPresenter.java
+org/directscreenapi/adapter/GpuVsyncDemo.java
+org/directscreenapi/adapter/experimental/GpuVsyncDemoExperiment.java
 org/directscreenapi/adapter/ScreenCaptureStreamer.java
 org/directscreenapi/adapter/CapabilityManagerUi.java
 org/directscreenapi/adapter/BridgeContract.java
+org/directscreenapi/adapter/CoreContract.java
+org/directscreenapi/adapter/BridgeExecCli.java
+org/directscreenapi/adapter/DsapiServiceRegistry.java
 org/directscreenapi/adapter/BridgeControlServer.java
+org/directscreenapi/adapter/HelloServiceDemo.java
 org/directscreenapi/adapter/ParasiticManagerHost.java
 org/directscreenapi/adapter/ZygoteAgentContract.java
 org/directscreenapi/adapter/ZygoteAgentServer.java
@@ -198,47 +212,7 @@ javac -g:none --release "$JAVA_RELEASE" -encoding UTF-8 $JAVAC_EXTRA_ARGS -d "$C
   jar --create --file "$CLASS_JAR_ABS" .
 )
 
-if [ "$DEX_MODE" = "d8" ]; then
-  "$DEX_BIN" --release --min-api 26 --output "$DEX_JAR_ABS" "$CLASS_JAR_ABS"
-else
-  mkdir -p "$DEX_TMP_DIR"
-  "$DEX_BIN" --dex --min-sdk-version=26 --output="$DEX_TMP_DIR/classes.dex" "$CLASS_JAR_ABS"
-  if [ ! -f "$DEX_TMP_DIR/classes.dex" ]; then
-    echo "android_adapter_error=classes_dex_missing path=$DEX_TMP_DIR/classes.dex"
-    exit 2
-  fi
-  if command -v zip >/dev/null 2>&1; then
-    (
-      cd "$DEX_TMP_DIR"
-      zip -q "$DEX_JAR_ABS" classes.dex
-    )
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 - "$DEX_TMP_DIR/classes.dex" "$DEX_JAR_ABS" <<'PY'
-import sys
-import zipfile
-
-dex_path = sys.argv[1]
-jar_path = sys.argv[2]
-
-with zipfile.ZipFile(jar_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-    zf.write(dex_path, "classes.dex")
-PY
-  elif command -v python >/dev/null 2>&1; then
-    python - "$DEX_TMP_DIR/classes.dex" "$DEX_JAR_ABS" <<'PY'
-import sys
-import zipfile
-
-dex_path = sys.argv[1]
-jar_path = sys.argv[2]
-
-with zipfile.ZipFile(jar_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-    zf.write(dex_path, "classes.dex")
-PY
-  else
-    echo "android_adapter_error=zip_and_python_missing_for_dx"
-    exit 2
-  fi
-fi
+"$DEX_BIN" --release --min-api 26 --output "$DEX_JAR_ABS" "$CLASS_JAR_ABS"
 
 # ART 会拒绝执行当前进程可写的 dex/apk，这里统一改为只读。
 chmod 444 "$CLASS_JAR_ABS" "$DEX_JAR_ABS" 2>/dev/null || true

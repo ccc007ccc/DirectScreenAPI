@@ -1,5 +1,5 @@
 #!/system/bin/sh
-ACTION_NAME=停止输入代理
+ACTION_NAME="停止输入代理"
 ACTION_DANGER=1
 set -eu
 

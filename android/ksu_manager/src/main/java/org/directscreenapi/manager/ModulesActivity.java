@@ -1,7 +1,6 @@
 package org.directscreenapi.manager;
 
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
@@ -263,7 +262,7 @@ public final class ModulesActivity extends Activity {
     private View buildToolbarCard() {
         LinearLayout card = UiStyles.makeCard(this);
         card.addView(UiStyles.makeSectionTitle(this, "模块管理"));
-        TextView desc = UiStyles.makeSectionDesc(this, "支持 ZIP 导入、内置模块安装、生命周期与 Action 管理");
+        TextView desc = UiStyles.makeSectionDesc(this, "支持外部 ZIP 导入、生命周期与 Action 管理");
         card.addView(desc, UiStyles.topMargin(this, 2));
 
         LinearLayout row = new LinearLayout(this);
@@ -286,15 +285,6 @@ public final class ModulesActivity extends Activity {
             }
         });
         row.addView(importZip, UiStyles.rowWeightLayout(this));
-
-        Button installBuiltin = UiStyles.makeTonalButton(this, "安装内置");
-        installBuiltin.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                showBuiltinZipPicker();
-            }
-        });
-        row.addView(installBuiltin, UiStyles.rowWeightLayout(this));
 
         card.addView(row, UiStyles.topMargin(this, 10));
 
@@ -378,48 +368,6 @@ public final class ModulesActivity extends Activity {
         intent.setType("application/zip");
         intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"application/zip", "application/octet-stream", "*/*"});
         startActivityForResult(intent, REQ_PICK_MODULE_ZIP);
-    }
-
-    private void showBuiltinZipPicker() {
-        worker.execute(new Runnable() {
-            @Override
-            public void run() {
-                final DsapiCtlClient.CmdResult result = repo.run("module", "zip-list");
-                final List<CtlParsers.ModuleZipRow> rows = CtlParsers.parseModuleZipRows(result.output);
-                runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (result.exitCode != 0) {
-                            StringBuilder sb = new StringBuilder();
-                            sb.append("$ module zip-list\nexit=").append(result.exitCode);
-                            if (!result.output.isEmpty()) {
-                                sb.append("\n").append(result.output);
-                            }
-                            setLogText(sb.toString());
-                            return;
-                        }
-                        if (rows.isEmpty()) {
-                            setLogText("$ module zip-list\nexit=0\nno_builtin_zip=1");
-                            return;
-                        }
-                        String[] names = new String[rows.size()];
-                        for (int i = 0; i < rows.size(); i++) {
-                            names[i] = rows.get(i).name;
-                        }
-                        UiStyles.dialogBuilder(ModulesActivity.this)
-                                .setTitle("安装内置模块")
-                                .setItems(names, (dialog, which) -> runCtlAction(
-                                        new String[]{"module", "install-builtin", rows.get(which).name},
-                                        true,
-                                        false,
-                                        null
-                                ))
-                                .setNegativeButton("取消", null)
-                                .show();
-                    }
-                });
-            }
-        });
     }
 
     private String copyUriToImportZip(Uri uri) throws Exception {
@@ -610,7 +558,7 @@ public final class ModulesActivity extends Activity {
         }
 
         if (snapshot.modules.isEmpty()) {
-            TextView empty = UiStyles.makeSectionDesc(this, "暂无模块。可点击“添加 ZIP 模块”或“安装内置”。");
+            TextView empty = UiStyles.makeSectionDesc(this, "暂无模块。可点击“添加 ZIP 模块”安装外部模块。");
             moduleContainer.addView(empty);
             return;
         }

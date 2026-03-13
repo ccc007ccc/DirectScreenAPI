@@ -15,7 +15,7 @@ usage:
   ./scripts/dsapi.sh android probe [display-kv|display-line]
   ./scripts/dsapi.sh android sync-display
   ./scripts/dsapi.sh frame pull <out_rgba_path>
-  ./scripts/dsapi.sh build core|android|ksu-module|c-example|framepull
+  ./scripts/dsapi.sh build core|android|ksu-module|ksu-module-zip <module_id|--all>|c-example|framepull
   ./scripts/dsapi.sh check|fix
 USAGE
 }
@@ -142,6 +142,10 @@ build_impl() {
     ksu-module)
       shift
       ./scripts/build_ksu_module.sh "$@"
+      ;;
+    ksu-module-zip)
+      shift
+      ./scripts/build_ksu_module_zip.sh "$@"
       ;;
     c-example)
       shift

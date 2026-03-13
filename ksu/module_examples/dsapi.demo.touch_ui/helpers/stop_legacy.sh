@@ -1,9 +1,7 @@
 #!/system/bin/sh
-ACTION_NAME=停止测试窗口
-ACTION_DANGER=1
 set -eu
 
-state_dir="${DSAPI_MODULE_STATE_DIR:-/data/adb/dsapi/state/modules/test.touch_demo}"
+state_dir="${DSAPI_MODULE_STATE_DIR:-/data/adb/dsapi/state/modules/dsapi.demo.touch_ui}"
 mkdir -p "$state_dir"
 
 demo_pid_file="$state_dir/touch_demo.pid"
@@ -81,13 +79,12 @@ demo_pid="$(read_pid "$demo_pid_file")"
 presenter_pid="$(read_pid "$presenter_pid_file")"
 
 kill_pid_if_match "$demo_pid" "dsapi_touch_demo"
-kill_pid_if_match "$presenter_pid" "present-loop"
+kill_pid_if_match "$presenter_pid" "touch-ui-loop"
 
-# 兜底清理：避免 pid 文件漂移导致 stop 后仍有窗口/模糊层残留。
 force_kill_by_name "dsapi_touch_demo"
 force_kill_by_name "DSAPIPresenterDemo"
 
-rm -f "$demo_pid_file" "$presenter_pid_file"
+rm -f "$demo_pid_file" "$presenter_pid_file" "$state_dir/touch_demo.state.pipe"
 
 if [ "$(to_bool "${TOUCH_DEMO_STOP_DAEMON:-0}")" = "1" ] && [ -f "$ctl_path" ]; then
   if ! /system/bin/sh "$ctl_path" stop >/dev/null 2>&1; then

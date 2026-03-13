@@ -94,7 +94,7 @@ result_version=2
 result_type=module.reload
 result_code=0
 result_message=ok
-result_json={"module_id":"test.touch_demo","from":"running","to":"ready","reloaded":true}
+result_json={"module_id":"dsapi.demo.touch_ui","from":"running","to":"ready","reloaded":true}
 ```
 
 示例：`module list`
@@ -104,7 +104,7 @@ result_version=2
 result_type=module.list
 result_code=0
 result_message=ok
-result_json=[{"id":"system.ime","state":"ready","enabled":true},{"id":"test.touch_demo","state":"degraded","enabled":true}]
+result_json=[{"id":"system.ime","state":"ready","enabled":true},{"id":"dsapi.demo.touch_ui","state":"degraded","enabled":true}]
 ```
 
 ## 6. 错误码规范（首版）

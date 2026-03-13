@@ -56,12 +56,12 @@
 示例：
 
 ```text
-test.touch_demo/
+dsapi.demo.touch_ui/
 ├── dsapi.module
 ├── env.spec
 ├── env.values
 ├── capabilities/
-│   └── test.touch_demo.sh
+│   └── dsapi.demo.touch_ui.sh
 └── actions/
     ├── start.sh
     ├── stop.sh
@@ -75,7 +75,7 @@ test.touch_demo/
 
 - `MODULE_ID`：模块唯一 ID（必填）
 - `MODULE_NAME`：展示名
-- `MODULE_KIND`：模块类型（test/system/inject/...）
+- `MODULE_KIND`：模块类型（demo/system/inject/...）
 - `MODULE_VERSION`：版本
 - `MODULE_DESC`：描述
 - `MAIN_CAP_ID`：主 capability ID（可选）
@@ -125,9 +125,7 @@ test.touch_demo/
 
 module 相关命令：
 
-- `module zip-list`
 - `module install-zip <zip>`
-- `module install-builtin <name>`
 - `module list|start|stop|reload|enable|disable|remove|status|detail <id>`
 - `module reload-all`
 - `module action-list <id>`
@@ -163,7 +161,11 @@ Action 超时控制：
 ## 6. 发布与更新策略
 
 - KSU 模块尽量少更新：仅承载启动器与基础控制层。
+- 核心 KSU 包不再内置 `module_zips`，模块更新走独立 ZIP 分发。
 - 业务能力通过 runtime release 与 capability 热更新。
+- 外部模块独立打包：
+  - `./scripts/build_ksu_module_zip.sh <module_id>`
+  - `./scripts/build_ksu_module_zip.sh --all`
 - runtime 安装/切换：
   - `runtime install <release_id> <dir>`
   - `runtime activate <release_id>`
@@ -181,6 +183,6 @@ capability 应遵循同样原则：
 ## 8. 示例位置
 
 - 核心内置示例：`ksu/module_template/capabilities/core.daemon.sh`
-- 外部扩展示例：`ksu/module_examples/test.touch_demo/`、`ksu/module_examples/system.ime/`
+- 外部扩展示例：`ksu/module_examples/dsapi.demo.touch_ui/`（MODULE_ID=`dsapi.demo.touch_ui`）、`ksu/module_examples/system.ime/`
 - 旧 capability 占位示例：`ksu/capability_examples/inject.window.sh`、`ksu/capability_examples/inject.ime.sh`
 - 安装后示例路径：`/data/adb/modules/directscreenapi/capability_examples/*.sh`

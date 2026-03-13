@@ -1,9 +1,9 @@
 #!/system/bin/sh
 
-CAP_ID="test.touch_demo"
-CAP_NAME="Touch Demo Test"
-CAP_KIND="test"
-CAP_DESC="触摸窗口测试 capability，委托模块 action 进行启停。"
+CAP_ID="dsapi.demo.hello_provider"
+CAP_NAME="Hello Provider Demo"
+CAP_KIND="demo"
+CAP_DESC="模块即接口：Provider 注册 Binder 服务到 Core ServiceRegistry。"
 
 cap_start() {
   /system/bin/sh "$DSAPI_MODULE_DIR/actions/start.sh"

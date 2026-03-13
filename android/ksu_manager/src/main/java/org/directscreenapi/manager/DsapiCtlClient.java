@@ -28,7 +28,7 @@ final class DsapiCtlClient {
                     .append(':')
                     .append(bridgeAttempt.error.getMessage());
         }
-        out.append("\nfix_hint=当前管理器仅支持 LSP 风格单契约: IDaemonService + exec_v2");
+        out.append("\nfix_hint=当前管理器仅支持 LSP 风格单契约: ICoreService + exec_v2");
         out.append("\nfix_hint2=请确认 bridge 已升级并重启: /data/adb/modules/directscreenapi/bin/dsapi_service_ctl.sh bridge restart ")
                 .append(config.bridgeService);
         out.append("\nfix_hint_service=当前 binder_service=").append(config.bridgeService);

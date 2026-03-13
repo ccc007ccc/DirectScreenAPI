@@ -1,7 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 use std::fs;
-use std::io::{self, IoSliceMut, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -19,9 +18,6 @@ use directscreen_core::util::{
     ctl_wire, default_control_socket_path, derive_data_socket_path_text,
 };
 use evdev::{AbsoluteAxisType, Device};
-use font8x8::{UnicodeFonts, BASIC_FONTS};
-use nix::cmsg_space;
-use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
 
 const WINDOW_ARG_MIN_W: f32 = 120.0;
 const WINDOW_ARG_MIN_H: f32 = 90.0;
@@ -41,7 +37,6 @@ const BASE_CONTENT_PADDING_DP: f32 = 12.0;
 const BASE_IME_KEY_GAP_DP: f32 = 4.0;
 const CURSOR_BLINK_MS: u64 = 420;
 const WATCH_EVENT_TIMEOUT_MS: u32 = 120;
-const CLOSE_CLEAR_SETTLE_MS: u64 = 12;
 
 #[derive(Debug, Clone, Copy)]
 struct DisplayInfo {
@@ -157,314 +152,6 @@ impl BinaryControlClient {
     }
 }
 
-#[derive(Debug)]
-struct BoundMapping {
-    ptr: *mut u8,
-    len: usize,
-    capacity: usize,
-    data_offset: usize,
-}
-
-impl BoundMapping {
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-}
-
-impl Drop for BoundMapping {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() && self.len > 0 {
-            let _ = unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
-            self.ptr = std::ptr::null_mut();
-            self.len = 0;
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ShmSubmitClient {
-    data_socket_path: String,
-    stream: UnixStream,
-    mapping: BoundMapping,
-    submit_cmd_cache: Vec<u8>,
-    submit_cmd_width: u32,
-    submit_cmd_height: u32,
-    submit_cmd_len: usize,
-    submit_cmd_origin_x: i32,
-    submit_cmd_origin_y: i32,
-}
-
-impl ShmSubmitClient {
-    fn connect(data_socket_path: &str) -> io::Result<Self> {
-        let stream = UnixStream::connect(data_socket_path)?;
-        let timeout =
-            directscreen_core::util::timeout_from_env("DSAPI_CLIENT_TIMEOUT_MS", 5000, 100);
-        stream.set_read_timeout(timeout)?;
-        stream.set_write_timeout(timeout)?;
-        let mapping = bind_mapping(&stream)?;
-        Ok(Self {
-            data_socket_path: data_socket_path.to_string(),
-            stream,
-            mapping,
-            submit_cmd_cache: Vec::new(),
-            submit_cmd_width: 0,
-            submit_cmd_height: 0,
-            submit_cmd_len: 0,
-            submit_cmd_origin_x: i32::MIN,
-            submit_cmd_origin_y: i32::MIN,
-        })
-    }
-
-    fn frame_buffer_mut(&mut self, width: u32, height: u32) -> io::Result<&mut [u8]> {
-        let expected_len = frame_byte_len(width, height)?;
-        self.ensure_mapping_capacity(expected_len)?;
-        let begin = self.mapping.data_offset;
-        let end = begin
-            .checked_add(expected_len)
-            .ok_or_else(|| io::Error::other("submit_offset_overflow"))?;
-        if end > self.mapping.len {
-            return Err(io::Error::other("submit_out_of_bound_mapping"));
-        }
-        Ok(&mut self.mapping.as_mut_slice()[begin..end])
-    }
-
-    fn submit_rendered_frame(
-        &mut self,
-        width: u32,
-        height: u32,
-        byte_len: usize,
-        origin_x: i32,
-        origin_y: i32,
-    ) -> io::Result<()> {
-        self.ensure_mapping_capacity(byte_len)?;
-        self.ensure_submit_cmd(width, height, byte_len, origin_x, origin_y);
-        self.stream.write_all(&self.submit_cmd_cache)?;
-        let line = read_line_fast(&mut self.stream, 4096)?;
-        if !line.starts_with("OK") {
-            return Err(io::Error::other(format!("submit_failed response={}", line)));
-        }
-        Ok(())
-    }
-
-    fn ensure_mapping_capacity(&mut self, byte_len: usize) -> io::Result<()> {
-        if byte_len > self.mapping.capacity {
-            // 旧连接可能绑定了历史尺寸的 SHM，重连后重新绑定一次。
-            self.reconnect()?;
-        }
-        if byte_len > self.mapping.capacity {
-            return Err(io::Error::other(format!(
-                "bound_shm_capacity_too_small capacity={} frame_len={} reconnect=1",
-                self.mapping.capacity, byte_len
-            )));
-        }
-        Ok(())
-    }
-
-    fn reconnect(&mut self) -> io::Result<()> {
-        let new_stream = UnixStream::connect(&self.data_socket_path)?;
-        let timeout =
-            directscreen_core::util::timeout_from_env("DSAPI_CLIENT_TIMEOUT_MS", 5000, 100);
-        new_stream.set_read_timeout(timeout)?;
-        new_stream.set_write_timeout(timeout)?;
-        let mapping = bind_mapping(&new_stream)?;
-        self.stream = new_stream;
-        self.mapping = mapping;
-        self.submit_cmd_cache.clear();
-        self.submit_cmd_width = 0;
-        self.submit_cmd_height = 0;
-        self.submit_cmd_len = 0;
-        self.submit_cmd_origin_x = i32::MIN;
-        self.submit_cmd_origin_y = i32::MIN;
-        Ok(())
-    }
-
-    fn ensure_submit_cmd(
-        &mut self,
-        width: u32,
-        height: u32,
-        byte_len: usize,
-        origin_x: i32,
-        origin_y: i32,
-    ) {
-        if self.submit_cmd_width == width
-            && self.submit_cmd_height == height
-            && self.submit_cmd_len == byte_len
-            && self.submit_cmd_origin_x == origin_x
-            && self.submit_cmd_origin_y == origin_y
-            && !self.submit_cmd_cache.is_empty()
-        {
-            return;
-        }
-
-        self.submit_cmd_cache = format!(
-            "RENDER_FRAME_SUBMIT_SHM {} {} {} {} {} {}\n",
-            width, height, byte_len, self.mapping.data_offset, origin_x, origin_y
-        )
-        .into_bytes();
-        self.submit_cmd_width = width;
-        self.submit_cmd_height = height;
-        self.submit_cmd_len = byte_len;
-        self.submit_cmd_origin_x = origin_x;
-        self.submit_cmd_origin_y = origin_y;
-    }
-}
-
-fn bind_mapping(stream: &UnixStream) -> io::Result<BoundMapping> {
-    let mut stream = stream.try_clone()?;
-    stream.write_all(b"RENDER_FRAME_BIND_SHM\n")?;
-    stream.flush()?;
-
-    let (line, fd_opt) = recv_line_with_optional_fd(&stream, true)?;
-    let mut parts = line.split_whitespace();
-    let p0 = parts.next();
-    let p1 = parts.next();
-    let p2 = parts.next();
-    let p3 = parts.next();
-    if p0 != Some("OK")
-        || p1 != Some("SHM_BOUND")
-        || p2.is_none()
-        || p3.is_none()
-        || parts.next().is_some()
-    {
-        return Err(io::Error::other(format!(
-            "invalid_bind_response line={}",
-            line
-        )));
-    }
-
-    let capacity = p2
-        .and_then(|v| v.parse::<usize>().ok())
-        .ok_or_else(|| io::Error::other("invalid_bind_capacity"))?;
-    let data_offset = p3
-        .and_then(|v| v.parse::<usize>().ok())
-        .ok_or_else(|| io::Error::other("invalid_bind_offset"))?;
-    if capacity == 0 {
-        return Err(io::Error::other("bind_capacity_zero"));
-    }
-
-    let map_len = data_offset
-        .checked_add(capacity)
-        .ok_or_else(|| io::Error::other("bind_map_len_overflow"))?;
-    let fd = fd_opt.ok_or_else(|| io::Error::other("bind_missing_fd"))?;
-
-    let mapped = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            map_len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        )
-    };
-    let _ = unsafe { libc::close(fd) };
-    if mapped == libc::MAP_FAILED {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(BoundMapping {
-        ptr: mapped as *mut u8,
-        len: map_len,
-        capacity,
-        data_offset,
-    })
-}
-
-fn recv_line_with_optional_fd(
-    stream: &UnixStream,
-    require_fd: bool,
-) -> io::Result<(String, Option<RawFd>)> {
-    let mut line: Vec<u8> = Vec::with_capacity(256);
-    let mut received_fd: Option<RawFd> = None;
-
-    loop {
-        let mut buf = [0u8; 1024];
-        let mut iov = [IoSliceMut::new(&mut buf)];
-        let mut cmsg = cmsg_space!([RawFd; 4]);
-        let bytes_read = {
-            let msg = recvmsg::<()>(
-                stream.as_raw_fd(),
-                &mut iov,
-                Some(&mut cmsg),
-                MsgFlags::empty(),
-            )
-            .map_err(io::Error::other)?;
-            if msg.bytes == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "data_socket_closed",
-                ));
-            }
-
-            let cmsgs = msg.cmsgs().map_err(io::Error::other)?;
-            for c in cmsgs {
-                if let ControlMessageOwned::ScmRights(fds) = c {
-                    for fd in fds {
-                        if received_fd.is_none() {
-                            received_fd = Some(fd);
-                        } else {
-                            let _ = unsafe { libc::close(fd) };
-                        }
-                    }
-                }
-            }
-            msg.bytes
-        };
-
-        for b in &buf[..bytes_read] {
-            if *b == b'\n' {
-                let text = String::from_utf8_lossy(&line).trim_end().to_string();
-                if require_fd && received_fd.is_none() {
-                    return Err(io::Error::other("required_fd_missing"));
-                }
-                return Ok((text, received_fd));
-            }
-            if *b != b'\r' {
-                line.push(*b);
-            }
-            if line.len() > 4096 {
-                return Err(io::Error::other("response_line_too_long"));
-            }
-        }
-    }
-}
-
-fn read_line_fast(stream: &mut UnixStream, max_len: usize) -> io::Result<String> {
-    let mut out: Vec<u8> = Vec::with_capacity(128);
-    let mut chunk = [0u8; 256];
-    loop {
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            if out.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "socket_closed",
-                ));
-            }
-            break;
-        }
-        for b in &chunk[..n] {
-            if *b == b'\n' {
-                return Ok(String::from_utf8_lossy(&out).trim().to_string());
-            }
-            if *b != b'\r' {
-                out.push(*b);
-            }
-            if out.len() > max_len {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "line_too_long"));
-            }
-        }
-    }
-    Ok(String::from_utf8_lossy(&out).trim().to_string())
-}
-
-fn frame_byte_len(width: u32, height: u32) -> io::Result<usize> {
-    (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|v| v.checked_mul(4))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame_size_overflow"))
-}
-
 #[derive(Debug, Clone, Copy)]
 struct UiMetrics {
     title_height: f32,
@@ -480,9 +167,6 @@ struct UiMetrics {
     input_h: f32,
     content_padding: f32,
     ime_key_gap: f32,
-    title_text_scale: i32,
-    body_text_scale: i32,
-    body_line_step: i32,
 }
 
 fn ui_metrics(display: DisplayInfo) -> UiMetrics {
@@ -493,10 +177,7 @@ fn ui_metrics(display: DisplayInfo) -> UiMetrics {
     };
     let control_scale = (1.0 + (density - 1.0) * 0.18).clamp(1.0, 1.45);
     let min_scale = (1.0 + (density - 1.0) * 0.08).clamp(1.0, 1.20);
-    let body_text_scale = if density >= 2.6 { 2 } else { 1 };
-    let title_text_scale = body_text_scale;
-    let body_line_step = (9 * body_text_scale + 5).max(14);
-    let min_title_h = (10 * title_text_scale + 10) as f32;
+    let min_title_h = 20.0f32;
 
     UiMetrics {
         title_height: (BASE_TITLE_HEIGHT_DP * control_scale).max(min_title_h),
@@ -512,9 +193,6 @@ fn ui_metrics(display: DisplayInfo) -> UiMetrics {
         input_h: BASE_INPUT_H_DP * control_scale,
         content_padding: BASE_CONTENT_PADDING_DP * control_scale,
         ime_key_gap: BASE_IME_KEY_GAP_DP * control_scale,
-        title_text_scale,
-        body_text_scale,
-        body_line_step,
     }
 }
 
@@ -579,6 +257,8 @@ fn compute_ui_layout(window: WindowState, metrics: UiMetrics) -> UiLayout {
 struct Args {
     control_socket: String,
     data_socket: String,
+    state_pipe: String,
+    presenter_pid: Option<i32>,
     device_path: Option<String>,
     route_name: String,
     fps: f32,
@@ -597,6 +277,8 @@ fn usage() {
     eprintln!("options:");
     eprintln!("  --control-socket <path>   daemon control socket");
     eprintln!("  --data-socket <path>      daemon data socket");
+    eprintln!("  --state-pipe <path>      write UI state line per frame to fifo/file");
+    eprintln!("  --presenter-pid <pid>    presenter process pid for liveness guard");
     eprintln!("  --device <event_path>     touch input device path");
     eprintln!("  --route-name <name>       touch route name (default: demo-window)");
     eprintln!("  --fps <n>                 render fps cap, 0 means auto by refresh rate");
@@ -631,6 +313,10 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         .or_else(|| env_non_empty("DSAPI_SOCKET_PATH"))
         .unwrap_or_else(default_control_socket_path);
     let mut data_socket: Option<String> = env_non_empty("DSAPI_DATA_SOCKET_PATH");
+    let mut state_pipe: Option<String> = env_non_empty("TOUCH_DEMO_STATE_PIPE");
+    let mut presenter_pid: Option<i32> = env_non_empty("TOUCH_DEMO_PRESENTER_PID")
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|v| *v > 1);
     let mut device_path: Option<String> = None;
     let mut route_name = "demo-window".to_string();
     let mut fps = 0.0f32;
@@ -657,6 +343,26 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                     return Err("missing_data_socket".to_string());
                 }
                 data_socket = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--state-pipe" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_state_pipe".to_string());
+                }
+                state_pipe = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--presenter-pid" => {
+                if i + 1 >= args.len() {
+                    return Err("missing_presenter_pid".to_string());
+                }
+                let pid = args[i + 1]
+                    .parse::<i32>()
+                    .map_err(|_| format!("invalid_presenter_pid:{}", args[i + 1]))?;
+                if pid <= 1 {
+                    return Err(format!("invalid_presenter_pid:{}", pid));
+                }
+                presenter_pid = Some(pid);
                 i += 2;
             }
             "--device" => {
@@ -751,8 +457,15 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         return Err("window_size_invalid".to_string());
     }
 
+    let state_pipe = state_pipe
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "state_pipe_required".to_string())?;
+
     Ok(Args {
         data_socket: data_socket.unwrap_or_else(|| derive_data_socket_path_text(&control_socket)),
+        state_pipe,
+        presenter_pid,
         control_socket,
         device_path,
         route_name,
@@ -866,15 +579,6 @@ enum PressTarget {
 enum ButtonAction {
     Close,
     Submit,
-}
-
-impl ButtonAction {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Close => "close",
-            Self::Submit => "submit",
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -1186,99 +890,6 @@ impl FpsCounter {
     }
 }
 
-#[allow(dead_code)]
-struct BlurScratch {
-    src: Vec<u8>,
-    tmp: Vec<u8>,
-    kernel: Vec<f32>,
-    radius: i32,
-    cached_patch: Vec<u8>,
-    cached_x: i32,
-    cached_y: i32,
-    cached_w: usize,
-    cached_h: usize,
-    cache_valid: bool,
-}
-
-#[allow(dead_code)]
-impl BlurScratch {
-    fn new(radius: u32, sigma: f32) -> Self {
-        Self {
-            src: Vec::new(),
-            tmp: Vec::new(),
-            kernel: build_gaussian_kernel(radius as usize, sigma),
-            radius: radius as i32,
-            cached_patch: Vec::new(),
-            cached_x: 0,
-            cached_y: 0,
-            cached_w: 0,
-            cached_h: 0,
-            cache_valid: false,
-        }
-    }
-
-    fn ensure_len(&mut self, len: usize) {
-        if self.src.len() != len {
-            self.src.resize(len, 0);
-        }
-        if self.tmp.len() != len {
-            self.tmp.resize(len, 0);
-        }
-    }
-
-    fn cache_matches(&self, x: i32, y: i32, w: usize, h: usize) -> bool {
-        self.cache_valid
-            && self.cached_x == x
-            && self.cached_y == y
-            && self.cached_w == w
-            && self.cached_h == h
-            && self.cached_patch.len() == w.saturating_mul(h).saturating_mul(4)
-    }
-
-    fn write_cached(&self, frame: &mut [u8], fb_width: u32) {
-        if !self.cache_valid || self.cached_w == 0 || self.cached_h == 0 {
-            return;
-        }
-        for ry in 0..self.cached_h {
-            let dst_row =
-                ((self.cached_y as usize + ry) * fb_width as usize + self.cached_x as usize) * 4;
-            let src_row = ry * self.cached_w * 4;
-            frame[dst_row..dst_row + self.cached_w * 4]
-                .copy_from_slice(&self.cached_patch[src_row..src_row + self.cached_w * 4]);
-        }
-    }
-
-    fn update_cache_from_frame(
-        &mut self,
-        frame: &[u8],
-        fb_width: u32,
-        x: i32,
-        y: i32,
-        w: usize,
-        h: usize,
-    ) {
-        let len = w.saturating_mul(h).saturating_mul(4);
-        if self.cached_patch.len() != len {
-            self.cached_patch.resize(len, 0);
-        }
-        for ry in 0..h {
-            let src_row = ((y as usize + ry) * fb_width as usize + x as usize) * 4;
-            let dst_row = ry * w * 4;
-            self.cached_patch[dst_row..dst_row + w * 4]
-                .copy_from_slice(&frame[src_row..src_row + w * 4]);
-        }
-        self.cached_x = x;
-        self.cached_y = y;
-        self.cached_w = w;
-        self.cached_h = h;
-        self.cache_valid = true;
-    }
-
-    fn invalidate_cache(&mut self) {
-        self.cache_valid = false;
-    }
-}
-
 fn resolve_target_fps(user_fps: f32, refresh_hz: f32) -> f32 {
     if user_fps > 1.0 {
         return user_fps;
@@ -1328,13 +939,87 @@ fn rescale_window_for_render_change(
     window.y = new_cy - new_h * 0.5;
 }
 
-fn submit_clear_frame(submitter: &mut ShmSubmitClient) -> io::Result<()> {
-    let width = 1u32;
-    let height = 1u32;
-    let frame_len = frame_byte_len(width, height)?;
-    let frame_buf = submitter.frame_buffer_mut(width, height)?;
-    frame_buf.fill(0);
-    submitter.submit_rendered_frame(width, height, frame_len, 0, 0)
+#[derive(Debug)]
+struct StatePipeWriter {
+    path: String,
+    out: fs::File,
+}
+
+impl StatePipeWriter {
+    fn open(path: &str) -> io::Result<Self> {
+        let out = fs::OpenOptions::new().write(true).open(path)?;
+        Ok(Self {
+            path: path.to_string(),
+            out,
+        })
+    }
+
+    fn write_line(&mut self, line: &str) -> io::Result<()> {
+        self.out.write_all(line.as_bytes())?;
+        self.out.write_all(b"\n")
+    }
+}
+
+fn bool01(v: bool) -> u8 {
+    if v {
+        1
+    } else {
+        0
+    }
+}
+
+fn encode_hex_text(text: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(2 + bytes.len().saturating_mul(2));
+    out.push_str("0x");
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn encode_state_line(
+    state: &DemoState,
+    fps: f32,
+    blocked: u64,
+    passed: u64,
+    now: Instant,
+) -> String {
+    let x = state.window.x.round() as i32;
+    let y = state.window.y.round() as i32;
+    let w = state.window.w.round().max(1.0) as i32;
+    let h = state.window.h.round().max(1.0) as i32;
+    let mode = state.interaction.label();
+    let input_text = encode_hex_text(&state.input_text);
+    let last_submit = encode_hex_text(&state.last_submit_text);
+    let press_close = state.press_active(PressTarget::CloseButton);
+    let press_submit = state.press_active(PressTarget::SubmitButton);
+    let flash_close = DemoState::flash_active(state.close_flash_until, now);
+    let flash_submit = DemoState::flash_active(state.submit_flash_until, now);
+
+    format!(
+        "x={} y={} w={} h={} focus={} ime={} cursor={} press_close={} press_submit={} flash_close={} flash_submit={} fps={:.2} blocked={} passed={} mode={} input_text={} last_submit={} ui_events={}",
+        x,
+        y,
+        w,
+        h,
+        bool01(state.input_focused),
+        bool01(state.ime_visible),
+        bool01(state.cursor_visible),
+        bool01(press_close),
+        bool01(press_submit),
+        bool01(flash_close),
+        bool01(flash_submit),
+        fps,
+        blocked,
+        passed,
+        mode,
+        input_text,
+        last_submit,
+        state.ui_event_count
+    )
 }
 
 fn map_touch_to_render(
@@ -1464,6 +1149,13 @@ fn cmdline_contains_any(pid: i32, tokens: &[&str]) -> bool {
     tokens.iter().any(|token| merged.contains(token))
 }
 
+fn pid_exists(pid: i32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    fs::metadata(format!("/proc/{}/cmdline", pid)).is_ok()
+}
+
 fn stop_pid_quiet(pid: i32) {
     if pid <= 1 {
         return;
@@ -1482,7 +1174,10 @@ fn cleanup_touch_demo_module_state() {
     let presenter_pid = read_pid_file(&presenter_pid_file);
     let _ = fs::remove_file(&demo_pid_file);
     if let Some(pid) = presenter_pid {
-        if cmdline_contains_any(pid, &["DSAPIPresenterDemo", "present-loop"]) {
+        if cmdline_contains_any(
+            pid,
+            &["DSAPIPresenterDemo", "touch-ui-loop", "present-loop"],
+        ) {
             stop_pid_quiet(pid);
         }
     }
@@ -1659,12 +1354,12 @@ fn main() {
         eprintln!("touch_demo_status=touch_router_disabled mode=render_only");
     }
 
-    let mut submitter = match ShmSubmitClient::connect(&cfg.data_socket) {
+    let mut state_pipe = match StatePipeWriter::open(&cfg.state_pipe) {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
-                "touch_demo_error=data_connect_failed socket={} err={}",
-                cfg.data_socket, e
+                "touch_demo_error=state_pipe_open_failed path={} err={}",
+                cfg.state_pipe, e
             );
             std::process::exit(7);
         }
@@ -1675,7 +1370,7 @@ fn main() {
         let init_frame_w = state.window.w.round().max(1.0) as u32;
         let init_frame_h = state.window.h.round().max(1.0) as u32;
         eprintln!(
-            "touch_demo_status=running display={}x{} frame={}x{} @ {:.2}Hz dpi={} rotation={} target_fps={:.1}",
+            "touch_demo_status=running display={}x{} frame={}x{} @ {:.2}Hz dpi={} rotation={} target_fps={:.1} output=state_pipe",
             display.width,
             display.height,
             init_frame_w,
@@ -1685,6 +1380,13 @@ fn main() {
             display.rotation,
             target_fps
         );
+        eprintln!(
+            "touch_demo_status=state_pipe_enabled path={}",
+            state_pipe.path
+        );
+        if let Some(presenter_pid) = cfg.presenter_pid {
+            eprintln!("touch_demo_status=presenter_guard_enabled pid={}", presenter_pid);
+        }
         if cfg.no_touch_router {
             eprintln!(
                 "touch_demo_hint=touch_router_disabled_window_not_interactive use_ctrl_c_or_--run-seconds"
@@ -1698,11 +1400,29 @@ fn main() {
     let mut frame_interval = frame_interval_from_fps(target_fps);
     let started_at = Instant::now();
     let mut last_perf_log = Instant::now();
+    let mut last_presenter_probe = Instant::now() - Duration::from_secs(1);
 
     while state.running {
         if let Some(limit_s) = cfg.run_seconds {
             if started_at.elapsed().as_secs_f32() >= limit_s {
                 break;
+            }
+        }
+        if let Some(presenter_pid) = cfg.presenter_pid {
+            if last_presenter_probe.elapsed() >= Duration::from_millis(220) {
+                let alive = pid_exists(presenter_pid)
+                    && cmdline_contains_any(
+                        presenter_pid,
+                        &["DSAPIPresenterDemo", "touch-ui-loop", "app_process"],
+                    );
+                if !alive {
+                    eprintln!(
+                        "touch_demo_error=presenter_not_alive pid={} action=stop_demo_to_avoid_invisible_touch_block",
+                        presenter_pid
+                    );
+                    break;
+                }
+                last_presenter_probe = Instant::now();
             }
         }
         let frame_started = Instant::now();
@@ -1781,59 +1501,17 @@ fn main() {
             }
         }
 
-        state.tick(Instant::now());
+        let frame_now = Instant::now();
+        state.tick(frame_now);
         let fps = fps_counter.on_frame();
         let blocked = route_blocked_down.load(Ordering::Relaxed);
         let passed = route_passed_down.load(Ordering::Relaxed);
-
-        let frame_w = state
-            .window
-            .w
-            .round()
-            .max(1.0)
-            .min(render_display.width.max(1) as f32) as u32;
-        let frame_h = state
-            .window
-            .h
-            .round()
-            .max(1.0)
-            .min(render_display.height.max(1) as f32) as u32;
-        let max_origin_x = render_display.width.saturating_sub(frame_w) as i32;
-        let max_origin_y = render_display.height.saturating_sub(frame_h) as i32;
-        let frame_origin_x = (state.window.x.round() as i32).clamp(0, max_origin_x);
-        let frame_origin_y = (state.window.y.round() as i32).clamp(0, max_origin_y);
-
-        let frame_len = match frame_byte_len(frame_w, frame_h) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("touch_demo_error=frame_size_invalid err={}", e);
-                break;
-            }
-        };
-        let frame_buf = match submitter.frame_buffer_mut(frame_w, frame_h) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("touch_demo_error=frame_buffer_failed err={}", e);
-                break;
-            }
-        };
-        let frame_display = DisplayInfo {
-            width: frame_w,
-            height: frame_h,
-            refresh_hz: display.refresh_hz,
-            density_dpi: display.density_dpi,
-            rotation: display.rotation,
-        };
-        render_scene(frame_buf, frame_display, &state, fps, blocked, passed);
-
-        if let Err(e) = submitter.submit_rendered_frame(
-            frame_w,
-            frame_h,
-            frame_len,
-            frame_origin_x,
-            frame_origin_y,
-        ) {
-            eprintln!("touch_demo_error=submit_frame_failed err={}", e);
+        let line = encode_state_line(&state, fps, blocked, passed, frame_now);
+        if let Err(e) = state_pipe.write_line(&line) {
+            eprintln!(
+                "touch_demo_error=state_pipe_write_failed path={} err={}",
+                state_pipe.path, e
+            );
             break;
         }
         let elapsed = frame_started.elapsed();
@@ -1850,14 +1528,6 @@ fn main() {
         }
     }
 
-    if let Err(e) = submit_clear_frame(&mut submitter) {
-        if !cfg.quiet {
-            eprintln!("touch_demo_warn=submit_clear_frame_failed err={}", e);
-        }
-    } else {
-        // 给 presenter 最小处理窗口，确保 clear frame 先落地。
-        thread::sleep(Duration::from_millis(CLOSE_CLEAR_SETTLE_MS));
-    }
     cleanup_touch_demo_module_state();
 
     if let Some(mut handle) = touch_handle {
@@ -1908,699 +1578,6 @@ fn is_touch_device(device: &Device) -> bool {
         && abs.contains(AbsoluteAxisType::ABS_MT_POSITION_Y)
         && abs.contains(AbsoluteAxisType::ABS_MT_SLOT)
         && abs.contains(AbsoluteAxisType::ABS_MT_TRACKING_ID)
-}
-
-fn render_scene(
-    frame: &mut [u8],
-    display: DisplayInfo,
-    state: &DemoState,
-    fps: f32,
-    blocked_down: u64,
-    passed_down: u64,
-) {
-    frame.fill(0);
-    let metrics = ui_metrics(display);
-    let now = Instant::now();
-
-    // 窗口内容帧采用局部坐标系：提交 origin 后由 presenter 负责层位置。
-    let wx = 0i32;
-    let wy = 0i32;
-    let ww = display.width.max(1) as i32;
-    let wh = display.height.max(1) as i32;
-    let title_h = metrics.title_height.round().max(1.0) as i32;
-    let local_window = WindowState {
-        x: wx as f32,
-        y: wy as f32,
-        w: ww as f32,
-        h: wh as f32,
-        visible: true,
-    };
-    let layout = compute_ui_layout(local_window, metrics);
-
-    fill_rect(
-        frame,
-        display.width,
-        display.height,
-        wx,
-        wy,
-        ww,
-        wh,
-        [26, 34, 48, 138],
-    );
-
-    fill_rect(
-        frame,
-        display.width,
-        display.height,
-        wx,
-        wy,
-        ww,
-        title_h,
-        [34, 49, 72, 224],
-    );
-    draw_rect_border(
-        frame,
-        display.width,
-        display.height,
-        wx,
-        wy,
-        ww,
-        wh,
-        [130, 175, 240, 250],
-    );
-
-    draw_button(
-        frame,
-        display.width,
-        display.height,
-        layout.close_button,
-        "CLOSE",
-        metrics.body_text_scale.max(1),
-        [198, 76, 74, 244],
-        [255, 220, 220, 255],
-        [255, 248, 248, 255],
-        state.press_active(PressTarget::CloseButton),
-        DemoState::flash_active(state.close_flash_until, now),
-    );
-
-    draw_button(
-        frame,
-        display.width,
-        display.height,
-        layout.submit_button,
-        "SEND",
-        metrics.body_text_scale.max(1),
-        [63, 128, 220, 244],
-        [205, 234, 255, 255],
-        [243, 251, 255, 255],
-        state.press_active(PressTarget::SubmitButton),
-        DemoState::flash_active(state.submit_flash_until, now),
-    );
-
-    let input_x = layout.input_box.x.round() as i32;
-    let input_y = layout.input_box.y.round() as i32;
-    let input_w = layout.input_box.w.round().max(20.0) as i32;
-    let input_h = layout.input_box.h.round().max(16.0) as i32;
-    let input_fill = if state.input_focused {
-        [30, 48, 72, 234]
-    } else {
-        [24, 38, 57, 224]
-    };
-    let input_border = if state.input_focused {
-        [163, 210, 255, 255]
-    } else {
-        [108, 152, 200, 255]
-    };
-    fill_rect(
-        frame,
-        display.width,
-        display.height,
-        input_x,
-        input_y,
-        input_w,
-        input_h,
-        input_fill,
-    );
-    draw_rect_border(
-        frame,
-        display.width,
-        display.height,
-        input_x,
-        input_y,
-        input_w,
-        input_h,
-        input_border,
-    );
-
-    let input_scale = metrics.body_text_scale.max(1);
-    let char_step = 8 * input_scale + input_scale;
-    let text_left = input_x + 6;
-    let text_baseline = input_y + ((input_h - 8 * input_scale) / 2).max(2);
-    let max_chars = ((input_w - 12).max(8) / char_step.max(1)) as usize;
-    let input_text = tail_chars(&state.input_text, max_chars.max(1));
-    let input_color = if state.input_focused {
-        [239, 248, 255, 255]
-    } else {
-        [203, 219, 236, 255]
-    };
-    draw_text(
-        frame,
-        display.width,
-        display.height,
-        text_left,
-        text_baseline,
-        if input_text.is_empty() && !state.input_focused {
-            "tap to type"
-        } else {
-            input_text.as_str()
-        },
-        input_color,
-        input_scale,
-    );
-    if state.input_focused && state.cursor_visible {
-        let caret_x = text_left + text_pixel_width(input_text.as_str(), input_scale) + input_scale;
-        let caret_y0 = input_y + 5;
-        let caret_y1 = input_y + input_h - 6;
-        draw_line(
-            frame,
-            display.width,
-            display.height,
-            caret_x,
-            caret_y0,
-            caret_x,
-            caret_y1,
-            [239, 248, 255, 255],
-        );
-    }
-
-    let resize_size = metrics.resize_hit.round().max(16.0) as i32;
-    let rx = wx + ww - resize_size;
-    let ry = wy + wh - resize_size;
-    let step = (resize_size / 4).max(4);
-    let resize_end = resize_size - step;
-    for i in 0..3 {
-        let delta = i * step;
-        draw_line(
-            frame,
-            display.width,
-            display.height,
-            rx + delta,
-            ry + resize_end,
-            rx + resize_end,
-            ry + delta,
-            [158, 198, 255, 255],
-        );
-    }
-
-    let mode = state.interaction.label();
-    let title = "DirectScreenAPI Touch Demo";
-    let title_text_h = 8 * metrics.title_text_scale;
-    let title_y = wy + ((title_h - title_text_h) / 2).max(2);
-    draw_text(
-        frame,
-        display.width,
-        display.height,
-        wx + 12,
-        title_y,
-        title,
-        [238, 245, 255, 255],
-        metrics.title_text_scale,
-    );
-
-    let ime_state = if state.ime_visible { "shown" } else { "hidden" };
-    let focus_state = if state.input_focused {
-        "focused"
-    } else {
-        "unfocused"
-    };
-    let last_action = state
-        .last_button_action
-        .map(|v| v.as_str())
-        .unwrap_or("none");
-    let lines = [
-        format!("FPS: {:>5.1}", fps),
-        format!("Mode: {}", mode),
-        format!(
-            "Input: {} chars={} ime={}",
-            focus_state,
-            state.input_text.chars().count(),
-            ime_state
-        ),
-        format!(
-            "Window: x={:.0} y={:.0} w={:.0} h={:.0}",
-            state.window.x, state.window.y, state.window.w, state.window.h
-        ),
-        format!(
-            "Frame: {}x{} dpi={}",
-            display.width, display.height, display.density_dpi
-        ),
-        format!(
-            "Buttons: callbacks={} submit_count={} last_action={}",
-            state.button_callback_count, state.submit_count, last_action
-        ),
-        format!("Touch block downs: {}", blocked_down),
-        format!("Touch passthrough downs: {}", passed_down),
-        format!(
-            "UI events: {} latency_ms={:.2}",
-            state.ui_event_count, state.last_latency_ms
-        ),
-        format!("Last submit: {}", state.last_submit_text),
-        "Drag title, resize corner, tap CLOSE/SEND, tap input for system IME.".to_string(),
-    ];
-
-    let mut text_y = input_y + input_h + 10;
-    let text_limit = wy + wh - 14;
-    for line in lines.iter() {
-        if text_y + metrics.body_line_step > text_limit {
-            break;
-        }
-        draw_text(
-            frame,
-            display.width,
-            display.height,
-            wx + 12,
-            text_y,
-            line,
-            [208, 223, 238, 255],
-            metrics.body_text_scale,
-        );
-        text_y += metrics.body_line_step;
-    }
-}
-
-fn tail_chars(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let total = text.chars().count();
-    if total <= max_chars {
-        return text.to_string();
-    }
-    text.chars().skip(total - max_chars).collect()
-}
-
-fn text_pixel_width(text: &str, scale: i32) -> i32 {
-    if text.is_empty() {
-        return 0;
-    }
-    let step = 8 * scale + scale;
-    step * i32::try_from(text.chars().count()).unwrap_or(i32::MAX) - scale
-}
-
-fn adjust_color(color: [u8; 4], mul: f32, add: i16) -> [u8; 4] {
-    let mut out = color;
-    for item in out.iter_mut().take(3) {
-        let base = ((*item as f32) * mul).round() as i16 + add;
-        *item = base.clamp(0, 255) as u8;
-    }
-    out
-}
-
-fn draw_button(
-    frame: &mut [u8],
-    fb_width: u32,
-    fb_height: u32,
-    rect: RectF,
-    label: &str,
-    text_scale: i32,
-    base_color: [u8; 4],
-    border_color: [u8; 4],
-    text_color: [u8; 4],
-    pressed: bool,
-    flash: bool,
-) {
-    let x = rect.x.round() as i32;
-    let y = rect.y.round() as i32;
-    let w = rect.w.round().max(16.0) as i32;
-    let h = rect.h.round().max(12.0) as i32;
-    let mut fill = base_color;
-    if pressed {
-        fill = adjust_color(fill, 0.72, -12);
-    } else if flash {
-        fill = adjust_color(fill, 1.0, 24);
-    }
-    fill_rect(frame, fb_width, fb_height, x, y, w, h, fill);
-    draw_rect_border(frame, fb_width, fb_height, x, y, w, h, border_color);
-    if !label.is_empty() {
-        let text_w = text_pixel_width(label, text_scale.max(1));
-        let text_h = 8 * text_scale.max(1);
-        let text_x = x + ((w - text_w) / 2).max(2);
-        let text_y = y + ((h - text_h) / 2).max(1);
-        draw_text(
-            frame,
-            fb_width,
-            fb_height,
-            text_x,
-            text_y,
-            label,
-            text_color,
-            text_scale.max(1),
-        );
-    }
-}
-
-fn fill_rect(
-    frame: &mut [u8],
-    fb_width: u32,
-    fb_height: u32,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    color: [u8; 4],
-) {
-    if w <= 0 || h <= 0 {
-        return;
-    }
-    let start_x = x.max(0);
-    let start_y = y.max(0);
-    let end_x = (x + w).min(fb_width as i32);
-    let end_y = (y + h).min(fb_height as i32);
-    if start_x >= end_x || start_y >= end_y {
-        return;
-    }
-
-    let fb_w = fb_width as usize;
-    for py in start_y..end_y {
-        let row = py as usize * fb_w * 4;
-        for px in start_x..end_x {
-            let idx = row + px as usize * 4;
-            frame[idx] = color[0];
-            frame[idx + 1] = color[1];
-            frame[idx + 2] = color[2];
-            frame[idx + 3] = color[3];
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn blend_rect(
-    frame: &mut [u8],
-    fb_width: u32,
-    fb_height: u32,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    color: [u8; 4],
-    alpha: u8,
-) {
-    if w <= 0 || h <= 0 || alpha == 0 {
-        return;
-    }
-    let start_x = x.max(0);
-    let start_y = y.max(0);
-    let end_x = (x + w).min(fb_width as i32);
-    let end_y = (y + h).min(fb_height as i32);
-    if start_x >= end_x || start_y >= end_y {
-        return;
-    }
-
-    let a = alpha as u16;
-    let inv_a = 255u16.saturating_sub(a);
-    let fb_w = fb_width as usize;
-    for py in start_y..end_y {
-        let row = py as usize * fb_w * 4;
-        for px in start_x..end_x {
-            let idx = row + px as usize * 4;
-            for c in 0..3 {
-                let dst = frame[idx + c] as u16;
-                let src = color[c] as u16;
-                frame[idx + c] = (((dst * inv_a) + (src * a)) / 255) as u8;
-            }
-            frame[idx + 3] = 255;
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn draw_backdrop_pattern(
-    frame: &mut [u8],
-    fb_width: u32,
-    fb_height: u32,
-    wx: i32,
-    wy: i32,
-    ww: i32,
-    wh: i32,
-) {
-    let pad = 96i32;
-    let start_x = (wx - pad).max(0);
-    let start_y = (wy - pad).max(0);
-    let end_x = (wx + ww + pad).min(fb_width as i32);
-    let end_y = (wy + wh + pad).min(fb_height as i32);
-    if start_x >= end_x || start_y >= end_y {
-        return;
-    }
-
-    let phase = 0i32;
-    let cell = 28i32;
-    let fb_w = fb_width as usize;
-    for py in start_y..end_y {
-        let row = py as usize * fb_w * 4;
-        for px in start_x..end_x {
-            let cx = (px + phase) / cell;
-            let cy = (py - phase) / cell;
-            let checker = (cx + cy) & 1;
-            let idx = row + px as usize * 4;
-            if checker == 0 {
-                frame[idx] = 44;
-                frame[idx + 1] = 72;
-                frame[idx + 2] = 116;
-            } else {
-                frame[idx] = 26;
-                frame[idx + 1] = 46;
-                frame[idx + 2] = 82;
-            }
-            frame[idx + 3] = 255;
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn blur_region_gaussian(
-    frame: &mut [u8],
-    fb_width: u32,
-    fb_height: u32,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    scratch: &mut BlurScratch,
-) {
-    if w <= 0 || h <= 0 || scratch.radius <= 0 || scratch.kernel.is_empty() {
-        return;
-    }
-    let sx = x.max(0);
-    let sy = y.max(0);
-    let ex = (x + w).min(fb_width as i32);
-    let ey = (y + h).min(fb_height as i32);
-    if sx >= ex || sy >= ey {
-        return;
-    }
-    let rw = (ex - sx) as usize;
-    let rh = (ey - sy) as usize;
-    if scratch.cache_matches(sx, sy, rw, rh) {
-        scratch.write_cached(frame, fb_width);
-        return;
-    }
-    let len = rw
-        .checked_mul(rh)
-        .and_then(|v| v.checked_mul(4))
-        .unwrap_or(0usize);
-    if len == 0 {
-        return;
-    }
-    scratch.ensure_len(len);
-
-    for ry in 0..rh {
-        let src_row = ((sy as usize + ry) * fb_width as usize + sx as usize) * 4;
-        let dst_row = ry * rw * 4;
-        scratch.src[dst_row..dst_row + rw * 4].copy_from_slice(&frame[src_row..src_row + rw * 4]);
-    }
-
-    let radius = scratch.radius;
-    let kernel = &scratch.kernel;
-
-    for ry in 0..rh {
-        for rx in 0..rw {
-            let mut acc = [0.0f32; 4];
-            let mut wsum = 0.0f32;
-            for k in -radius..=radius {
-                let sx2 = (rx as i32 + k).clamp(0, rw as i32 - 1) as usize;
-                let weight = kernel[(k + radius) as usize];
-                wsum += weight;
-                let idx = (ry * rw + sx2) * 4;
-                for (c, acc_slot) in acc.iter_mut().enumerate() {
-                    *acc_slot += scratch.src[idx + c] as f32 * weight;
-                }
-            }
-            let out_idx = (ry * rw + rx) * 4;
-            for (c, acc_value) in acc.iter().enumerate() {
-                scratch.tmp[out_idx + c] =
-                    (acc_value / wsum.max(0.0001)).round().clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
-
-    for ry in 0..rh {
-        for rx in 0..rw {
-            let mut acc = [0.0f32; 4];
-            let mut wsum = 0.0f32;
-            for k in -radius..=radius {
-                let sy2 = (ry as i32 + k).clamp(0, rh as i32 - 1) as usize;
-                let weight = kernel[(k + radius) as usize];
-                wsum += weight;
-                let idx = (sy2 * rw + rx) * 4;
-                for (c, acc_slot) in acc.iter_mut().enumerate() {
-                    *acc_slot += scratch.tmp[idx + c] as f32 * weight;
-                }
-            }
-            let out_idx = ((sy as usize + ry) * fb_width as usize + (sx as usize + rx)) * 4;
-            for c in 0..3usize {
-                frame[out_idx + c] = (acc[c] / wsum.max(0.0001)).round().clamp(0.0, 255.0) as u8;
-            }
-            frame[out_idx + 3] = 255;
-        }
-    }
-    scratch.update_cache_from_frame(frame, fb_width, sx, sy, rw, rh);
-}
-
-fn build_gaussian_kernel(radius: usize, sigma: f32) -> Vec<f32> {
-    if radius == 0 {
-        return vec![1.0];
-    }
-    let sigma = if sigma.is_finite() && sigma > 0.01 {
-        sigma
-    } else {
-        (radius as f32) * 0.45
-    };
-    let mut kernel = Vec::with_capacity(radius * 2 + 1);
-    let denom = 2.0 * sigma * sigma;
-    let mut sum = 0.0f32;
-    for i in 0..=(radius * 2) {
-        let x = i as i32 - radius as i32;
-        let v = (-(x * x) as f32 / denom).exp();
-        kernel.push(v);
-        sum += v;
-    }
-    if sum > 0.0 {
-        for v in &mut kernel {
-            *v /= sum;
-        }
-    }
-    kernel
-}
-
-fn draw_rect_border(
-    frame: &mut [u8],
-    fb_width: u32,
-    fb_height: u32,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    color: [u8; 4],
-) {
-    draw_line(frame, fb_width, fb_height, x, y, x + w - 1, y, color);
-    draw_line(
-        frame,
-        fb_width,
-        fb_height,
-        x,
-        y + h - 1,
-        x + w - 1,
-        y + h - 1,
-        color,
-    );
-    draw_line(frame, fb_width, fb_height, x, y, x, y + h - 1, color);
-    draw_line(
-        frame,
-        fb_width,
-        fb_height,
-        x + w - 1,
-        y,
-        x + w - 1,
-        y + h - 1,
-        color,
-    );
-}
-
-fn draw_line(
-    frame: &mut [u8],
-    fb_width: u32,
-    fb_height: u32,
-    mut x0: i32,
-    mut y0: i32,
-    x1: i32,
-    y1: i32,
-    color: [u8; 4],
-) {
-    let dx = (x1 - x0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let dy = -(y1 - y0).abs();
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-
-    loop {
-        put_pixel(frame, fb_width, fb_height, x0, y0, color);
-        if x0 == x1 && y0 == y1 {
-            break;
-        }
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            x0 += sx;
-        }
-        if e2 <= dx {
-            err += dx;
-            y0 += sy;
-        }
-    }
-}
-
-fn put_pixel(frame: &mut [u8], fb_width: u32, fb_height: u32, x: i32, y: i32, color: [u8; 4]) {
-    if x < 0 || y < 0 || x >= fb_width as i32 || y >= fb_height as i32 {
-        return;
-    }
-    let idx = ((y as usize * fb_width as usize) + x as usize) * 4;
-    if idx + 3 >= frame.len() {
-        return;
-    }
-    frame[idx] = color[0];
-    frame[idx + 1] = color[1];
-    frame[idx + 2] = color[2];
-    frame[idx + 3] = color[3];
-}
-
-fn draw_text(
-    frame: &mut [u8],
-    fb_width: u32,
-    fb_height: u32,
-    mut x: i32,
-    y: i32,
-    text: &str,
-    color: [u8; 4],
-    scale: i32,
-) {
-    for ch in text.chars() {
-        if ch == '\n' {
-            continue;
-        }
-        draw_char(frame, fb_width, fb_height, x, y, ch, color, scale);
-        x += 8 * scale + scale;
-    }
-}
-
-fn draw_char(
-    frame: &mut [u8],
-    fb_width: u32,
-    fb_height: u32,
-    x: i32,
-    y: i32,
-    ch: char,
-    color: [u8; 4],
-    scale: i32,
-) {
-    let Some(glyph) = BASIC_FONTS.get(ch) else {
-        return;
-    };
-
-    for (row, bits) in glyph.iter().enumerate() {
-        for col in 0..8 {
-            if (bits >> col) & 1 == 1 {
-                fill_rect(
-                    frame,
-                    fb_width,
-                    fb_height,
-                    x + col * scale,
-                    y + row as i32 * scale,
-                    scale,
-                    scale,
-                    color,
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]

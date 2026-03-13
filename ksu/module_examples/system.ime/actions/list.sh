@@ -1,5 +1,5 @@
 #!/system/bin/sh
-ACTION_NAME=列出代理模式
+ACTION_NAME="列出代理模式"
 ACTION_DANGER=0
 set -eu
 

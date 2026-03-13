@@ -1,9 +1,7 @@
 #!/system/bin/sh
-ACTION_NAME=启动测试窗口
-ACTION_DANGER=0
 set -eu
 
-state_dir="${DSAPI_MODULE_STATE_DIR:-/data/adb/dsapi/state/modules/test.touch_demo}"
+state_dir="${DSAPI_MODULE_STATE_DIR:-/data/adb/dsapi/state/modules/dsapi.demo.touch_ui}"
 mkdir -p "$state_dir"
 
 demo_pid_file="$state_dir/touch_demo.pid"
@@ -133,6 +131,39 @@ wait_process_stable() {
   return 0
 }
 
+wait_presenter_started() {
+  pid="$1"
+  log_file="$2"
+  max_tries="${3:-40}"
+  i=0
+  while [ "$i" -lt "$max_tries" ]; do
+    if ! pid_running "$pid"; then
+      return 1
+    fi
+    if [ -f "$log_file" ] && grep -F -q "touch_ui_status=started" "$log_file"; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 0.1
+  done
+  return 1
+}
+
+normalize_layer_z() {
+  raw="${1:-}"
+  case "$raw" in
+    ''|*[!0-9]*)
+      echo "2100000000"
+      return 0
+      ;;
+  esac
+  if [ "$raw" -lt 2000000000 ] || [ "$raw" -gt 2147483647 ]; then
+    echo "2100000000"
+    return 0
+  fi
+  echo "$raw"
+}
+
 force_kill_by_name() {
   name="$1"
   [ -n "$name" ] || return 0
@@ -161,7 +192,7 @@ find_app_process() {
 }
 
 cleanup_stale_pid_file "$demo_pid_file" "dsapi_touch_demo"
-cleanup_stale_pid_file "$presenter_pid_file" "present-loop"
+cleanup_stale_pid_file "$presenter_pid_file" "DSAPIPresenterDemo"
 
 old_demo_pid="$(read_pid "$demo_pid_file")"
 if [ -n "$old_demo_pid" ] && pid_running "$old_demo_pid"; then
@@ -195,6 +226,12 @@ fi
 
 control_socket="${TOUCH_DEMO_CONTROL_SOCKET:-${DSAPI_DAEMON_SOCKET:-/data/adb/dsapi/run/dsapi.sock}}"
 data_socket="${TOUCH_DEMO_DATA_SOCKET:-$control_socket}"
+state_pipe="${TOUCH_DEMO_STATE_PIPE:-$state_dir/touch_demo.state.pipe}"
+rm -f "$state_pipe"
+if ! mkfifo "$state_pipe"; then
+  echo "state=error pid=- reason=state_pipe_create_failed"
+  exit 2
+fi
 
 demo_bin="${TOUCH_DEMO_BIN:-${DSAPI_ACTIVE_RELEASE:-}/bin/dsapi_touch_demo}"
 if [ ! -x "$demo_bin" ]; then
@@ -220,12 +257,9 @@ if [ -z "$app_process_bin" ] || [ ! -x "$app_process_bin" ]; then
   exit 2
 fi
 
-# 默认关闭全局/链式模糊，避免把整层或窗口内文本都模糊掉。
-filter_chain="${TOUCH_DEMO_FILTER_CHAIN:-}"
 blur_radius="${TOUCH_DEMO_BLUR_RADIUS:-0}"
-blur_sigma="${TOUCH_DEMO_BLUR_SIGMA:-0}"
 frame_rate="${TOUCH_DEMO_PRESENTER_FRAME_RATE:-current}"
-layer_z="${TOUCH_DEMO_LAYER_Z:-1000000}"
+layer_z="$(normalize_layer_z "${TOUCH_DEMO_LAYER_Z:-2100000000}")"
 layer_name="${TOUCH_DEMO_LAYER_NAME:-DirectScreenAPI}"
 
 presenter_pid="$(read_pid "$presenter_pid_file")"
@@ -235,15 +269,22 @@ if [ -n "$presenter_pid" ] && ! pid_running "$presenter_pid"; then
 fi
 
 if [ -z "$presenter_pid" ]; then
-  CLASSPATH="$dex_jar" nohup "$app_process_bin" /system/bin --nice-name=DSAPIPresenterDemo \
-    org.directscreenapi.adapter.AndroidAdapterMain present-loop \
-    "$control_socket" 0 "$layer_z" "$layer_name" "$blur_radius" "$blur_sigma" "$filter_chain" "$frame_rate" \
+  TOUCH_DEMO_STATE_PIPE="$state_pipe" CLASSPATH="$dex_jar" nohup "$app_process_bin" /system/bin --nice-name=DSAPIPresenterDemo \
+    org.directscreenapi.adapter.AndroidAdapterMain touch-ui-loop \
+    "$state_pipe" "$layer_z" "$layer_name" "$blur_radius" "$frame_rate" \
     >>"$presenter_log_file" 2>&1 &
   presenter_pid="$!"
   echo "$presenter_pid" >"$presenter_pid_file"
   if ! wait_process_stable "$presenter_pid" 6; then
     rm -f "$presenter_pid_file"
+    rm -f "$state_pipe"
     echo "state=error pid=- reason=presenter_start_failed"
+    exit 2
+  fi
+  if ! wait_presenter_started "$presenter_pid" "$presenter_log_file" 40; then
+    rm -f "$presenter_pid_file"
+    rm -f "$state_pipe"
+    echo "state=error pid=- reason=presenter_not_ready"
     exit 2
   fi
 fi
@@ -265,6 +306,8 @@ no_touch_router="$(to_bool "${TOUCH_DEMO_NO_TOUCH_ROUTER:-0}")"
 set -- "$demo_bin" \
   --control-socket "$control_socket" \
   --data-socket "$data_socket" \
+  --state-pipe "$state_pipe" \
+  --presenter-pid "$presenter_pid" \
   --route-name "$route_name" \
   --fps "$demo_fps" \
   --window-w "$window_w" \
@@ -292,6 +335,7 @@ echo "$demo_pid" >"$demo_pid_file"
 
 if ! wait_process_stable "$demo_pid" 8; then
   rm -f "$demo_pid_file"
+  rm -f "$state_pipe"
   echo "state=error pid=- reason=demo_start_failed"
   exit 2
 fi

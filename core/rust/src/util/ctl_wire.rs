@@ -680,7 +680,10 @@ mod tests {
     use super::*;
     use std::io::{Cursor, ErrorKind};
 
-    fn encode_test_response_frame(status: Status, values: [u64; BINARY_RESPONSE_VALUE_COUNT]) -> Vec<u8> {
+    fn encode_test_response_frame(
+        status: Status,
+        values: [u64; BINARY_RESPONSE_VALUE_COUNT],
+    ) -> Vec<u8> {
         let payload_bytes = 4usize + (BINARY_RESPONSE_VALUE_COUNT * 8usize);
         let mut out = Vec::with_capacity(BINARY_COMMAND_HEADER_BYTES + payload_bytes);
         out.extend_from_slice(&BINARY_PROTOCOL_MAGIC.to_le_bytes());
@@ -707,8 +710,7 @@ mod tests {
         let frame = encode_test_response_frame(Status::Ok, [0u64; BINARY_RESPONSE_VALUE_COUNT]);
         let truncated = frame[..BINARY_COMMAND_HEADER_BYTES].to_vec();
         let mut cursor = Cursor::new(truncated);
-        let err = read_response(&mut cursor)
-            .expect_err("payload eof must fail");
+        let err = read_response(&mut cursor).expect_err("payload eof must fail");
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
     }
 }

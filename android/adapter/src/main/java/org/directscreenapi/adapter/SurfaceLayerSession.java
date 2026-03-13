@@ -199,6 +199,23 @@ final class SurfaceLayerSession {
         }
     }
 
+    void setGeometry(float x, float y, int cropWidth, int cropHeight) throws Exception {
+        int safeWidth = Math.max(1, cropWidth);
+        int safeHeight = Math.max(1, cropHeight);
+        Object crop = rectConstructor.newInstance(0, 0, safeWidth, safeHeight);
+        Object tx = transactionClass.getDeclaredConstructor().newInstance();
+        try {
+            ReflectBridge.invoke(tx, "setPosition", surfaceControl, Float.valueOf(x), Float.valueOf(y));
+            ReflectBridge.invoke(tx, "setWindowCrop", surfaceControl, crop);
+            ReflectBridge.invoke(tx, "apply");
+        } finally {
+            try {
+                ReflectBridge.invoke(tx, "close");
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
     void setFrameRate(float frameRateHz) throws Exception {
         Object tx = transactionClass.getDeclaredConstructor().newInstance();
         try {
@@ -213,20 +230,24 @@ final class SurfaceLayerSession {
     }
 
     Object lockFrame() throws Exception {
-        if (lockCanvasMethod != null) {
+        if (lockHardwareCanvasMethod != null) {
             try {
-                return lockCanvasMethod.invoke(surface, new Object[]{null});
+                return lockHardwareCanvasMethod.invoke(surface);
             } catch (Throwable ignored) {
             }
         }
-        if (lockHardwareCanvasMethod != null) {
-            return lockHardwareCanvasMethod.invoke(surface);
+        if (lockCanvasMethod != null) {
+            return lockCanvasMethod.invoke(surface, new Object[]{null});
         }
         throw new IllegalStateException("surface_lock_canvas_unavailable");
     }
 
     void unlockFrame(Object canvas) throws Exception {
         unlockCanvasAndPostMethod.invoke(surface, canvas);
+    }
+
+    Object surfaceObject() {
+        return surface;
     }
 
     void closeQuietly() {

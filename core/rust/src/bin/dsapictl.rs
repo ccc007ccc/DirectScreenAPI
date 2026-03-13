@@ -1,7 +1,7 @@
 use std::os::unix::net::UnixStream;
 
-use directscreen_core::util::timeout_from_env;
 use directscreen_core::api::Status;
+use directscreen_core::util::timeout_from_env;
 
 use directscreen_core::util::ctl_wire;
 

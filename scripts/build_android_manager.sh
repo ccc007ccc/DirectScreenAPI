@@ -35,47 +35,62 @@ if [ -n "${DSAPI_AAPT2_ANDROID_JAR:-}" ]; then
   AAPT2_ANDROID_JAR="${DSAPI_AAPT2_ANDROID_JAR}"
 elif [ -f "third_party/android-sdk/platforms/android-23-framework.jar" ]; then
   AAPT2_ANDROID_JAR="third_party/android-sdk/platforms/android-23-framework.jar"
+elif [ -f "/usr/lib/android-sdk/platforms/android-23/android.jar" ]; then
+  AAPT2_ANDROID_JAR="/usr/lib/android-sdk/platforms/android-23/android.jar"
 elif [ -f "/system/framework/framework-res.apk" ]; then
   AAPT2_ANDROID_JAR="/system/framework/framework-res.apk"
 else
   AAPT2_ANDROID_JAR="$ANDROID_JAR"
 fi
 
-for cmd in javac jar keytool aapt2 zipalign apksigner
-do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "android_manager_error=${cmd}_not_found"
-    exit 2
-  fi
-done
-
 AAPT2_BIN="${DSAPI_AAPT2_BIN:-aapt2}"
 ZIPALIGN_BIN="${DSAPI_ZIPALIGN_BIN:-zipalign}"
 APKSIGNER_BIN="${DSAPI_APKSIGNER_BIN:-apksigner}"
+SKIP_SIGN="${DSAPI_MANAGER_SKIP_SIGN:-0}"
 
 DEX_MODE=""
 DEX_BIN="${DSAPI_DEX_TOOL_BIN:-}"
 if [ -n "$DEX_BIN" ]; then
   DEX_MODE="${DSAPI_DEX_MODE:-d8}"
+  if [ "$DEX_MODE" != "d8" ]; then
+    echo "android_manager_error=unsupported_dex_mode mode=$DEX_MODE required=d8"
+    exit 2
+  fi
 elif [ -x "$BUILD_TOOLS_DIR/d8" ]; then
   DEX_MODE="d8"
   DEX_BIN="$BUILD_TOOLS_DIR/d8"
 elif command -v d8 >/dev/null 2>&1; then
   DEX_MODE="d8"
   DEX_BIN="d8"
-elif command -v dalvik-exchange >/dev/null 2>&1; then
-  DEX_MODE="dx"
-  DEX_BIN="dalvik-exchange"
 else
-  echo "android_manager_error=dex_tool_not_found"
+  echo "android_manager_error=d8_tool_not_found"
   exit 2
 fi
 
 JAVA_RELEASE="${DSAPI_MANAGER_JAVA_RELEASE:-21}"
 
-if [ "$DEX_MODE" = "dx" ] && [ "$JAVA_RELEASE" -gt 8 ]; then
-  echo "android_manager_error=dx_requires_java8 java_release=$JAVA_RELEASE"
+ensure_bin() {
+  label="$1"
+  bin="$2"
+  case "$bin" in
+    /*)
+      [ -x "$bin" ] && return 0
+      ;;
+    *)
+      command -v "$bin" >/dev/null 2>&1 && return 0
+      ;;
+  esac
+  echo "android_manager_error=${label}_not_found bin=$bin"
   exit 2
+}
+
+ensure_bin javac javac
+ensure_bin jar jar
+ensure_bin keytool keytool
+ensure_bin aapt2 "$AAPT2_BIN"
+ensure_bin zipalign "$ZIPALIGN_BIN"
+if [ "$SKIP_SIGN" != "1" ]; then
+  ensure_bin apksigner "$APKSIGNER_BIN"
 fi
 
 if [ ! -f "$ANDROID_JAR" ]; then
@@ -114,14 +129,15 @@ javac -g:none --release "$JAVA_RELEASE" -encoding UTF-8 -classpath "$ANDROID_JAR
 
 (
   cd "$CLASSES_DIR"
-  jar --create --file "$ROOT_DIR/$CLASS_JAR" .
+  # CLASS_JAR 可能是绝对路径（例如 chroot/out_dir 传绝对路径），也可能是相对路径（默认 OUT_DIR）。
+  case "$CLASS_JAR" in
+    /*) jar_out="$CLASS_JAR" ;;
+    *) jar_out="$ROOT_DIR/$CLASS_JAR" ;;
+  esac
+  jar --create --file "$jar_out" .
 )
 
-if [ "$DEX_MODE" = "d8" ]; then
-  "$DEX_BIN" --release --min-api 26 --output "$DEX_DIR" "$CLASS_JAR"
-else
-  "$DEX_BIN" --dex --min-sdk-version=26 --output="$DEX_DIR/classes.dex" "$CLASS_JAR"
-fi
+"$DEX_BIN" --release --min-api 26 --output "$DEX_DIR" "$CLASS_JAR"
 
 "$AAPT2_BIN" compile --dir "$RES_DIR" -o "$RES_ZIP"
 "$AAPT2_BIN" link \
@@ -162,29 +178,35 @@ fi
 
 "$ZIPALIGN_BIN" -f 4 "$UNSIGNED_APK" "$ALIGNED_APK"
 
-if [ ! -f "$KEYSTORE" ]; then
-  keytool -genkeypair \
-    -keystore "$KEYSTORE" \
-    -storepass android \
-    -alias androiddebugkey \
-    -keypass android \
-    -dname "CN=Android Debug,O=Android,C=US" \
-    -keyalg RSA \
-    -keysize 2048 \
-    -validity 10000 >/dev/null 2>&1
+if [ "$SKIP_SIGN" = "1" ]; then
+  chmod 0444 "$ALIGNED_APK" 2>/dev/null || true
+  echo "android_manager_apk=$ALIGNED_APK"
+  echo "android_manager_sign=skipped"
+else
+  if [ ! -f "$KEYSTORE" ]; then
+    keytool -genkeypair \
+      -keystore "$KEYSTORE" \
+      -storepass android \
+      -alias androiddebugkey \
+      -keypass android \
+      -dname "CN=Android Debug,O=Android,C=US" \
+      -keyalg RSA \
+      -keysize 2048 \
+      -validity 10000 >/dev/null 2>&1
+  fi
+
+  "$APKSIGNER_BIN" sign \
+    --ks "$KEYSTORE" \
+    --ks-pass pass:android \
+    --key-pass pass:android \
+    --out "$SIGNED_APK" \
+    "$ALIGNED_APK"
+
+  "$APKSIGNER_BIN" verify "$SIGNED_APK" >/dev/null
+  chmod 0444 "$SIGNED_APK" 2>/dev/null || true
+  echo "android_manager_apk=$SIGNED_APK"
+  echo "android_manager_sign=ok"
 fi
-
-"$APKSIGNER_BIN" sign \
-  --ks "$KEYSTORE" \
-  --ks-pass pass:android \
-  --key-pass pass:android \
-  --out "$SIGNED_APK" \
-  "$ALIGNED_APK"
-
-"$APKSIGNER_BIN" verify "$SIGNED_APK" >/dev/null
-chmod 0444 "$SIGNED_APK" 2>/dev/null || true
-
-echo "android_manager_apk=$SIGNED_APK"
 echo "android_manager_package=org.directscreenapi.manager"
 echo "android_manager_dex_mode=$DEX_MODE"
 echo "android_manager_java_release=$JAVA_RELEASE"

@@ -580,12 +580,16 @@ fn submit_dmabuf_tight_rgba(
                 .byte_offset
                 .checked_add(y.checked_mul(row_bytes).ok_or(Status::OutOfRange)?)
                 .ok_or(Status::OutOfRange)?;
-            let src_end = src_off.checked_add(crop_row_bytes).ok_or(Status::OutOfRange)?;
+            let src_end = src_off
+                .checked_add(crop_row_bytes)
+                .ok_or(Status::OutOfRange)?;
             if src_end > src.len() {
                 return Err(Status::InvalidArgument);
             }
             let dst_off = y.checked_mul(crop_row_bytes).ok_or(Status::OutOfRange)?;
-            let dst_end = dst_off.checked_add(crop_row_bytes).ok_or(Status::OutOfRange)?;
+            let dst_end = dst_off
+                .checked_add(crop_row_bytes)
+                .ok_or(Status::OutOfRange)?;
             tight[dst_off..dst_end].copy_from_slice(&src[src_off..src_end]);
         }
 

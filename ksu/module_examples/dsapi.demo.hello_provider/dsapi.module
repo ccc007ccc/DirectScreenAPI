@@ -1,0 +1,6 @@
+MODULE_ID=dsapi.demo.hello_provider
+MODULE_NAME=Hello Provider Demo
+MODULE_KIND=demo
+MODULE_VERSION=1.0.0
+MODULE_DESC=模块即接口：启动一个 Binder Provider 并注册到 Core ServiceRegistry。
+MAIN_CAP_ID=dsapi.demo.hello_provider

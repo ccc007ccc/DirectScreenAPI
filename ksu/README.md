@@ -24,6 +24,20 @@
 - `pack` 默认会自动尝试嵌入 `manager.apk`（优先本机构建，失败自动回退到 `~/ubuntu-chroot/rootfs` 容器构建）。
 - 如需禁用 manager APK 嵌入，可用：`DSAPI_KSU_WITH_MANAGER_APK=0 ./scripts/dsapi.sh ksu pack`
 
+## 外置模块独立打包
+
+核心 KSU 包不再内置 `module_zips`。模块请独立打包、独立更新：
+
+```sh
+# 单模块
+./scripts/build_ksu_module_zip.sh dsapi.demo.touch_ui
+
+# 全部模块（逐个独立 zip）
+./scripts/build_ksu_module_zip.sh --all
+```
+
+默认输出目录：`artifacts/ksu_module_zips/`
+
 ## 安装后控制
 
 ```sh

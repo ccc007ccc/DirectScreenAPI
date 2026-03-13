@@ -1,5 +1,5 @@
 #!/system/bin/sh
-ACTION_NAME=输入代理状态
+ACTION_NAME="输入代理状态"
 ACTION_DANGER=0
 set -eu
 

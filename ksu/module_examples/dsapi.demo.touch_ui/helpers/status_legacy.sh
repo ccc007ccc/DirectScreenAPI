@@ -1,9 +1,7 @@
 #!/system/bin/sh
-ACTION_NAME=运行状态
-ACTION_DANGER=0
 set -eu
 
-state_dir="${DSAPI_MODULE_STATE_DIR:-/data/adb/dsapi/state/modules/test.touch_demo}"
+state_dir="${DSAPI_MODULE_STATE_DIR:-/data/adb/dsapi/state/modules/dsapi.demo.touch_ui}"
 demo_pid_file="$state_dir/touch_demo.pid"
 presenter_pid_file="$state_dir/presenter.pid"
 
@@ -58,7 +56,8 @@ else
   demo_pid="-"
 fi
 
-if [ -n "$presenter_pid" ] && pid_running "$presenter_pid" && pid_has_text "$presenter_pid" "present-loop"; then
+if [ -n "$presenter_pid" ] && pid_running "$presenter_pid" \
+  && { pid_has_text "$presenter_pid" "touch-ui-loop" || pid_has_text "$presenter_pid" "DSAPIPresenterDemo"; }; then
   presenter_running=1
 else
   rm -f "$presenter_pid_file"

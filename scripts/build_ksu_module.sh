@@ -19,12 +19,14 @@ ANDROID_JAVA_RELEASE="${DSAPI_ANDROID_JAVA_RELEASE:-21}"
 MANAGER_JAVA_RELEASE="${DSAPI_MANAGER_JAVA_RELEASE:-21}"
 if [ -f "third_party/android-sdk/platforms/android-23-framework.jar" ]; then
   AAPT2_ANDROID_JAR_DEFAULT="third_party/android-sdk/platforms/android-23-framework.jar"
-elif [ -f "/system/framework/framework-res.apk" ]; then
-  AAPT2_ANDROID_JAR_DEFAULT="/system/framework/framework-res.apk"
+elif [ -f "/usr/lib/android-sdk/platforms/android-23/android.jar" ]; then
+  AAPT2_ANDROID_JAR_DEFAULT="/usr/lib/android-sdk/platforms/android-23/android.jar"
 else
   AAPT2_ANDROID_JAR_DEFAULT="$ANDROID_JAR"
 fi
 AAPT2_ANDROID_JAR="${DSAPI_AAPT2_ANDROID_JAR:-$AAPT2_ANDROID_JAR_DEFAULT}"
+DEX_TOOL_BIN="${DSAPI_DEX_TOOL_BIN:-}"
+DEX_MODE="${DSAPI_DEX_MODE:-d8}"
 
 if [ ! -d "$TEMPLATE_DIR" ]; then
   echo "ksu_pack_error=template_missing path=$TEMPLATE_DIR"
@@ -36,15 +38,84 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 2
 fi
 
-# 仅打包 KSU 核心必需二进制 + 测试窗口二进制。
-cargo build --release --manifest-path core/rust/Cargo.toml --bin dsapid --bin dsapictl --bin dsapi_touch_demo >/dev/null
+if [ "$DEX_MODE" != "d8" ]; then
+  echo "ksu_pack_error=unsupported_dex_mode mode=$DEX_MODE required=d8"
+  exit 2
+fi
 
-DSAPID_BIN="target/release/dsapid"
-DSAPICTL_BIN="target/release/dsapictl"
-DSAPI_TOUCH_DEMO_BIN="target/release/dsapi_touch_demo"
+if [ -z "$DEX_TOOL_BIN" ]; then
+  ensure_d8_output="$(./scripts/ensure_d8_from_r8.sh 2>&1)" || {
+    [ -n "$ensure_d8_output" ] && printf '%s\n' "$ensure_d8_output"
+    echo "ksu_pack_error=ensure_d8_failed"
+    exit 2
+  }
+  [ -n "$ensure_d8_output" ] && printf '%s\n' "$ensure_d8_output" | sed -n '/^ensure_d8_/p'
+  DEX_TOOL_BIN="$(printf '%s\n' "$ensure_d8_output" | awk -F= '/^d8_tool=/{print $2}' | tail -n 1)"
+fi
+if [ -z "$DEX_TOOL_BIN" ]; then
+  echo "ksu_pack_error=d8_tool_missing"
+  exit 2
+fi
+
+TARGET_DIR="${CARGO_TARGET_DIR:-${DSAPI_TARGET_DIR:-target}}"
+
+detect_default_rust_target() {
+  if [ -n "${DSAPI_RUST_TARGET:-}" ]; then
+    printf '%s\n' "$DSAPI_RUST_TARGET"
+    return 0
+  fi
+
+  # Android 宿主原生环境可直接构建本机目标。
+  if [ -x /system/bin/linker64 ] || [ -x /system/bin/linker ]; then
+    printf '%s\n' ""
+    return 0
+  fi
+
+  case "$(uname -m)" in
+    aarch64|arm64) printf '%s\n' "aarch64-unknown-linux-musl" ;;
+    armv7l|arm) printf '%s\n' "armv7-unknown-linux-musleabihf" ;;
+    x86_64) printf '%s\n' "x86_64-unknown-linux-musl" ;;
+    i686|x86) printf '%s\n' "i686-unknown-linux-musl" ;;
+    *) printf '%s\n' "" ;;
+  esac
+}
+
+RUST_TARGET="$(detect_default_rust_target)"
+if [ -n "$RUST_TARGET" ] && printf '%s' "$RUST_TARGET" | grep -q 'musl'; then
+  if ! command -v musl-gcc >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y musl-tools >/dev/null 2>&1 || true
+  fi
+fi
+if [ -n "$RUST_TARGET" ] && command -v rustup >/dev/null 2>&1; then
+  rustup target add "$RUST_TARGET" >/dev/null 2>&1 || true
+fi
+
+if [ -n "$RUST_TARGET" ]; then
+  cargo build --release --manifest-path core/rust/Cargo.toml \
+    --target "$RUST_TARGET" \
+    --bin dsapid --bin dsapictl --bin dsapi_touch_demo >/dev/null
+  CORE_BIN_DIR="$TARGET_DIR/$RUST_TARGET/release"
+  echo "ksu_pack_rust_target=$RUST_TARGET"
+else
+  cargo build --release --manifest-path core/rust/Cargo.toml \
+    --bin dsapid --bin dsapictl --bin dsapi_touch_demo >/dev/null
+  CORE_BIN_DIR="$TARGET_DIR/release"
+  echo "ksu_pack_rust_target=host_default"
+fi
+
+DSAPID_BIN="$CORE_BIN_DIR/dsapid"
+DSAPICTL_BIN="$CORE_BIN_DIR/dsapictl"
+DSAPI_TOUCH_DEMO_BIN="$CORE_BIN_DIR/dsapi_touch_demo"
 if [ ! -x "$DSAPID_BIN" ] || [ ! -x "$DSAPICTL_BIN" ] || [ ! -x "$DSAPI_TOUCH_DEMO_BIN" ]; then
   echo "ksu_pack_error=core_binaries_missing"
   exit 2
+fi
+
+if command -v readelf >/dev/null 2>&1; then
+  if readelf -l "$DSAPID_BIN" 2>/dev/null | grep -F -q '/lib/ld-linux'; then
+    echo "ksu_pack_error=core_binary_incompatible interpreter=glibc path=$DSAPID_BIN"
+    exit 2
+  fi
 fi
 
 ANDROID_OUT_DIR="$OUT_ROOT/android_adapter"
@@ -52,6 +123,8 @@ adapter_build_output=""
 if ! adapter_build_output="$(
   DSAPI_ANDROID_OUT_DIR="$ANDROID_OUT_DIR" \
   DSAPI_ANDROID_BUILD_MODE=all \
+  DSAPI_DEX_MODE="$DEX_MODE" \
+  DSAPI_DEX_TOOL_BIN="$DEX_TOOL_BIN" \
   DSAPI_ANDROID_JAVA_RELEASE="$ANDROID_JAVA_RELEASE" \
   DSAPI_ANDROID_JAR="$ANDROID_JAR" \
   DSAPI_ANDROID_BUILD_TOOLS_DIR="$BUILD_TOOLS_DIR" \
@@ -74,7 +147,9 @@ KSU_MODULE_ID="${DSAPI_KSU_MODULE_ID:-directscreenapi}"
 KSU_MODULE_NAME="${DSAPI_KSU_MODULE_NAME:-DirectScreenAPI Core}"
 VERSION="${DSAPI_KSU_VERSION:-$(date +%Y.%m.%d-%H%M%S)}"
 VERSION_CODE="$(date +%s)"
-RELEASE_ID_DEFAULT="r${VERSION_CODE}"
+# V3：runtime release 目录保持稳定（避免每次构建在 /data/adb/dsapi/runtime/releases 产生新目录）。
+# 变更检测由运行时 seed sync marker（包含 module.prop versionCode）负责。
+RELEASE_ID_DEFAULT="r0"
 RELEASE_ID="${DSAPI_KSU_RELEASE_ID:-$RELEASE_ID_DEFAULT}"
 ZIP_PATH="$OUT_ROOT/${KSU_MODULE_ID}-ksu.zip"
 
@@ -145,35 +220,66 @@ if [ "$KSU_WITH_MANAGER_APK" = "auto" ]; then
 fi
 
 if [ "$KSU_WITH_MANAGER_APK" = "1" ]; then
-  manager_build_output=""
-  if ! manager_build_output="$(
-    DSAPI_MANAGER_OUT_DIR="$MANAGER_OUT_DIR" \
-    DSAPI_MANAGER_VERSION_NAME="$VERSION" \
-    DSAPI_MANAGER_VERSION_CODE="$VERSION_CODE" \
-    DSAPI_MANAGER_JAVA_RELEASE="$MANAGER_JAVA_RELEASE" \
-    DSAPI_ANDROID_JAR="$ANDROID_JAR" \
-    DSAPI_AAPT2_ANDROID_JAR="$AAPT2_ANDROID_JAR" \
-    DSAPI_ANDROID_BUILD_TOOLS_DIR="$BUILD_TOOLS_DIR" \
-    ./scripts/build_android_manager.sh 2>&1
-  )"; then
-    if [ -n "$manager_build_output" ]; then
-      printf '%s\n' "$manager_build_output"
+  if [ -n "${DSAPI_MANAGER_APK_PREBUILT:-}" ]; then
+    MANAGER_APK="$DSAPI_MANAGER_APK_PREBUILT"
+    if [ ! -f "$MANAGER_APK" ]; then
+      echo "ksu_pack_error=manager_apk_prebuilt_missing path=$MANAGER_APK"
+      exit 2
     fi
-    echo "ksu_pack_error=manager_build_failed_local"
-    exit 2
-  fi
+    echo "ksu_pack_manager_apk_source=prebuilt path=$MANAGER_APK"
+  else
+    manager_build_output=""
+    if ! manager_build_output="$(
+      DSAPI_MANAGER_OUT_DIR="$MANAGER_OUT_DIR" \
+      DSAPI_MANAGER_VERSION_NAME="$VERSION" \
+      DSAPI_MANAGER_VERSION_CODE="$VERSION_CODE" \
+      DSAPI_DEX_MODE="$DEX_MODE" \
+      DSAPI_DEX_TOOL_BIN="$DEX_TOOL_BIN" \
+      DSAPI_MANAGER_JAVA_RELEASE="$MANAGER_JAVA_RELEASE" \
+      DSAPI_ANDROID_JAR="$ANDROID_JAR" \
+      DSAPI_AAPT2_ANDROID_JAR="$AAPT2_ANDROID_JAR" \
+      DSAPI_ANDROID_BUILD_TOOLS_DIR="$BUILD_TOOLS_DIR" \
+      ./scripts/build_android_manager.sh 2>&1
+    )"; then
+      # Termux 上 aapt2 可能因为 framework include 崩溃；默认允许回退到 Ubuntu chroot 构建。
+      if [ "${DSAPI_KSU_MANAGER_CHROOT_FALLBACK:-1}" = "1" ]; then
+        local_manager_build_output="$manager_build_output"
+        manager_build_output=""
+        if ! manager_build_output="$(
+          DSAPI_MANAGER_OUT_DIR="$MANAGER_OUT_DIR" \
+          DSAPI_MANAGER_VERSION_NAME="$VERSION" \
+          DSAPI_MANAGER_VERSION_CODE="$VERSION_CODE" \
+          DSAPI_MANAGER_JAVA_RELEASE="$MANAGER_JAVA_RELEASE" \
+          DSAPI_DEX_MODE="$DEX_MODE" \
+          ./scripts/build_android_manager_chroot.sh 2>&1
+        )"; then
+          [ -n "$local_manager_build_output" ] && printf '%s\n' "$local_manager_build_output"
+          [ -n "$manager_build_output" ] && printf '%s\n' "$manager_build_output"
+          echo "ksu_pack_error=manager_build_failed_local_and_chroot"
+          exit 2
+        fi
+        echo "ksu_pack_manager_apk_source=chroot"
+      else
+        if [ -n "$manager_build_output" ]; then
+          printf '%s\n' "$manager_build_output"
+        fi
+        echo "ksu_pack_error=manager_build_failed_local"
+        exit 2
+      fi
+    fi
 
-  if [ -n "$manager_build_output" ]; then
-    printf '%s\n' "$manager_build_output" | sed -n '/^android_manager_/p'
-  fi
+    if [ -n "$manager_build_output" ]; then
+      printf '%s\n' "$manager_build_output" | sed -n '/^android_manager_/p'
+    fi
 
-  MANAGER_APK="$(printf '%s\n' "$manager_build_output" | awk -F= '/^android_manager_apk=/{print $2}' | tail -n 1)"
-  if [ -z "$MANAGER_APK" ]; then
-    MANAGER_APK="$MANAGER_OUT_DIR/dsapi-manager.apk"
-  fi
-  if [ ! -f "$MANAGER_APK" ]; then
-    echo "ksu_pack_error=manager_apk_missing path=$MANAGER_APK"
-    exit 2
+    MANAGER_APK="$(printf '%s\n' "$manager_build_output" | awk -F= '/^android_manager_apk=/{print $2}' | tail -n 1)"
+    if [ -z "$MANAGER_APK" ]; then
+      MANAGER_APK="$MANAGER_OUT_DIR/dsapi-manager.apk"
+    fi
+    if [ ! -f "$MANAGER_APK" ]; then
+      echo "ksu_pack_error=manager_apk_missing path=$MANAGER_APK"
+      exit 2
+    fi
   fi
 fi
 
@@ -231,19 +337,6 @@ fi
 if [ -d "ksu/capability_examples" ]; then
   mkdir -p "$MOD_DIR/capability_examples"
   cp "ksu/capability_examples/"*.sh "$MOD_DIR/capability_examples/" 2>/dev/null || true
-fi
-
-if [ -d "ksu/module_examples" ]; then
-  mkdir -p "$MOD_DIR/module_zips"
-  for module_dir in ksu/module_examples/*; do
-    [ -d "$module_dir" ] || continue
-    module_name="$(basename "$module_dir")"
-    module_zip_rel="$MOD_DIR/module_zips/$module_name.zip"
-    if ! zip_tree "ksu/module_examples" "$module_name" "$module_zip_rel"; then
-      echo "ksu_pack_error=module_zip_pack_failed module=$module_name"
-      exit 2
-    fi
-  done
 fi
 
 SEED_DIR="$MOD_DIR/runtime_seed/releases/$RELEASE_ID"

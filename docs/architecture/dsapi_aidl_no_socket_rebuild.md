@@ -42,14 +42,13 @@
 
 ## 4. 本轮补充（减少 shell 依赖）
 
-- Bridge contract descriptor 统一为：
-  - `org.directscreenapi.daemon.IDaemonService`
+- Core contract descriptor 统一为：
+  - `org.directscreenapi.core.ICoreService`
 - Bridge 服务端 `BridgeControlServer` 已将以下链路改为 Java 直连（不再回落 `ctl.sh --v2`）：
-  - `module zip-list`
   - `module install-zip/install`
-  - `module install-builtin`
   - `runtime activate/install/remove`
-- 管理 UI 启动主路径改为 `parasitic manager host`（`app_process --nice-name=shell`）：
+  - 注：`module zip-list/install-builtin` 已在“外置模块化”阶段移除（核心包不再内置 `module_zips`）。
+- 管理 UI 启动主路径改为 `parasitic manager host`（`app_process --nice-name=DSAPIManagerHost`）：
   - `ui start/stop/status` 优先走 `manager-host`，保留 activity 状态探测作为补充视图。
 - 新增 zygote 注入链前置代理：
   - `zygote-agent`（Binder service）对外提供 `daemon_binder` 透传能力，用于注入侧后续直连 daemon。
@@ -61,7 +60,7 @@
   - `ksu/zygisk_loader/dsapi_zygisk_loader.cpp`
   - `build_ksu_module.sh` 默认尝试嵌入 `zygisk/<abi>.so`
 - Bridge 控制面移除 `execCtlV2ViaShell/parseCtlV2Envelope` 旧 shell 兜底逻辑。
-- Manager 提示文案同步为 `IDaemonService + exec_v2`。
+- Manager 提示文案同步为 `ICoreService + exec_v2`。
 - 构建验证通过：
   - `scripts/build_android_adapter.sh`
   - `scripts/build_android_manager.sh`

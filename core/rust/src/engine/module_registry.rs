@@ -140,7 +140,10 @@ impl ModuleRegistry {
         self.records.get(module_id).cloned()
     }
 
-    pub fn upsert(&mut self, mut record: ModuleRecord) -> Result<ModuleRecord, ModuleRegistryError> {
+    pub fn upsert(
+        &mut self,
+        mut record: ModuleRecord,
+    ) -> Result<ModuleRecord, ModuleRegistryError> {
         let id = sanitize_module_id(&record.id)?;
         record.id = id.clone();
         let now = now_ms();
@@ -163,14 +166,14 @@ impl ModuleRegistry {
         removed
     }
 
-    pub fn reload_by_id(
-        &mut self,
-        module_id: &str,
-    ) -> Result<ModuleRecord, ModuleRegistryError> {
+    pub fn reload_by_id(&mut self, module_id: &str) -> Result<ModuleRecord, ModuleRegistryError> {
         let now = now_ms();
         let Some(rec) = self.records.get_mut(module_id) else {
-            let err =
-                ModuleRegistryError::with_module("E_MODULE_NOT_FOUND", "module_not_found", module_id);
+            let err = ModuleRegistryError::with_module(
+                "E_MODULE_NOT_FOUND",
+                "module_not_found",
+                module_id,
+            );
             self.last_error = Some(ModuleErrorRecord::new(
                 "module.lifecycle",
                 err.code,
@@ -302,13 +305,13 @@ mod tests {
     #[test]
     fn reload_by_id_reports_disabled() {
         let mut reg = ModuleRegistry::default();
-        let mut r = ModuleRecord::new("test.touch_demo");
+        let mut r = ModuleRecord::new("dsapi.demo.touch_ui");
         r.enabled = false;
         r.state = ModuleState::Disabled;
         reg.upsert(r).expect("upsert");
 
         let err = reg
-            .reload_by_id("test.touch_demo")
+            .reload_by_id("dsapi.demo.touch_ui")
             .expect_err("disabled should fail");
         assert_eq!(err.code, "E_MODULE_DISABLED");
         let last = reg.last_error().expect("last error");

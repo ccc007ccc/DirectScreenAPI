@@ -1,5 +1,5 @@
 #!/system/bin/sh
-ACTION_NAME=启动输入代理
+ACTION_NAME="启动输入代理"
 ACTION_DANGER=0
 set -eu
 
